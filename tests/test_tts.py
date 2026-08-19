@@ -42,10 +42,11 @@ def _silent_mp3(seconds: float = 1.0) -> bytes:
 class FakeResponse:
     """Minimal stand-in for requests.Response covering what tts.py touches."""
 
-    def __init__(self, status_code=200, body=b"", payload=None):
+    def __init__(self, status_code=200, body=b"", payload=None, headers=None):
         self.status_code = status_code
         self._payload = payload
         self.content = body if payload is None else json.dumps(payload).encode()
+        self.headers = headers or {}
         self.closed = False
 
     @property
@@ -84,10 +85,33 @@ def captured_post(monkeypatch):
     return _install
 
 
+@pytest.fixture
+def scripted_post(monkeypatch):
+    """Patch requests.post to return a different response per attempt."""
+    calls = []
+
+    def _install(*responses):
+        def fake_post(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            return responses[min(len(calls) - 1, len(responses) - 1)]
+        monkeypatch.setattr(requests, "post", fake_post)
+        return calls
+
+    return _install
+
+
 @pytest.fixture(autouse=True)
 def _fake_key(monkeypatch):
     """Guarantee a key is present so validation order is what's under test."""
     monkeypatch.setenv("ELEVENLABS_API_KEY", "sk_test_key")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleeping(monkeypatch):
+    """Record the backoff instead of serving it - the suite stays fast."""
+    slept = []
+    monkeypatch.setattr(tts.time, "sleep", slept.append)
+    return slept
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +329,122 @@ def test_validation_error_list_body(tmp_path, captured_post):
     ]}))
     with pytest.raises(tts.TTSError, match="field required"):
         tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+
+
+# ---------------------------------------------------------------------------
+# Retries - only for failures that never reached the synthesiser
+# ---------------------------------------------------------------------------
+
+def test_a_rate_limit_is_retried_and_then_succeeds(tmp_path, scripted_post):
+    calls = scripted_post(
+        FakeResponse(429, payload={"detail": {
+            "status": "too_many_concurrent_requests", "message": "busy",
+        }}),
+        FakeResponse(200, _silent_mp3(1.0)),
+    )
+    result = tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+
+    assert len(calls) == 2
+    assert result["duration_seconds"] == pytest.approx(1.0, abs=0.1)
+
+
+def test_a_server_error_is_retried_up_to_the_limit(tmp_path, captured_post):
+    calls = captured_post(FakeResponse(503, body=b"upstream exploded"))
+    with pytest.raises(tts.TTSError, match="upstream exploded"):
+        tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+    assert len(calls) == tts.MAX_ATTEMPTS
+
+
+def test_the_retry_sends_exactly_the_same_request(tmp_path, scripted_post):
+    calls = scripted_post(
+        FakeResponse(500, body=b"blip"),
+        FakeResponse(200, _silent_mp3(0.5)),
+    )
+    tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+    assert calls[0]["json"] == calls[1]["json"]
+    assert calls[0]["url"] == calls[1]["url"]
+
+
+@pytest.mark.parametrize("status,payload", [
+    (401, {"detail": {"status": "invalid_api_key", "message": "bad key"}}),
+    (401, {"detail": {"status": "quota_exceeded", "message": "no credits"}}),
+    (402, {"detail": {"status": "payment_required", "message": "upgrade"}}),
+    (404, {"detail": {"status": "voice_not_found", "message": "no voice"}}),
+    (422, {"detail": [{"msg": "field required"}]}),
+])
+def test_a_settled_failure_is_not_retried(status, payload, tmp_path, captured_post):
+    """A bad key or an empty balance fails the same way every time."""
+    calls = captured_post(FakeResponse(status, payload=payload))
+    with pytest.raises(tts.TTSError):
+        tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+    assert len(calls) == 1, "retrying this only delays the real message"
+
+
+def test_a_timeout_is_not_retried(tmp_path, monkeypatch):
+    """The generation may have happened and been billed - never pay twice."""
+    calls = []
+
+    def timing_out(url, **kwargs):
+        calls.append(url)
+        raise requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr(requests, "post", timing_out)
+    with pytest.raises(tts.TTSError, match="timed out"):
+        tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+    assert len(calls) == 1
+
+
+def test_backoff_grows_between_attempts(tmp_path, captured_post, _no_real_sleeping):
+    captured_post(FakeResponse(500, body=b"blip"))
+    with pytest.raises(tts.TTSError):
+        tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+
+    assert _no_real_sleeping == [tts.RETRY_BASE_SECONDS, tts.RETRY_BASE_SECONDS * 2]
+
+
+def test_a_sane_retry_after_is_honoured(tmp_path, scripted_post, _no_real_sleeping):
+    scripted_post(
+        FakeResponse(429, payload={"detail": {"status": "system_busy"}},
+                     headers={"Retry-After": "5"}),
+        FakeResponse(200, _silent_mp3(0.5)),
+    )
+    tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+    assert _no_real_sleeping == [5.0]
+
+
+def test_an_absurd_retry_after_falls_back_to_the_backoff(
+        tmp_path, scripted_post, _no_real_sleeping):
+    """A provider asking for ten minutes is not worth blocking the run on."""
+    scripted_post(
+        FakeResponse(429, payload={"detail": {"status": "system_busy"}},
+                     headers={"Retry-After": "600"}),
+        FakeResponse(200, _silent_mp3(0.5)),
+    )
+    tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+    assert _no_real_sleeping == [tts.RETRY_BASE_SECONDS]
+
+
+def test_an_http_date_retry_after_falls_back_to_the_backoff(
+        tmp_path, scripted_post, _no_real_sleeping):
+    """Retry-After may be a date; we do not parse those."""
+    scripted_post(
+        FakeResponse(429, payload={"detail": {"status": "system_busy"}},
+                     headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+        FakeResponse(200, _silent_mp3(0.5)),
+    )
+    tts.generate_audio("hi there", str(tmp_path / "a.mp3"))
+    assert _no_real_sleeping == [tts.RETRY_BASE_SECONDS]
+
+
+def test_a_retry_leaves_no_partial_file_behind(tmp_path, scripted_post):
+    out = tmp_path / "a.mp3"
+    scripted_post(
+        FakeResponse(500, body=b"blip"),
+        FakeResponse(200, _silent_mp3(0.5)),
+    )
+    tts.generate_audio("hi there", str(out))
+    assert out.exists()
+    assert list(tmp_path.glob("*.part")) == []
 
 
 def test_all_api_errors_share_a_base_class():

@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -77,6 +78,25 @@ REQUEST_TIMEOUT = (10, 180)
 
 #: Bytes pulled per iteration while streaming the response to disk.
 DOWNLOAD_CHUNK_SIZE = 8192
+
+# --- retry ------------------------------------------------------------------
+# Only failures the API rejected outright are retried - a rate limit, or a 5xx.
+# Those never reached the synthesiser, so nothing was generated and nothing was
+# billed, and the same request can safely go again. A timeout or a dropped
+# connection is deliberately NOT retried: the generation may well have happened
+# and been charged for, and paying twice for one script is the worse outcome.
+
+#: Attempts per request, including the first.
+MAX_ATTEMPTS = 3
+
+#: Exponential backoff between attempts: 2s, then 4s. Longer than the Gemini
+#: backoff - a concurrency limit needs the other request to finish, not just a
+#: moment to pass.
+RETRY_BASE_SECONDS = 2.0
+
+#: Longest Retry-After we will sit and wait for before ignoring it in favour of
+#: the backoff above. A provider asking for five minutes is not worth blocking.
+RETRY_AFTER_CAP_SECONDS = 30.0
 
 # --- input guards -----------------------------------------------------------
 
@@ -225,6 +245,33 @@ def _raise_for_api_error(response, voice_id: str) -> None:
     raise TTSError(f"ElevenLabs request failed {label}: {message}")
 
 
+def _worth_retrying(response) -> bool:
+    """True when the request was refused without anything being synthesised.
+
+    Rate limits and server errors qualify. A bad key, an empty balance, a plan
+    restriction or an unknown voice do not - they fail the same way every time,
+    and retrying only delays the message the caller needs to read.
+    """
+    slug, _ = _describe_api_error(response)
+    if slug in _QUOTA_STATUSES or slug in _AUTH_STATUSES:
+        return False
+    return (response.status_code == 429
+            or response.status_code >= 500
+            or slug in _RATE_LIMIT_STATUSES)
+
+
+def _retry_delay(response, attempt: int) -> float:
+    """Seconds to wait: the server's own Retry-After, or the backoff."""
+    raw = str(response.headers.get("Retry-After", "")).strip()
+    try:
+        requested = float(raw)
+    except ValueError:
+        requested = 0.0     # absent, or an HTTP-date we will not parse
+    if 0 < requested <= RETRY_AFTER_CAP_SECONDS:
+        return requested
+    return RETRY_BASE_SECONDS * 2 ** (attempt - 1)
+
+
 def _stream_to_file(response, output_path: Path) -> int:
     """Write the response body to `output_path` atomically. Returns bytes."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -297,6 +344,9 @@ def generate_audio(script: str, output_path: str, voice_id: str = None) -> dict:
         where duration_seconds is measured from the written file and
         character_count is what was billed to the ElevenLabs account.
 
+    A rate limit or a server error is retried up to MAX_ATTEMPTS times; see the
+    retry block at the top of this file for why nothing else is.
+
     Raises:
         ValueError: the script is empty or over MAX_SCRIPT_CHARACTERS.
         config.MissingConfigError: ELEVENLABS_API_KEY is not in .env.
@@ -325,29 +375,46 @@ def generate_audio(script: str, output_path: str, voice_id: str = None) -> dict:
         "Accept": "audio/mpeg",
     }
 
-    try:
-        response = requests.post(
-            f"{API_BASE_URL}/text-to-speech/{voice}",
-            headers=headers,
-            params={"output_format": OUTPUT_FORMAT},
-            json=_build_payload(text),
-            timeout=REQUEST_TIMEOUT,
-            stream=True,
-        )
-    except requests.exceptions.Timeout as exc:
-        raise TTSError(
-            f"ElevenLabs timed out after {REQUEST_TIMEOUT[1]}s: {exc}"
-        ) from exc
-    except requests.exceptions.RequestException as exc:
-        raise TTSError(
-            f"Could not reach ElevenLabs: {type(exc).__name__}: {exc}"
-        ) from exc
+    payload = _build_payload(text)
 
-    with response:
-        if response.status_code != 200:
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                f"{API_BASE_URL}/text-to-speech/{voice}",
+                headers=headers,
+                params={"output_format": OUTPUT_FORMAT},
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+                stream=True,
+            )
+        except requests.exceptions.Timeout as exc:
+            raise TTSError(
+                f"ElevenLabs timed out after {REQUEST_TIMEOUT[1]}s: {exc}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise TTSError(
+                f"Could not reach ElevenLabs: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        with response:
+            if response.status_code == 200:
+                _stream_to_file(response, destination)
+                break
+
             response.content  # materialise the body before the stream closes
-            _raise_for_api_error(response, voice)
-        _stream_to_file(response, destination)
+            if attempt == MAX_ATTEMPTS or not _worth_retrying(response):
+                _raise_for_api_error(response, voice)
+
+            delay = _retry_delay(response, attempt)
+            slug, _ = _describe_api_error(response)
+            # stderr, so it does not land in the middle of piped result output
+            print(
+                f"elevenlabs: {response.status_code}"
+                f"{'/' + slug if slug else ''} - retrying in {delay:g}s "
+                f"(attempt {attempt + 1} of {MAX_ATTEMPTS})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
     return {
         "audio_path": str(destination.resolve()),

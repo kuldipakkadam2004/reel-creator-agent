@@ -16,13 +16,16 @@ python config.py          # self-check: paths + which keys are set
 Run modules from the project root:
 
 ```bash
-python pipeline/script_gen.py "why the ocean is salty" -d 35
+python pipeline/script_gen.py "why the ocean is salty" -d 35 -o output/scripts/ocean.txt
 python pipeline/tts.py -f output/scripts/ocean.txt -o output/audio/ocean.mp3
 python pipeline/visuals.py -f output/scripts/ocean.txt -a output/audio/ocean.mp3
 python pipeline/assemble.py -a output/audio/ocean.mp3 -v assets/visuals/runs/ocean-1a2b3c
 python pipeline/caption.py -r output/2026-08-19/ocean-1a2b3c
 ```
 
+`python pipeline/script_gen.py` writes the script to
+`output/scripts/<topic-slug>.txt` and prints the exact `tts.py` command to run
+next; `-o` picks the path and `--no-save` prints without writing.
 `python pipeline/visuals.py --providers-status` shows which stock providers have
 their keys; `--dry-run` plans the beats and search queries without downloading.
 `python pipeline/assemble.py --dry-run` prints the shot list and writes the
@@ -38,7 +41,9 @@ assets/visuals/cache/   downloaded media, content-addressed
 assets/visuals/runs/    one directory per run: media + manifest.json
 assets/visuals/usage.json  which stock asset each run used
 assets/fonts/       caption fonts
-output/scripts/     generated narration scripts
+output/scripts/     generated narration scripts: <name>.txt (the words,
+                    which step 3 speaks) + <name>.json (topic and timings,
+                    which step 6 reads)
 output/audio/       ElevenLabs .mp3 renders
 output/<date>/<run>/  one finished reel: .mp4, captions, attribution, post text
 output/captions/hashtag_usage.json  which tags recent posts used
@@ -107,6 +112,11 @@ a finished 9:16 .mp4 with captions burned in, written to
 * captions are timed by **ElevenLabs forced alignment** — the script is already
   known, so the words are exact rather than transcribed. `whisper` and a
   no-network `estimate` are the fallbacks, tried in that order;
+* the narration is **loudness-normalised to -14 LUFS**, Instagram's own
+  working point, so two reels cut a week apart do not land at different
+  volumes. ElevenLabs renders at whatever level the voice sits at — one real
+  narration measured -24.4 LUFS in and -15.6 out. `AUDIO_NORMALIZE=false`
+  leaves it alone;
 * the whole edit is **one ffmpeg pass** — a single `filter_complex` scales,
   concatenates, burns the captions in with libass and muxes the audio, so the
   picture is encoded once.
@@ -166,6 +176,23 @@ What it adds to `output/<date>/<run id>/`:
 | `post.txt` | the caption, exactly as it should be posted, and nothing else |
 | `post.json` | the same in parts: hook, body, CTA, tags and their tiers, credits, character counts, warnings |
 | `post_comment.txt` | the tag block — only when `POST_HASHTAG_PLACEMENT=comment` |
+
+## When a provider blips
+
+Every API call the pipeline makes is retried on the failures worth retrying —
+rate limits, and the 5xxs a service returns under load — with exponential
+backoff, and raised at once on the ones that are settled: a bad key, an empty
+balance, a refusal, an unknown model.
+
+`script_gen.call_gemini` is the one Gemini call **three** steps share, so this
+matters more than it looks: without it, a single 503 does not just fail step 2,
+it drops step 4 to keyword search queries and step 6 to heuristic copy, and the
+reel comes out quietly worse with only a warning line to say why.
+
+Step 3 is the exception that proves the rule — a timeout there is **not**
+retried. The narration may well have been generated and billed already, and
+paying twice for one script is the worse outcome. Only refusals the API sent
+back before synthesising anything are tried again.
 
 ## Secrets
 

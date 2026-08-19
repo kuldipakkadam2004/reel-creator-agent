@@ -515,6 +515,46 @@ def test_the_graph_concatenates_every_shot_and_maps_the_audio():
     assert stage in graph
 
 
+def test_the_narration_is_loudness_normalised(monkeypatch):
+    monkeypatch.setattr(config, "AUDIO_NORMALIZE", True)
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=3.5, narration=3.0,
+        ass_path=None, fonts_dir=None,
+    )
+    chain = [c for c in graph.split(";") if "[aout]" in c][0]
+
+    assert f"loudnorm=I={config.AUDIO_LOUDNESS_TARGET:g}" in chain
+    assert f"TP={config.AUDIO_LOUDNESS_PEAK:g}" in chain
+    assert f"LRA={config.AUDIO_LOUDNESS_RANGE:g}" in chain
+
+
+def test_normalisation_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(config, "AUDIO_NORMALIZE", False)
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=3.5, narration=3.0,
+        ass_path=None, fonts_dir=None,
+    )
+    assert "loudnorm" not in graph
+    assert f"aresample={config.AUDIO_SAMPLE_RATE}" in graph
+
+
+def test_the_fade_is_applied_after_normalisation(monkeypatch):
+    """loudnorm is dynamic - ahead of it, a fade reads as the audio going quiet
+    and is pulled straight back up."""
+    monkeypatch.setattr(config, "AUDIO_NORMALIZE", True)
+    monkeypatch.setattr(config, "AUDIO_FADE_OUT_SECONDS", 0.35)
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=3.5, narration=3.0,
+        ass_path=None, fonts_dir=None,
+    )
+    chain = [c for c in graph.split(";") if "[aout]" in c][0]
+
+    assert chain.index("loudnorm") < chain.index("afade")
+    # loudnorm runs at 192 kHz internally, so come back down before encoding
+    assert chain.index("loudnorm") < chain.index("aresample")
+    assert chain.index("afade") < chain.index("apad")
+
+
 def test_captions_are_burned_in_when_an_ass_file_is_given(tmp_path):
     subtitle = tmp_path / "captions.ass"
     subtitle.write_text("", encoding="utf-8")

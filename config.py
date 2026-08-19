@@ -295,6 +295,30 @@ AUDIO_CODEC = get_env("AUDIO_CODEC", "aac")
 AUDIO_BITRATE = get_env("AUDIO_BITRATE", "192k")
 AUDIO_SAMPLE_RATE = get_env_int("AUDIO_SAMPLE_RATE", 44100)
 
+# --- loudness ---------------------------------------------------------------
+# Instagram normalises playback to roughly -14 LUFS. ElevenLabs renders at
+# whatever level the chosen voice happens to sit at, so without this two reels
+# cut a week apart land at audibly different volumes - and a quiet one is
+# turned up by the platform along with its noise floor. loudnorm fixes the
+# perceived loudness of the narration instead of guessing at a gain.
+
+#: Off leaves the narration exactly as ElevenLabs rendered it.
+AUDIO_NORMALIZE = get_env_bool("AUDIO_NORMALIZE", True)
+
+#: Integrated loudness target, LUFS. Instagram's own working point. This is a
+#: single-pass loudnorm - it keeps step 5 to one encode, and lands within a
+#: couple of LU of the target rather than exactly on it. Measured on a real
+#: narration: -24.4 LUFS in, -15.6 LUFS out.
+AUDIO_LOUDNESS_TARGET = get_env_float("AUDIO_LOUDNESS_TARGET", -14.0)
+
+#: True-peak ceiling, dBTP. -1.5 leaves headroom for the lossy re-encode
+#: Instagram puts the file through, which can push samples above the peak.
+AUDIO_LOUDNESS_PEAK = get_env_float("AUDIO_LOUDNESS_PEAK", -1.5)
+
+#: Loudness range, LU. How much quiet-to-loud variation to preserve; a single
+#: narrator reading to camera does not have much, so this rarely bites.
+AUDIO_LOUDNESS_RANGE = get_env_float("AUDIO_LOUDNESS_RANGE", 11.0)
+
 # --- pacing -----------------------------------------------------------------
 # Step 4 decided *which* footage belongs to which stretch of narration; these
 # decide how often the picture cuts inside one of those beats.
@@ -576,6 +600,9 @@ def _report() -> None:
         ("SHOT_TARGET_SECONDS", f"{SHOT_TARGET_SECONDS}s per shot "
                                 f"({SHOT_MIN_SECONDS}-{SHOT_MAX_SECONDS}s)"),
         ("TRANSITION", f"{TRANSITION} ({TRANSITION_SECONDS}s)"),
+        ("AUDIO_NORMALIZE",
+         f"{AUDIO_LOUDNESS_TARGET:g} LUFS, peak {AUDIO_LOUDNESS_PEAK:g} dBTP"
+         if AUDIO_NORMALIZE else "off (narration left as rendered)"),
         ("CAPTION_ALIGNMENT", CAPTION_ALIGNMENT),
         ("CAPTION_STYLE", f"{CAPTION_STYLE}, {CAPTION_FONT_NAME} "
                           f"{CAPTION_FONT_SIZE}px, "

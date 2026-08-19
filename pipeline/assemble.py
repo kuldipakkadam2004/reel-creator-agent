@@ -1184,7 +1184,16 @@ def build_filter_graph(shots: list[Shot], audio_index: int, total: float,
         chains.append(f"[{stage}]" + ",".join(tail) + "[vout]")
         stage = "vout"
 
-    audio = [f"aresample={config.AUDIO_SAMPLE_RATE}"]
+    # Order matters. loudnorm goes first: it is a dynamic normaliser, so a fade
+    # applied ahead of it would be read as the narration going quiet and pulled
+    # back up. It also runs internally at 192 kHz, hence the resample straight
+    # after to land back on the output rate.
+    audio = []
+    if config.AUDIO_NORMALIZE:
+        audio.append(f"loudnorm=I={config.AUDIO_LOUDNESS_TARGET:g}"
+                     f":TP={config.AUDIO_LOUDNESS_PEAK:g}"
+                     f":LRA={config.AUDIO_LOUDNESS_RANGE:g}")
+    audio.append(f"aresample={config.AUDIO_SAMPLE_RATE}")
     if config.AUDIO_FADE_OUT_SECONDS > 0:
         start = max(0.0, narration - config.AUDIO_FADE_OUT_SECONDS)
         audio.append(f"afade=t=out:st={start:.3f}"
