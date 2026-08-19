@@ -675,3 +675,313 @@ def test_the_run_directory_is_dated_and_named_for_the_run():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Music bed
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def music_dir(monkeypatch, tmp_path):
+    """A music library of the suite's own, never the real assets/music/."""
+    directory = tmp_path / "music"
+    directory.mkdir()
+    monkeypatch.setattr(config, "MUSIC_DIR", directory)
+    monkeypatch.setattr(config, "MUSIC_USAGE_FILE", directory / "usage.json")
+    monkeypatch.setattr(config, "MUSIC_ENABLED", True)
+    monkeypatch.setattr(config, "MUSIC_FILE", None)
+    return directory
+
+
+def track_file(directory: Path, name: str, credit: str | None = None) -> Path:
+    path = directory / name
+    path.write_bytes(b"not really audio")
+    if credit is not None:
+        path.with_suffix(".txt").write_text(credit, encoding="utf-8")
+    return path
+
+
+def music_graph(total=45.0, narration=44.0):
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=total, narration=narration,
+        ass_path=None, fonts_dir=None, music_index=2,
+    )
+    return graph
+
+
+# --- the mix ---------------------------------------------------------------
+
+def test_amix_does_not_renormalise(monkeypatch):
+    """normalize=1 is the default and would halve the narration."""
+    monkeypatch.setattr(config, "MUSIC_DUCKING", False)
+    assert "amix=inputs=2:normalize=0" in music_graph()
+
+
+def test_the_bed_is_loudness_matched_not_left_at_its_own_level(monkeypatch):
+    monkeypatch.setattr(config, "MUSIC_DUCKING", False)
+    chain = [c for c in music_graph().split(";") if c.endswith("[bed]")][0]
+    assert f"loudnorm=I={config.MUSIC_LOUDNESS_TARGET:g}" in chain
+
+
+def test_the_bed_is_trimmed_to_the_reel(monkeypatch):
+    """The input is fed in looping, so something has to make it finite again."""
+    monkeypatch.setattr(config, "MUSIC_DUCKING", False)
+    chain = [c for c in music_graph(total=12.5).split(";") if c.endswith("[bed]")][0]
+    assert "atrim=end=12.500" in chain
+
+
+def test_the_bed_fades_at_both_ends(monkeypatch):
+    monkeypatch.setattr(config, "MUSIC_DUCKING", False)
+    monkeypatch.setattr(config, "MUSIC_FADE_IN_SECONDS", 1.0)
+    monkeypatch.setattr(config, "MUSIC_FADE_OUT_SECONDS", 1.5)
+    chain = [c for c in music_graph(total=20.0).split(";") if c.endswith("[bed]")][0]
+
+    assert "afade=t=in:st=0:d=1" in chain
+    assert "afade=t=out:st=18.500:d=1.5" in chain
+
+
+def test_no_music_index_leaves_the_graph_exactly_as_it_was():
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None,
+    )
+    assert "[aout]" in graph
+    for absent in ("amix", "sidechaincompress", "[bed]", "asplit"):
+        assert absent not in graph
+
+
+# --- ducking ---------------------------------------------------------------
+
+def test_ducking_splits_the_narration_rather_than_decoding_it_twice(monkeypatch):
+    monkeypatch.setattr(config, "MUSIC_DUCKING", True)
+    graph = music_graph()
+
+    assert "asplit=2[narr][duckkey]" in graph
+    assert graph.count("[1:a]") == 1, "the narration is one input, split in the graph"
+
+
+def test_the_bed_is_the_thing_compressed_not_the_voice(monkeypatch):
+    """sidechaincompress compresses its first input and only listens to the
+    second - the wrong way round would duck the narration under the music."""
+    monkeypatch.setattr(config, "MUSIC_DUCKING", True)
+    chain = [c for c in music_graph().split(";") if "sidechaincompress" in c][0]
+    assert chain.startswith("[bed][duckkey]")
+
+
+def test_ducking_uses_the_configured_compressor(monkeypatch):
+    monkeypatch.setattr(config, "MUSIC_DUCKING", True)
+    monkeypatch.setattr(config, "MUSIC_DUCK_THRESHOLD", 0.05)
+    monkeypatch.setattr(config, "MUSIC_DUCK_RATIO", 6.0)
+    chain = [c for c in music_graph().split(";") if "sidechaincompress" in c][0]
+
+    assert "threshold=0.05" in chain
+    assert "ratio=6" in chain
+
+
+def test_ducking_off_mixes_the_bed_flat(monkeypatch):
+    monkeypatch.setattr(config, "MUSIC_DUCKING", False)
+    graph = music_graph()
+
+    assert "sidechaincompress" not in graph
+    assert "asplit" not in graph
+    assert "[narr][bed]amix" in graph
+
+
+def test_a_ratio_of_one_is_not_ducking(monkeypatch):
+    """Ratio 1 is a compressor that does nothing - do not pay for the filter."""
+    monkeypatch.setattr(config, "MUSIC_DUCKING", True)
+    monkeypatch.setattr(config, "MUSIC_DUCK_RATIO", 1.0)
+    assert "sidechaincompress" not in music_graph()
+
+
+# --- choosing a track ------------------------------------------------------
+
+def test_an_empty_library_is_not_an_error(music_dir):
+    track, ledger = assemble.resolve_track(None, [])
+    assert track is None and ledger is None
+
+
+def test_only_audio_extensions_are_picked_up(music_dir):
+    track_file(music_dir, "good.mp3")
+    track_file(music_dir, "notes.md")
+    track_file(music_dir, "cover.jpg")
+    assert [t.name for t in assemble.available_tracks()] == ["good.mp3"]
+
+
+def test_a_sidecar_is_read_as_a_required_credit(music_dir):
+    track_file(music_dir, "a.mp3", credit='"Night Drive" by A. Composer, CC BY 4.0')
+    track_file(music_dir, "b.mp3")
+    by_name = {t.name: t for t in assemble.available_tracks()}
+
+    assert by_name["a.mp3"].credit_required is True
+    assert by_name["a.mp3"].credit.startswith('"Night Drive"')
+    assert by_name["b.mp3"].credit_required is False
+
+
+def test_an_empty_sidecar_is_not_a_credit(music_dir):
+    track_file(music_dir, "a.mp3", credit="   \n  ")
+    assert assemble.available_tracks()[0].credit_required is False
+
+
+def test_music_can_be_switched_off_entirely(music_dir):
+    track_file(music_dir, "a.mp3")
+    assert assemble.resolve_track(False, []) == (None, None)
+
+
+def test_disabled_in_config_beats_a_full_library(music_dir, monkeypatch):
+    monkeypatch.setattr(config, "MUSIC_ENABLED", False)
+    track_file(music_dir, "a.mp3")
+    assert assemble.resolve_track(None, []) == (None, None)
+
+
+def test_a_track_named_by_bare_filename_is_found_in_the_library(music_dir):
+    track_file(music_dir, "calm.mp3")
+    track, ledger = assemble.resolve_track("calm.mp3", [])
+
+    assert track.name == "calm.mp3"
+    assert ledger is None, "a pinned track is not rotating, so nothing to record"
+
+
+def test_a_track_named_on_the_command_line_must_exist(music_dir):
+    """Typed just now - swallowing the typo would hide it."""
+    with pytest.raises(assemble.AssemblyError, match="music track not found"):
+        assemble.resolve_track("nope.mp3", [])
+
+
+def test_a_stale_MUSIC_FILE_warns_and_falls_back(music_dir, monkeypatch):
+    """Set once, months ago. A moved file should not fail every run from here."""
+    monkeypatch.setattr(config, "MUSIC_FILE", "moved-away.mp3")
+    track_file(music_dir, "still-here.mp3")
+    warnings = []
+
+    track, ledger = assemble.resolve_track(None, warnings)
+
+    assert track.name == "still-here.mp3"
+    assert any("moved-away.mp3" in w for w in warnings)
+
+
+# --- rotation --------------------------------------------------------------
+
+def test_a_library_rotates_instead_of_repeating(music_dir):
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        track_file(music_dir, name)
+
+    picked = []
+    for run in range(6):
+        track, ledger = assemble.resolve_track(None, [])
+        ledger.record(f"run-{run}", track)
+        picked.append(track.name)
+
+    assert picked == ["a.mp3", "b.mp3", "c.mp3", "a.mp3", "b.mp3", "c.mp3"]
+
+
+def test_one_track_is_still_used_when_the_cooldown_covers_everything(music_dir):
+    """A library smaller than the cooldown must not mean no music at all."""
+    track_file(music_dir, "only.mp3")
+
+    for run in range(3):
+        track, ledger = assemble.resolve_track(None, [])
+        assert track is not None and track.name == "only.mp3"
+        ledger.record(f"run-{run}", track)
+
+
+def test_a_rerun_of_one_id_does_not_stack_up_in_the_ledger(music_dir):
+    track_file(music_dir, "a.mp3")
+    ledger = assemble.MusicLedger()
+    track = assemble.available_tracks()[0]
+
+    ledger.record("same-run", track)
+    ledger.record("same-run", track)
+
+    assert len(assemble.MusicLedger()._data["history"]) == 1
+
+
+def test_a_corrupt_ledger_does_not_stop_the_reel(music_dir):
+    track_file(music_dir, "a.mp3")
+    config.MUSIC_USAGE_FILE.write_text("{ not json", encoding="utf-8")
+
+    track, ledger = assemble.resolve_track(None, [])
+    assert track.name == "a.mp3"
+
+
+# --- credits ---------------------------------------------------------------
+
+def test_the_bed_credit_matches_the_shape_step_6_reads(music_dir):
+    track_file(music_dir, "a.mp3", credit="Track by Someone, CC BY 4.0")
+    entry = assemble.music_credit_entry(assemble.available_tracks()[0], 45.0)
+
+    # what caption.py's _credit_line and build_credits actually look at
+    assert entry["attribution"] == "Track by Someone, CC BY 4.0"
+    assert entry["attribution_required"] is True
+    assert entry["kind"] == "music"
+    assert entry["provider"] == "", "a local file has no provider to credit"
+
+
+def test_an_uncredited_bed_asks_for_nothing(music_dir):
+    track_file(music_dir, "a.mp3")
+    entry = assemble.music_credit_entry(assemble.available_tracks()[0], 45.0)
+    assert entry["attribution_required"] is False
+
+
+def test_the_bed_is_not_counted_among_the_footage(tmp_path, music_dir):
+    track_file(music_dir, "a.mp3", credit="Track by Someone, CC BY 4.0")
+    credits = [
+        {"kind": "video", "file": "clip.mp4", "attribution": "a clip",
+         "attribution_required": False, "screen_seconds": 3.0},
+        assemble.music_credit_entry(assemble.available_tracks()[0], 45.0),
+    ]
+    path = tmp_path / "attribution.txt"
+    assemble.write_attribution_file(path, {"topic": "t", "run_id": "r"}, credits)
+    written = path.read_text(encoding="utf-8")
+
+    assert "1 asset(s) appear in this video" in written, "the bed is not on screen"
+    assert "Music:" in written
+    assert "Track by Someone" in written
+
+
+# --- probing ---------------------------------------------------------------
+
+def test_an_unreadable_track_is_dropped_rather_than_failing(music_dir):
+    """Everything else here degrades; the bed is the least important input."""
+    track_file(music_dir, "broken.mp3")       # not real audio
+    warnings = []
+    assert assemble.prepare_track(assemble.available_tracks()[0], warnings) is None
+    assert any("could not be read" in w for w in warnings)
+
+
+def test_probe_audio_reads_a_file_with_no_video_stream():
+    """probe_media calls an audio-only file broken - this is why it is separate."""
+    narration = config.AUDIO_DIR / "bioluminescence.mp3"
+    if not narration.is_file():
+        pytest.skip("no sample narration on this machine")
+
+    assert assemble.probe_audio(narration) > 0
+    assert assemble.probe_media(narration).get("ok") is False
+
+
+def test_probe_audio_on_something_that_is_not_audio():
+    assert assemble.probe_audio(config.BASE_DIR / "README.md") == 0.0
+
+
+# --- the open --------------------------------------------------------------
+
+def test_the_reel_cuts_straight_in_by_default():
+    """The first half-second decides whether the viewer stays; a fade spends it
+    showing black."""
+    assert config.VIDEO_FADE_IN_SECONDS == 0.0
+
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None,
+    )
+    assert "fade=t=in" not in graph
+    assert "fade=t=out" in graph, "the tail still fades - by then they have stayed"
+
+
+def test_a_soft_open_is_still_available(monkeypatch):
+    monkeypatch.setattr(config, "VIDEO_FADE_IN_SECONDS", 0.4)
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None,
+    )
+    assert "fade=t=in:st=0:d=0.4" in graph

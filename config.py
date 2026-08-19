@@ -29,6 +29,10 @@ ASSETS_DIR = BASE_DIR / "assets"
 VISUALS_DIR = ASSETS_DIR / "visuals"
 FONTS_DIR = ASSETS_DIR / "fonts"
 
+#: Drop background tracks in here. Step 5 picks one per reel and rotates
+#: between them. Empty is fine - it just means no music bed.
+MUSIC_DIR = ASSETS_DIR / "music"
+
 #: Step 4 keeps downloaded media in a content-addressed cache and gives every
 #: run its own directory of hardlinks into it, so re-runs cost no bytes.
 VISUALS_CACHE_DIR = VISUALS_DIR / "cache"
@@ -54,6 +58,7 @@ _MANAGED_DIRS = (
     VISUALS_CACHE_DIR,
     VISUALS_RUNS_DIR,
     FONTS_DIR,
+    MUSIC_DIR,
     OUTPUT_DIR,
     SCRIPTS_DIR,
     AUDIO_DIR,
@@ -345,13 +350,86 @@ TRANSITION_SECONDS = get_env_float("TRANSITION_SECONDS", 0.22)
 IMAGE_ZOOM = get_env_float("IMAGE_ZOOM", 1.12)
 
 #: Top and tail of the finished reel, in seconds.
-VIDEO_FADE_IN_SECONDS = get_env_float("VIDEO_FADE_IN_SECONDS", 0.4)
+#:
+#: The open is deliberately 0. A reel is judged in its first half-second, and
+#: that is exactly the stretch a fade spends showing black - the hook is being
+#: spoken over a picture nobody can see yet, and the viewer decides while it is
+#: still dark. Feeds also autoplay straight into the first frame, so a fade
+#: reads as a loading artefact rather than as an edit. Set it to 0.3-0.5 if a
+#: particular reel wants a soft open; the tail keeps its fade either way,
+#: because by then the viewer has already stayed.
+VIDEO_FADE_IN_SECONDS = get_env_float("VIDEO_FADE_IN_SECONDS", 0.0)
 VIDEO_FADE_OUT_SECONDS = get_env_float("VIDEO_FADE_OUT_SECONDS", 0.6)
 AUDIO_FADE_OUT_SECONDS = get_env_float("AUDIO_FADE_OUT_SECONDS", 0.35)
 
 #: Picture held after the narration stops, so the last word is not cut off by
 #: the video ending on the same frame.
 VIDEO_TAIL_SECONDS = get_env_float("VIDEO_TAIL_SECONDS", 0.5)
+
+# --- music bed --------------------------------------------------------------
+# A reel without music reads as a document; a reel whose music sits on top of
+# the voice reads as an advert. What follows keeps the bed present and out of
+# the way. Drop tracks into assets/music/ - nothing is downloaded, and whatever
+# you put there is yours to have licensed.
+
+#: Permission, not a requirement: an empty assets/music/ simply means no bed.
+MUSIC_ENABLED = get_env_bool("MUSIC_ENABLED", True)
+
+#: Pin one track instead of rotating. A bare filename is looked up inside
+#: MUSIC_DIR; anything else is treated as a path.
+MUSIC_FILE = get_env("MUSIC_FILE")
+
+#: What counts as a track in assets/music/.
+MUSIC_EXTENSIONS = get_env_list(
+    "MUSIC_EXTENSIONS", ".mp3,.m4a,.aac,.wav,.flac,.ogg,.opus"
+)
+
+#: Skip a track used within this many previous runs, so a small library does
+#: not put the same bed under every reel. 0 disables the rotation.
+MUSIC_REUSE_COOLDOWN_RUNS = get_env_int("MUSIC_REUSE_COOLDOWN_RUNS", 3)
+
+#: Cross-run ledger backing the setting above.
+MUSIC_USAGE_FILE = MUSIC_DIR / "usage.json"
+
+#: Integrated loudness the bed is normalised to, LUFS - the one knob that
+#: decides how loud the music is. Set against AUDIO_LOUDNESS_TARGET above:
+#: -30 sits about 16 LU under a -14 LUFS narration, which is audible without
+#: competing. Normalising means a quiet track and a mastered one land in the
+#: same place, instead of the level depending on what you happened to drop in.
+MUSIC_LOUDNESS_TARGET = get_env_float("MUSIC_LOUDNESS_TARGET", -30.0)
+
+#: Duck the bed under the narration instead of holding it at one level. This is
+#: what makes the music breathe: it lifts in the gaps between sentences and
+#: pulls back the moment the voice returns. Off holds a flat level throughout.
+MUSIC_DUCKING = get_env_bool("MUSIC_DUCKING", True)
+
+#: The compressor behind the ducking. These are expert knobs - MUSIC_DUCKING
+#: above is the one worth touching, and MUSIC_LOUDNESS_TARGET decides how loud
+#: the bed is in the first place.
+#:
+#: Threshold is a linear amplitude: 0.03 is about -30 dBFS, which measured as
+#: the best of the values tried. It has to sit between speech and the pauses -
+#: lower is not better, because then the pauses are compressed too and the bed
+#: stops lifting between lines at all. Measured on a real narration: -30 dBFS
+#: gave 5.1 dB of lift in the gaps, -40 dBFS only 3.9 dB.
+MUSIC_DUCK_THRESHOLD = get_env_float("MUSIC_DUCK_THRESHOLD", 0.03)
+
+#: How hard the bed is pushed once it is over the threshold. The reduction is
+#: capped by how far speech sits above the threshold - about 5 dB for a
+#: loudness-normalised narration - so this saturates: 8 and 20 measured the
+#: same 5.1 dB. Left at 8 because there is nothing to gain past it.
+MUSIC_DUCK_RATIO = get_env_float("MUSIC_DUCK_RATIO", 8.0)
+
+#: Milliseconds. The attack has to beat the first syllable, or the bed is still
+#: loud under the word that matters; the release is slow enough that the music
+#: does not pump between words inside a sentence.
+MUSIC_DUCK_ATTACK_MS = get_env_float("MUSIC_DUCK_ATTACK_MS", 15.0)
+MUSIC_DUCK_RELEASE_MS = get_env_float("MUSIC_DUCK_RELEASE_MS", 350.0)
+
+#: Music starts before the first word and outlives the last, so the reel does
+#: not open and close on an abrupt edit.
+MUSIC_FADE_IN_SECONDS = get_env_float("MUSIC_FADE_IN_SECONDS", 1.0)
+MUSIC_FADE_OUT_SECONDS = get_env_float("MUSIC_FADE_OUT_SECONDS", 1.5)
 
 # --- captions ---------------------------------------------------------------
 # Burned into the picture with libass. These are the *on-screen* captions; the
@@ -517,7 +595,10 @@ POST_MUST_INCLUDE = get_env_list("POST_MUST_INCLUDE", "", lower=False)
 #:   all      - also add a courtesy "via Pexels" line for the rest
 #:   off      - never touch the caption
 POST_ATTRIBUTION = get_env("POST_ATTRIBUTION", "required")
-POST_ATTRIBUTION_HEADER = get_env("POST_ATTRIBUTION_HEADER", "Footage:")
+#: Heads the credit block. "Credits:" rather than "Footage:" because step 5
+#: can put a music credit in there as well, and a bed credited under a heading
+#: that says footage is a small lie in a published caption.
+POST_ATTRIBUTION_HEADER = get_env("POST_ATTRIBUTION_HEADER", "Credits:")
 
 #: Ceiling on individual credit lines, so a 15-shot reel does not bury the
 #: copy. Credits a licence actually requires are never dropped to meet it - if
@@ -610,6 +691,11 @@ def _report() -> None:
         ("CAPTION_FONT_FILE", CAPTION_FONT_FILE or "(auto-resolved)"),
         ("VIDEO_RUN_DIR", f"output/<{VIDEO_RUN_DATE_FORMAT}>/<run id>/"
                           f"{VIDEO_FILENAME}"),
+        ("MUSIC", (f"{MUSIC_LOUDNESS_TARGET:g} LUFS"
+                   + (", ducked" if MUSIC_DUCKING else ", flat")
+                   + (f", pinned to {MUSIC_FILE}" if MUSIC_FILE
+                      else ", rotating over assets/music/"))
+                  if MUSIC_ENABLED else "off"),
         ("POST_MODE", POST_MODE),
         ("POST_HASHTAGS", f"{POST_HASHTAG_COUNT} tags in the "
                           f"{POST_HASHTAG_PLACEMENT}"

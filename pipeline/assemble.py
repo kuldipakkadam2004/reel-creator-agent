@@ -285,6 +285,42 @@ def probe_media(path: str | Path) -> dict:
 # Inputs - step 3's audio and step 4's manifest, however they were handed over
 # ---------------------------------------------------------------------------
 
+def probe_audio(path: str | Path) -> float:
+    """Length of an audio-only file in seconds, or 0.0 if it cannot be read.
+
+    probe_media is no use here: it looks for a decodable video or image stream
+    and calls a file without one broken, which is exactly what a .mp3 is.
+    mutagen reads headers for every format step 3 and the music bed use, and
+    ffprobe's container duration covers whatever it does not.
+    """
+    path = Path(path)
+    try:
+        from mutagen import File as MutagenFile
+
+        info = MutagenFile(str(path))
+        if info is not None and getattr(info, "info", None) is not None:
+            length = float(info.info.length)
+            if length > 0:
+                return round(length, 3)
+    except Exception:
+        pass
+
+    exe = ffprobe_binary()
+    if not exe:
+        return 0.0
+    try:
+        done = subprocess.run(
+            [exe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        seconds = float(json.loads(done.stdout or "{}")
+                        .get("format", {}).get("duration") or 0.0)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return 0.0
+    return round(seconds, 3) if seconds > 0 else 0.0
+
+
 def _resolve_audio(audio) -> tuple[Path, float]:
     """Accept step 3's result dict or a path. Returns (path, measured seconds)."""
     if isinstance(audio, dict):
@@ -297,19 +333,7 @@ def _resolve_audio(audio) -> tuple[Path, float]:
     if not path.is_file():
         raise AssemblyError(f"narration audio not found: {path}")
 
-    measured = 0.0
-    try:  # mutagen is already a step-3 dependency and reads headers only
-        from mutagen import File as MutagenFile
-
-        info = MutagenFile(str(path))
-        if info is not None and getattr(info, "info", None) is not None:
-            measured = round(float(info.info.length), 3)
-    except Exception:
-        measured = 0.0
-
-    if not measured:
-        measured = probe_media(path).get("duration") or 0.0
-    duration = measured or stated
+    duration = probe_audio(path) or stated
     if duration <= 0:
         raise AssemblyError(f"could not measure the length of {path.name}")
     return path, round(float(duration), 3)
@@ -1156,9 +1180,58 @@ def _shot_chain(shot: Shot, label_in: str, label_out: str) -> str:
     return f"[{label_in}]" + ",".join(steps) + f"[{label_out}]"
 
 
+def _music_chains(audio_index: int, music_index: int,
+                  narration_chain: list[str], total: float) -> list[str]:
+    """The bed, and how it goes under the voice.
+
+    Ducking needs the narration twice over - once as the thing you actually
+    hear, once as the key telling the compressor when to pull the music down -
+    so it is split rather than decoded twice.
+    """
+    ducking = config.MUSIC_DUCKING and config.MUSIC_DUCK_RATIO > 1
+    voice = ",".join(narration_chain)
+    chains = [f"[{audio_index}:a]{voice}"
+              + ("," + "asplit=2[narr][duckkey]" if ducking else "[narr]")]
+
+    # The input is fed in with -stream_loop, so a track shorter than the reel
+    # repeats; atrim is what makes that infinite stream finite again.
+    bed = [
+        f"atrim=end={total:.3f}",
+        f"aresample={config.AUDIO_SAMPLE_RATE}",
+        f"loudnorm=I={config.MUSIC_LOUDNESS_TARGET:g}"
+        f":TP={config.AUDIO_LOUDNESS_PEAK:g}"
+        f":LRA={config.AUDIO_LOUDNESS_RANGE:g}",
+    ]
+    if config.MUSIC_FADE_IN_SECONDS > 0:
+        bed.append(f"afade=t=in:st=0:d={config.MUSIC_FADE_IN_SECONDS:g}")
+    if config.MUSIC_FADE_OUT_SECONDS > 0:
+        start = max(0.0, total - config.MUSIC_FADE_OUT_SECONDS)
+        bed.append(f"afade=t=out:st={start:.3f}"
+                   f":d={config.MUSIC_FADE_OUT_SECONDS:g}")
+    chains.append(f"[{music_index}:a]" + ",".join(bed) + "[bed]")
+
+    mixed = "bed"
+    if ducking:
+        chains.append(
+            f"[bed][duckkey]sidechaincompress="
+            f"threshold={config.MUSIC_DUCK_THRESHOLD:g}"
+            f":ratio={config.MUSIC_DUCK_RATIO:g}"
+            f":attack={config.MUSIC_DUCK_ATTACK_MS:g}"
+            f":release={config.MUSIC_DUCK_RELEASE_MS:g}"
+            f":makeup=1[ducked]"
+        )
+        mixed = "ducked"
+
+    # normalize=0 is not optional: amix divides by the input count by default,
+    # so leaving it out would halve the narration the moment music was added.
+    chains.append(f"[narr][{mixed}]amix=inputs=2:normalize=0:duration=first[aout]")
+    return chains
+
+
 def build_filter_graph(shots: list[Shot], audio_index: int, total: float,
                        narration: float, ass_path: Path | None,
-                       fonts_dir: Path | None) -> tuple[str, str]:
+                       fonts_dir: Path | None,
+                       music_index: int | None = None) -> tuple[str, str]:
     """The whole edit as one filter graph: shots, concat, captions, audio."""
     chains = [_shot_chain(shot, f"{i}:v", f"v{i}") for i, shot in enumerate(shots)]
 
@@ -1201,14 +1274,18 @@ def build_filter_graph(shots: list[Shot], audio_index: int, total: float,
     # The picture outlives the narration by VIDEO_TAIL_SECONDS; pad the audio
     # with silence so the mux does not end the file early.
     audio.append("apad")
-    chains.append(f"[{audio_index}:a]" + ",".join(audio) + "[aout]")
+
+    if music_index is None:
+        chains.append(f"[{audio_index}:a]" + ",".join(audio) + "[aout]")
+    else:
+        chains += _music_chains(audio_index, music_index, audio, total)
 
     return ";".join(chains), stage
 
 
 def render(shots: list[Shot], audio_path: Path, output_path: Path, *,
            total: float, narration: float, ass_path: Path | None,
-           fonts_dir: Path | None, work_dir: Path,
+           fonts_dir: Path | None, work_dir: Path, music: Track | None = None,
            overwrite: bool = True) -> list[str]:
     """Encode the reel. One ffmpeg pass: no intermediates, one generation loss."""
     if not shots:
@@ -1220,8 +1297,16 @@ def render(shots: list[Shot], audio_path: Path, output_path: Path, *,
     audio_index = len(shots)
     inputs += ["-i", str(audio_path)]
 
+    music_index = None
+    if music is not None:
+        music_index = audio_index + 1
+        # -stream_loop rather than the aloop filter: a track shorter than the
+        # reel repeats by re-reading the file, instead of holding every sample
+        # of it in memory to loop from.
+        inputs += ["-stream_loop", "-1", "-i", str(music.path)]
+
     graph, stage = build_filter_graph(
-        shots, audio_index, total, narration, ass_path, fonts_dir
+        shots, audio_index, total, narration, ass_path, fonts_dir, music_index
     )
 
     args = [ffmpeg_binary(), "-hide_banner", "-nostdin",
@@ -1276,6 +1361,226 @@ def render(shots: list[Shot], audio_path: Path, output_path: Path, *,
 
 
 # ---------------------------------------------------------------------------
+# Music bed
+#
+# Tracks come from assets/music/ and nowhere else - nothing is downloaded, and
+# nothing is generated. A track may carry a sidecar .txt holding the credit
+# line its licence asks for; step 6 puts that in the post text, because a
+# credit that only lives in a file next to the .mp4 is not a credit.
+# ---------------------------------------------------------------------------
+
+#: Ledger entries kept. Only the newest MUSIC_REUSE_COOLDOWN_RUNS matter for a
+#: decision; the rest is history worth being able to read.
+MUSIC_HISTORY_LIMIT = 200
+
+
+def _read_json_file(path: Path, default: dict) -> dict:
+    """Read a small JSON file, treating a corrupt one as absent."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return dict(default)
+    return data if isinstance(data, dict) else dict(default)
+
+
+def _write_json_file(path: Path, data: dict) -> None:
+    """Write a small JSON file atomically, so a crash cannot corrupt it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".part")
+    try:
+        partial.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+        os.replace(partial, path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+@dataclass
+class Track:
+    """One music bed, and whatever its licence wants said about it."""
+
+    path: Path
+    credit: str = ""
+    credit_required: bool = False
+    duration: float = 0.0
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    def to_dict(self) -> dict:
+        return {
+            "file": self.name,
+            "path": str(self.path.resolve()),
+            "duration": self.duration,
+            "credit": self.credit,
+            "credit_required": self.credit_required,
+            "loudness_target": config.MUSIC_LOUDNESS_TARGET,
+            "ducking": bool(config.MUSIC_DUCKING),
+        }
+
+
+def _music_credit(path: Path) -> tuple[str, bool]:
+    """Read `track.txt` beside `track.mp3`, if it is there.
+
+    Writing a credit down is taken as saying it has to be used: over-crediting
+    costs a line of caption, under-crediting breaches a licence. Same .txt/.json
+    sidecar idea step 2 uses for its scripts, one file simpler.
+    """
+    sidecar = path.with_suffix(".txt")
+    if not sidecar.is_file():
+        return "", False
+    try:
+        text = sidecar.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "", False
+    line = " ".join(text.split())
+    return line, bool(line)
+
+
+def available_tracks() -> list[Track]:
+    """Every usable track in assets/music/, in a stable order."""
+    directory = config.MUSIC_DIR
+    if not directory.is_dir():
+        return []
+    wanted = {ext.lower() for ext in config.MUSIC_EXTENSIONS}
+    found = [
+        entry for entry in sorted(directory.iterdir())
+        if entry.is_file() and entry.suffix.lower() in wanted
+    ]
+    tracks = []
+    for entry in found:
+        credit, required = _music_credit(entry)
+        tracks.append(Track(path=entry, credit=credit, credit_required=required))
+    return tracks
+
+
+class MusicLedger:
+    """Which track backed which run, so a small library still rotates.
+
+    With three tracks and no memory, the same one opens most reels: the
+    directory listing is stable, so "the first track" is a constant. This makes
+    the choice depend on what the last few runs used instead.
+    """
+
+    def __init__(self, path: Path | str | None = None):
+        self.path = Path(path or config.MUSIC_USAGE_FILE)
+        self._data = _read_json_file(self.path, {"history": []})
+        self._data.setdefault("history", [])
+
+    def _recent(self) -> list[str]:
+        """Track names most recently used first."""
+        return [str(entry.get("track") or "")
+                for entry in reversed(self._data["history"])]
+
+    def choose(self, tracks: list[Track], *, cooldown: int) -> Track | None:
+        """Least recently used track, preferring one outside the cooldown."""
+        if not tracks:
+            return None
+        recent = self._recent()
+
+        def staleness(track: Track) -> tuple[int, str]:
+            # Never used is as stale as it gets; otherwise the longest ago
+            # wins. The name breaks ties, so one library always ranks the same.
+            try:
+                last = recent.index(track.name)
+            except ValueError:
+                last = len(recent)
+            return (-last, track.name)
+
+        ranked = sorted(tracks, key=staleness)
+        if cooldown > 0:
+            blocked = set(recent[:cooldown])
+            fresh = [t for t in ranked if t.name not in blocked]
+            # Every track inside the cooldown means the library is smaller than
+            # the cooldown - rotate anyway rather than dropping the bed.
+            if fresh:
+                return fresh[0]
+        return ranked[0]
+
+    def record(self, run_id: str, track: Track) -> None:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        history = [entry for entry in self._data["history"]
+                   if entry.get("run_id") != run_id]
+        history.append({"run_id": run_id, "track": track.name, "at": stamp})
+        self._data["history"] = history[-MUSIC_HISTORY_LIMIT:]
+        _write_json_file(self.path, self._data)
+
+
+def _named_track(name: str) -> Track | None:
+    """Resolve a track named by path, or by bare filename inside MUSIC_DIR."""
+    path = Path(name)
+    if not path.is_absolute() and not path.exists():
+        path = config.MUSIC_DIR / path
+    if not path.is_file():
+        return None
+    credit, required = _music_credit(path)
+    return Track(path=path, credit=credit, credit_required=required)
+
+
+def resolve_track(music, warnings: list[str]) -> tuple[Track | None,
+                                                       MusicLedger | None]:
+    """Pick the bed for this reel.
+
+    The `music` argument is a path to pin one track, False to go without, or
+    None to let the rotation choose. Returns the track and the ledger to record
+    it in - a pinned track has no ledger, because nothing is being rotated.
+
+    A track named on the command line has to exist: it was typed just now, and
+    silently ignoring it would hide the typo. MUSIC_FILE in .env is held to a
+    softer standard - it was set once, months ago, and a moved file should cost
+    a warning rather than every run from here on. An empty assets/music/ is not
+    a problem at all: it is how a fresh clone arrives, and silence is a
+    perfectly good bed.
+    """
+    if music is False or not config.MUSIC_ENABLED:
+        return None, None
+
+    if music not in (None, True):
+        track = _named_track(str(music))
+        if track is None:
+            raise AssemblyError(f"music track not found: {music}")
+        return track, None
+
+    if config.MUSIC_FILE:
+        track = _named_track(config.MUSIC_FILE)
+        if track is not None:
+            return track, None
+        warnings.append(
+            f"MUSIC_FILE points at {config.MUSIC_FILE!r}, which is not there - "
+            f"falling back to whatever is in assets/music/"
+        )
+
+    tracks = available_tracks()
+    if not tracks:
+        return None, None       # nothing dropped in yet; not worth a warning
+
+    ledger = MusicLedger()
+    chosen = ledger.choose(tracks, cooldown=config.MUSIC_REUSE_COOLDOWN_RUNS)
+    return chosen, ledger
+
+
+def prepare_track(track: Track | None, warnings: list[str]) -> Track | None:
+    """Probe the chosen track, dropping it if ffmpeg cannot read it.
+
+    A broken bed must not cost the reel. Everything else in this module
+    degrades rather than failing, and music is the least important input here.
+    """
+    if track is None:
+        return None
+    duration = probe_audio(track.path)
+    if not duration:
+        warnings.append(
+            f"music track {track.name!r} could not be read and was left out "
+            f"of the mix"
+        )
+        return None
+    track.duration = duration
+    return track
+
+
+# ---------------------------------------------------------------------------
 # Attribution carried over from step 4
 # ---------------------------------------------------------------------------
 
@@ -1315,25 +1620,59 @@ def collect_attribution(manifest: dict, shots: list[Shot]) -> list[dict]:
     return credits
 
 
+def music_credit_entry(track: Track, seconds: float) -> dict:
+    """The bed, in the same shape as a footage credit.
+
+    Deliberately the same shape, and deliberately in the same list: step 6
+    reads `attributions` out of assembly.json without caring what kind of asset
+    an entry describes, so a track that has to be credited reaches the post
+    text by itself. `provider` stays empty because a local file has none - the
+    courtesy "via Pexels" line skips blanks, which is what a track dropped in
+    by hand should do.
+    """
+    return {
+        "asset_index": None,
+        "beat_index": None,
+        "file": track.name,
+        "kind": "music",
+        "provider": "",
+        "provider_id": None,
+        "creator": None,
+        "creator_url": None,
+        "license": None,
+        "source_url": None,
+        "attribution": track.credit,
+        "attribution_required": bool(track.credit_required),
+        "screen_seconds": round(seconds, 3),
+    }
+
+
 def write_attribution_file(path: Path, manifest: dict, credits: list[dict]) -> None:
     """Human-readable credits next to the .mp4, for whoever posts it."""
+    footage = [c for c in credits if c.get("kind") != "music"]
+    music = [c for c in credits if c.get("kind") == "music"]
     required = [c for c in credits if c.get("attribution_required")]
     lines = [
         f"Attribution for: {manifest.get('topic') or '(untitled)'}",
         f"Run: {manifest.get('run_id', '?')}",
         f"Assembled: {datetime.now().astimezone().isoformat(timespec='seconds')}",
         "",
-        f"{len(credits)} asset(s) appear in this video."
+        f"{len(footage)} asset(s) appear in this video."
         + (f" {len(required)} require credit when posting." if required
            else " None require credit, but crediting is good manners."),
         "",
     ]
-    for credit in credits:
+    for credit in footage:
         flag = "  [CREDIT REQUIRED]" if credit.get("attribution_required") else ""
         lines.append(
             f"- {credit['attribution'] or credit['file']}"
             f" ({credit['screen_seconds']}s on screen){flag}"
         )
+    for credit in music:
+        flag = ("  [CREDIT REQUIRED]" if credit.get("attribution_required")
+                else "  (no credit line on file - check the licence yourself)")
+        lines += ["", "Music:",
+                  f"- {credit['attribution'] or credit['file']}{flag}"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1343,8 +1682,8 @@ def write_attribution_file(path: Path, manifest: dict, credits: list[dict]) -> N
 
 def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                    run_id: str | None = None, captions: bool | None = None,
-                   alignment: str | None = None, dry_run: bool = False,
-                   overwrite: bool = True) -> dict:
+                   alignment: str | None = None, music=None,
+                   dry_run: bool = False, overwrite: bool = True) -> dict:
     """Cut step 3's narration and step 4's footage into a finished reel.
 
     Args:
@@ -1354,6 +1693,8 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         run_id: overrides the manifest's run id, which names that directory.
         captions: burn in captions. Defaults to config.CAPTIONS_ENABLED.
         alignment: caption timing backend. Defaults to config.CAPTION_ALIGNMENT.
+        music: a track to pin under the reel, or False for none. Defaults to
+            rotating over whatever is in assets/music/.
         dry_run: plan the edit and write the captions, but do not encode.
         overwrite: replace an existing .mp4 at the destination.
 
@@ -1394,6 +1735,10 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
     shots, plan_warnings = plan_timeline(manifest, narration, probes)
     warnings += plan_warnings
     total = round(shots[-1].end, 3)
+
+    # --- the music bed -----------------------------------------------------
+    track, ledger = resolve_track(music, warnings)
+    track = prepare_track(track, warnings)
 
     # --- captions ----------------------------------------------------------
     caption_report = {
@@ -1443,8 +1788,12 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             shots, audio_path, video_path,
             total=total, narration=narration,
             ass_path=ass_path, fonts_dir=fonts_dir,
-            work_dir=destination, overwrite=overwrite,
+            work_dir=destination, music=track, overwrite=overwrite,
         )
+        if track is not None and ledger is not None:
+            # Recorded after the encode, not before: a run that never produced
+            # a reel must not push a track into the cooldown.
+            ledger.record(identifier, track)
         rendered = probe_media(video_path)
         if not rendered.get("ok"):
             raise FFmpegError(
@@ -1458,6 +1807,8 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
 
     # --- carry step 4's attribution forward --------------------------------
     credits = collect_attribution(manifest, shots)
+    if track is not None:
+        credits.append(music_credit_entry(track, total))
     attribution_path = destination / ATTRIBUTION_NAME
     write_attribution_file(attribution_path, manifest, credits)
 
@@ -1478,6 +1829,7 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             "aspect": "9:16",
         },
         "audio_path": str(audio_path.resolve()),
+        "music": track.to_dict() if track else None,
         "narration_duration": narration,
         "tail_seconds": round(total - narration, 3),
         "visuals_manifest": manifest.get("manifest_path"),
@@ -1504,7 +1856,7 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         "stats": {
             "shots": len(shots),
             "beats": len({shot.beat_index for shot in shots}),
-            "assets_used": len(credits),
+            "assets_used": sum(1 for c in credits if c.get("kind") != "music"),
             "assets_sourced": len(manifest["assets"]),
             "looped_shots": sum(1 for shot in shots if shot.looped),
             "reused_shots": sum(1 for shot in shots if shot.reused),
@@ -1546,6 +1898,17 @@ def _print_result(assembly: dict) -> None:
               + f", {captions['font']} {captions['style']}")
     else:
         print("CAPTIONS: off")
+    music = assembly.get("music")
+    if music:
+        duck = ("ducked under the voice" if music["ducking"] else "flat level")
+        print(f"MUSIC   : {music['file']} "
+              f"@ {music['loudness_target']:g} LUFS, {duck}"
+              + ("  [CREDIT REQUIRED]" if music["credit_required"] else ""))
+    else:
+        # Only suggest the fix when it is the problem - a run told --no-music
+        # does not need to be advised to add music.
+        hint = "" if available_tracks() else "  (drop a track into assets/music/)"
+        print(f"MUSIC   : none{hint}")
     if stats["file_bytes"]:
         print(f"SIZE    : {stats['file_bytes'] / 1024 / 1024:.1f} MB")
     print(f"CREDITS : {assembly['attribution_path']}")
@@ -1586,6 +1949,12 @@ def main(argv: list[str] | None = None) -> int:
                              f"(default: {config.CAPTION_ALIGNMENT})")
     parser.add_argument("--no-captions", action="store_true",
                         help="render the video without burned-in captions")
+    parser.add_argument("--music", type=Path, default=None,
+                        help="pin one background track (path, or a filename "
+                             "inside assets/music/). Default: rotate over "
+                             "whatever is in assets/music/")
+    parser.add_argument("--no-music", action="store_true",
+                        help="render without a music bed")
     parser.add_argument("--dry-run", action="store_true",
                         help="plan the edit and write the captions, do not encode")
     parser.add_argument("--json", action="store_true",
@@ -1599,6 +1968,7 @@ def main(argv: list[str] | None = None) -> int:
             run_id=args.run_id,
             captions=False if args.no_captions else None,
             alignment=args.alignment,
+            music=False if args.no_music else args.music,
             dry_run=args.dry_run,
         )
     except (AssemblyError, config.MissingConfigError) as exc:

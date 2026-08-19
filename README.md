@@ -41,6 +41,7 @@ assets/visuals/cache/   downloaded media, content-addressed
 assets/visuals/runs/    one directory per run: media + manifest.json
 assets/visuals/usage.json  which stock asset each run used
 assets/fonts/       caption fonts
+assets/music/       background tracks you drop in, + optional <track>.txt credits
 output/scripts/     generated narration scripts: <name>.txt (the words,
                     which step 3 speaks) + <name>.json (topic and timings,
                     which step 6 reads)
@@ -117,6 +118,13 @@ a finished 9:16 .mp4 with captions burned in, written to
   volumes. ElevenLabs renders at whatever level the voice sits at — one real
   narration measured -24.4 LUFS in and -15.6 out. `AUDIO_NORMALIZE=false`
   leaves it alone;
+* a **music bed** is mixed under the narration, **ducking** out of its way
+  while the voice speaks and lifting in the gaps between lines. The bed is
+  loudness-matched too, so a quiet track and a mastered one sit in the same
+  place;
+* the reel **cuts straight in** — no fade up from black. A reel is judged in
+  its first half-second, which is exactly the stretch a fade spends showing
+  nothing. The tail still fades;
 * the whole edit is **one ffmpeg pass** — a single `filter_complex` scales,
   concatenates, burns the captions in with libass and muxes the audio, so the
   picture is encoded once.
@@ -138,7 +146,35 @@ What lands in `output/<date>/<run id>/`:
 | `captions.ass` / `.srt` | the burned-in captions, and a plain copy |
 | `alignment.json` | every word with its timestamp, and which backend timed it |
 | `attribution.txt` | credits for the footage that made the cut |
-| `assembly.json` | the shot-by-shot timeline plus **step 4's per-asset attribution**, carried through for steps 6 and 7 |
+| `assembly.json` | the shot-by-shot timeline, the music bed used, plus **step 4's per-asset attribution**, carried through for steps 6 and 7 |
+
+### The music bed
+
+Tracks come from `assets/music/` and nowhere else — nothing is downloaded and
+nothing is generated, so whatever you put there is yours to have licensed.
+
+* an **empty `assets/music/` means no music**, which is how a fresh clone
+  arrives. Drop a track in and the next reel has a bed;
+* with several tracks, step 5 **rotates** between them
+  (`MUSIC_REUSE_COOLDOWN_RUNS`) so the same bed does not sit under every reel.
+  `--music <file>` pins one, `--no-music` goes without;
+* the bed is normalised to `MUSIC_LOUDNESS_TARGET` (-30 LUFS — about 16 LU
+  under the narration). **That is the knob that decides how loud the music
+  is**, and normalising means the level does not depend on how hot the track
+  you happened to download was mastered;
+* **ducking** is a compressor keyed off the narration, so the bed drops while
+  the voice speaks. Measured on a real narration, the bed sits about 5 dB
+  higher in the pauses than under speech. That is close to the ceiling: the
+  reduction is bounded by how far speech rises over `MUSIC_DUCK_THRESHOLD`, so
+  raising `MUSIC_DUCK_RATIO` past 8 changes nothing;
+* a **`track.txt` beside `track.mp3`** holding a credit line is treated as a
+  credit that has to be used — it goes into `attribution.txt` and step 6 puts
+  it in the post text, because a credit that only lives next to the .mp4 is not
+  a credit. No sidecar means no credit is claimed, and the licence is yours to
+  check.
+
+A track that ffmpeg cannot read is dropped with a warning rather than failing
+the reel, like everything else here.
 
 ## Step 6 — Instagram caption + hashtags
 

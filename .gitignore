@@ -6,6 +6,12 @@ output/
 assets/visuals/*
 !assets/visuals/.gitkeep
 
+# Music beds: yours, and yours to have licensed. The credit sidecars are text
+# worth keeping; the audio is not something to commit.
+assets/music/*
+!assets/music/.gitkeep
+!assets/music/*.txt
+
 # Python
 __pycache__/
 *.py[cod]
