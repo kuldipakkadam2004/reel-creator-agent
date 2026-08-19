@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Generated media / artifacts
+output/
+assets/visuals/*
+!assets/visuals/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

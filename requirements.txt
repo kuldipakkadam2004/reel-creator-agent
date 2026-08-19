@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# Reel Creator Agent — dependencies
+# Grouped by build step. Uncomment a group when we start that step.
+# ---------------------------------------------------------------------------
+
+# Step 1 — scaffolding / config
+python-dotenv>=1.0.0
+
+# Step 2 — script generation (Gemini)
+google-genai>=1.0.0
+
+# Step 3 — text-to-speech (ElevenLabs)
+#   Raw REST via requests instead of the `elevenlabs` SDK — one endpoint, and
+#   it keeps the API's own error payload intact. mutagen reads .mp3 duration
+#   from the frame headers (pure Python, no ffmpeg).
+requests>=2.31.0
+mutagen>=1.47.0
+
+# Step 4 — visual sourcing (Pexels / Pixabay / Openverse)
+#   `requests` above does the HTTP. Pillow measures downloaded stills: providers
+#   sometimes report the original's dimensions while serving a smaller file, and
+#   the 9:16 resolution floor has to be applied to what actually arrived.
+Pillow>=10.0.0
+
+# Step 5 — video assembly
+#   Raw ffmpeg subprocess calls, not moviepy: the whole edit goes into one
+#   filter_complex, which is one encode instead of moviepy's write-then-concat,
+#   and burning captions in needs libass either way.
+#   imageio-ffmpeg only ships the binary — it is the fallback when the machine
+#   has no ffmpeg on PATH. Delete it if you install ffmpeg yourself (it must be
+#   built --enable-libass, or the captions cannot be burned in).
+#   Pillow (above) measures caption text so a long word can be scaled to fit.
+imageio-ffmpeg>=0.4.9
+
+#   Optional: local word-level timestamps, used when CAPTION_ALIGNMENT=whisper
+#   or when the ElevenLabs alignment call fails. Pulls a model down on first
+#   run; the default (ElevenLabs forced alignment) needs neither.
+# faster-whisper>=1.0.0
+
+# Step 6 — Instagram caption + hashtags
+#   No new dependency: the copy goes through step 2's Gemini client
+#   (`script_gen.call_gemini`) rather than a second one, and everything after
+#   the call - character limits, tag hygiene, attribution - is stdlib.
+
+# Step 7 — Telegram delivery
+# python-telegram-bot>=21.0
+
+# Later (NOT step 8) — scheduling / HTTP endpoints. Deliberately deferred.
+# fastapi>=0.110.0
+# uvicorn[standard]>=0.29.0

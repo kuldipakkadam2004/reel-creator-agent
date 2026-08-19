@@ -1,0 +1,1552 @@
+"""Step 6 - the Instagram post text: caption copy plus hashtags.
+
+Takes the narration script (step 2's, or the copy step 5 carried into the run
+directory) and writes the words that go in Instagram's caption field:
+
+    post.txt   the exact caption, ready to hand to the Graph API
+    post.json  the same thing in parts - hook, body, CTA, tags, credits,
+               character counts, and every warning raised on the way
+
+Both land in output/<date>/<run id>/ next to reel.mp4, so step 7 picks up the
+video and its caption together.
+
+Nothing here touches the burned-in captions from step 5 - those are pixels
+inside the video. This is the post copy underneath it.
+
+What happens, in order:
+
+  1. the script, topic and niche are read from whatever this was handed:
+     step 2's dict, a run directory, assembly.json, or a bare .txt;
+  2. Gemini writes the copy and a tiered set of hashtags in one JSON call,
+     through step 2's client rather than a second one. POST_MODE=heuristic, a
+     missing key or a failed call all fall back to keyword extraction instead;
+  3. the draft is then held to Instagram's real constraints in code, because a
+     model cannot be trusted with a character count: the hook is cut to
+     POST_HOOK_MAX_CHARS at a sentence boundary so it never reads as a
+     truncated line, tags are normalised, deduped, banned-checked and mixed
+     across tiers, banned words are re-checked and must-include phrases added;
+  4. footage whose licence requires a credit gets one, in the form that licence
+     expects (POST_ATTRIBUTION);
+  5. anything still over the 2200-character limit is trimmed from the bottom -
+     courtesy credits first; the hook and required credits, never.
+
+Every knob - tone, tag count, attribution, banned words - lives in config.py.
+
+Standalone use:
+    python pipeline/caption.py -r output/2026-08-19/ocean-1a2b3c
+    python pipeline/caption.py -f output/scripts/ocean.json --hashtags 12
+    python pipeline/caption.py -f output/scripts/ocean.txt --dry-run --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field as dataclass_field
+from datetime import datetime, timezone
+from hashlib import sha1
+from pathlib import Path
+
+# Allow both `python pipeline/caption.py` and `python -m pipeline.caption`
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import config  # noqa: E402
+from pipeline import script_gen  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Tunables. The voice, the tag count and the attribution policy are config.py's
+# job - what follows is mechanical: what the files are called, how much slack to
+# leave the model, and the word lists the no-API fallback needs.
+# ---------------------------------------------------------------------------
+
+#: Bumped when the shape of post.json changes, so step 7 can tell.
+POST_VERSION = 1
+
+#: Written into the run directory. The `captions.*` files beside them are step
+#: 5's burned-in subtitles - deliberately a different word.
+POST_TEXT_NAME = "post.txt"
+POST_JSON_NAME = "post.json"
+
+#: Only written when POST_HASHTAG_PLACEMENT=comment. Kept out of post.txt so
+#: that file is always exactly the caption and nothing else - step 7 posting
+#: it verbatim can never put the tag block in the caption by accident.
+POST_COMMENT_NAME = "post_comment.txt"
+
+#: Written by step 5. Where the script, topic and per-asset credits come from
+#: when this is pointed at a run directory.
+ASSEMBLY_NAME = "assembly.json"
+
+#: Step 4's, read the same way if this is pointed at a visuals run instead.
+MANIFEST_NAME = "manifest.json"
+
+#: Gemini sampling. Warmer than step 4's query pass - this is copy, not search
+#: terms - and a little cooler than step 2's script.
+TEMPERATURE = 0.9
+MAX_OUTPUT_TOKENS = 2048
+THINKING_BUDGET = 0
+
+#: How the tag slots are split. Broad tags place the post in a subject area,
+#: niche ones reach the people who actually care, and mid does the work of
+#: saying what this particular video is. Ratios, so the mix survives a changed
+#: POST_HASHTAG_COUNT.
+HASHTAG_MIX = (("broad", 0.25), ("mid", 0.45), ("niche", 0.30))
+
+#: Ask each tier for a few more than its quota, so dedupe and the banned list
+#: have something to eat without leaving the mix short.
+HASHTAG_OVERASK = 3
+
+#: Longest tag worth having. Instagram accepts more; nobody searches it.
+HASHTAG_MAX_CHARS = 30
+
+#: Paragraph count asked of the model.
+BODY_MIN_PARAGRAPHS = 1
+BODY_MAX_PARAGRAPHS = 3
+
+#: Runs kept in the hashtag ledger.
+LEDGER_KEEP_RUNS = 50
+
+#: Instagram's cap on @mentions in one caption. Only warned about - the copy
+#: never adds mentions by itself, they arrive via POST_MUST_INCLUDE.
+MENTION_LIMIT = 20
+
+
+class CaptionError(RuntimeError):
+    """Raised when there is no usable script, or nowhere to write the post."""
+
+
+# ---------------------------------------------------------------------------
+# Text hygiene
+# ---------------------------------------------------------------------------
+
+#: The ranges step 2 strips from a script. Here they are counted rather than
+#: removed - a caption may keep a couple (POST_ALLOW_EMOJI / POST_MAX_EMOJI).
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001f300-\U0001faff"  # pictographs, emoticons, symbols
+    "\U00002600-\U000027bf"  # misc symbols and dingbats
+    "\U0001f1e6-\U0001f1ff"  # regional indicators
+    "\U00002190-\U000021ff"  # arrows
+    "\U00002b00-\U00002bff"
+    "]"
+)
+
+#: Zero-width joiners, skin tones and variation selectors, so a multi-codepoint
+#: emoji is not left half-deleted behind a stripped one.
+_EMOJI_GLUE_RE = re.compile(
+    "[\U0000fe00-\U0000fe0f\U0000200d\U0001f3fb-\U0001f3ff]"
+)
+
+#: Labels a model sometimes prefixes to a field despite being told not to.
+_LABEL_RE = re.compile(
+    r"^\s*(?:\*\*)?(?:caption|hook|body|cta|post|hashtags?)"
+    r"(?:\s*\(.*?\))?(?:\*\*)?\s*[:\-]\s*",
+    flags=re.IGNORECASE,
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])[\"'”’]?\s+")
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]+")
+
+#: A hook must not end on one of these. It leaves the reader mid-thought, which
+#: is exactly what Instagram's own "... more" already does to a caption.
+_DANGLING_WORDS = frozenset("""
+a an and as at because before but by for from how if in into like of on or so
+than that the then to until upon when where which while who with without your
+""".split())
+
+#: Words that make a poor hashtag on their own.
+_STOPWORDS = frozenset("""
+about after all also and any are around because been before being both but can
+could did does doing down each even ever every few for from get gets got had
+has have having her here hers him his how into its itself just like made make
+makes many may more most much must not now off once one only other our out
+over own same she should some such than that the their them then there these
+they thing things this those through too under until very was way were what
+when where which while who why will with would you your
+""".split())
+
+#: Instagram tags allow letters, digits and underscores. Everything else -
+#: spaces, punctuation, emoji - is stripped rather than the tag thrown away.
+_TAG_STRIP_RE = re.compile(r"[^\w]", flags=re.UNICODE)
+
+_MENTION_RE = re.compile(r"(?<![\w@])@[A-Za-z0-9._]+")
+
+
+def strip_markup(text: str) -> str:
+    """Remove the markdown, fences and labels a model adds on its own."""
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = re.sub(r"[*_`]{1,3}(?=\S)", "", cleaned)      # **bold**, __italic__
+    cleaned = re.sub(r"(?<=\S)[*_`]{1,3}", "", cleaned)
+    cleaned = re.sub(r"^#{1,6}\s+", "", cleaned, flags=re.MULTILINE)
+    cleaned = "\n".join(_LABEL_RE.sub("", line) for line in cleaned.splitlines())
+    cleaned = cleaned.strip()
+    if (len(cleaned) >= 2 and cleaned[0] in "\"'“‘"
+            and cleaned[-1] in "\"'”’"):
+        cleaned = cleaned[1:-1].strip()
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    return cleaned.strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split on sentence ends, keeping the punctuation."""
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(str(text or "").strip())]
+    return [p for p in parts if p]
+
+
+def count_emoji(text: str) -> int:
+    return len(_EMOJI_RE.findall(text or ""))
+
+
+def apply_emoji_budget(fields: list[str], *, allowed: bool,
+                       maximum: int) -> tuple[list[str], list[str]]:
+    """Hold a run of copy to its emoji budget, spending it top-down.
+
+    The hook is worth an emoji far more than the third paragraph is, so the
+    budget is spent in reading order and the surplus stripped from the end.
+    """
+    budget_total = max(0, maximum) if allowed else 0
+    seen = sum(count_emoji(field) for field in fields)
+    if seen <= budget_total:
+        return list(fields), []
+
+    budget = budget_total
+    trimmed: list[str] = []
+    for field in fields:
+        matches = list(_EMOJI_RE.finditer(field))
+        if len(matches) <= budget:
+            budget -= len(matches)
+            trimmed.append(field)
+            continue
+        surplus = matches[budget:]
+        budget = 0
+        for match in reversed(surplus):
+            field = field[:match.start()] + field[match.end():]
+        field = _EMOJI_GLUE_RE.sub("", field)
+        trimmed.append(re.sub(r"[ \t]{2,}", " ", field).strip())
+
+    note = (f"stripped {seen - budget_total} emoji - the copy came back with "
+            f"{seen} against a budget of {budget_total}"
+            if budget_total else
+            f"stripped {seen} emoji (POST_ALLOW_EMOJI is off)")
+    return trimmed, [note]
+
+
+def _undangle(text: str) -> str:
+    """Trim a line back off a dangling connector, leaving a finished thought."""
+    cleaned = text.strip()
+    if cleaned.endswith((".", "!", "?", "…", ":")):
+        return cleaned                      # already a finished sentence
+    cleaned = cleaned.rstrip(",;:-–— ")
+    words = cleaned.split()
+    while words and words[-1].lower().strip("’'") in _DANGLING_WORDS:
+        words.pop()
+    return " ".join(words).rstrip(",;:-–— ")
+
+
+def fit_hook(text: str, limit: int) -> tuple[str, list[str]]:
+    """Cut the first line down to `limit` without leaving it mid-sentence.
+
+    Instagram shows only the opening of a caption before "... more", so for
+    most of the people who see the post this line *is* the caption. It is
+    shortened at a sentence break first, a clause break second, and at a word
+    boundary only as a last resort - never with an ellipsis, which is what the
+    platform's own truncation already looks like.
+    """
+    hook = strip_markup(" ".join(str(text or "").split()))
+    if not hook:
+        return "", ["the generated hook was empty"]
+    if len(hook) <= limit:
+        return _undangle(hook), []
+
+    sentences = split_sentences(hook)
+    kept: list[str] = []
+    for sentence in sentences:
+        if len(" ".join(kept + [sentence])) > limit:
+            break
+        kept.append(sentence)
+    if kept:
+        return _undangle(" ".join(kept)), [
+            f"hook was {len(hook)} chars; kept the first {len(kept)} "
+            f"sentence(s) to fit {limit}"
+        ]
+
+    first = sentences[0] if sentences else hook
+    clause = ""
+    for match in re.finditer(r"\s*[,;:–—]\s+", first):
+        piece = first[:match.start()].strip()
+        if piece and len(piece) <= limit:
+            clause = piece
+    if clause:
+        return _undangle(clause), [
+            f"hook was {len(hook)} chars with no sentence break inside "
+            f"{limit}; cut at a clause boundary"
+        ]
+
+    cut = first[:limit + 1].rsplit(" ", 1)[0]
+    return _undangle(cut), [
+        f"hook was {len(hook)} chars with no sentence or clause break inside "
+        f"{limit}; cut at a word boundary - check it still reads as a hook"
+    ]
+
+
+def normalise_tag(raw: str) -> str | None:
+    """Turn whatever the model wrote into a tag Instagram will accept.
+
+    Casing is kept - #DeepSeaCreatures reads better than the flattened version
+    and matches the same tag either way - but anything Instagram would refuse
+    is stripped rather than the tag thrown away.
+    """
+    text = str(raw or "").strip().lstrip("#").strip()
+    text = _TAG_STRIP_RE.sub("", text)
+    if not text or text.isdigit() or len(text) < 2:
+        return None
+    if len(text) > HASHTAG_MAX_CHARS:
+        return None
+    return text
+
+
+def _stem(raw: str) -> str:
+    """Lowercase a word and drop any contraction or possessive tail.
+
+    Without this "It’s" survives as "its" and normalises into the tag
+    #its, which says nothing about anything.
+    """
+    return re.split(r"['’]", str(raw).lower(), maxsplit=1)[0].strip("-")
+
+
+def _is_content_word(word: str) -> bool:
+    return len(word) >= 4 and word not in _STOPWORDS and not word.isdigit()
+
+
+def keywords(text: str, limit: int = 6) -> list[str]:
+    """The most tag-worthy words in `text`, best first. No API, no deps."""
+    scores: dict[str, float] = {}
+    order: list[str] = []
+    for raw in _WORD_RE.findall(text or ""):
+        word = _stem(raw)
+        if not _is_content_word(word):
+            continue
+        if word not in scores:
+            order.append(word)
+            scores[word] = min(len(word), 12) / 12.0
+            if raw[0].isupper() and raw != "I":
+                scores[word] += 0.4
+        scores[word] += 0.3                   # repetition is the real signal
+    return sorted(order, key=lambda w: (-scores[w], order.index(w)))[:limit]
+
+
+def phrases(text: str, limit: int = 4) -> list[str]:
+    """Two-word phrases that stand on their own, for the long-tail tier.
+
+    Only words that sit next to each other in the text count - "deep ocean"
+    and "total darkness" are things people search for, whereas pairing the two
+    highest-scoring words in a script gives a tag nobody has ever typed.
+    """
+    scores: dict[str, float] = {}
+    order: list[str] = []
+    # Punctuation ends a run: a pair either side of a comma is not a phrase.
+    for run in re.split(r"[^\w\s'’-]+", text or ""):
+        words = [_stem(w) for w in _WORD_RE.findall(run)]
+        for first, second in zip(words, words[1:]):
+            if not (_is_content_word(first) and _is_content_word(second)):
+                continue
+            phrase = f"{first}{second}"
+            if len(phrase) > HASHTAG_MAX_CHARS:
+                continue
+            if phrase not in scores:
+                order.append(phrase)
+                scores[phrase] = 0.0
+            scores[phrase] += 1.0
+    return sorted(order, key=lambda p: (-scores[p], order.index(p)))[:limit]
+
+
+# ---------------------------------------------------------------------------
+# What this was handed
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Source:
+    """Everything the copy is written from, wherever it arrived from."""
+
+    script: str = ""
+    topic: str = ""
+    niche: str = ""
+    run_id: str = ""
+    run_dir: Path | None = None
+    credits: list[dict] = dataclass_field(default_factory=list)
+    script_path: Path | None = None
+    assembly_path: Path | None = None
+    warnings: list[str] = dataclass_field(default_factory=list)
+
+
+def _read_json(path: Path, default: dict) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else dict(default)
+    except (OSError, ValueError):
+        return dict(default)
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Write JSON atomically, so a crash cannot corrupt the ledger."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".part")
+    try:
+        with open(partial, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+        os.replace(partial, path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def _slug(text: str, limit: int = 48) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+    return slug[:limit].strip("-")
+
+
+def _from_mapping(data: dict) -> Source:
+    """Read step 2's script dict, step 4's manifest or step 5's assembly.
+
+    All three carry `topic` and `script` under the same names; only the last
+    two carry `attributions`, and only step 5's names an output directory.
+    """
+    output_dir = data.get("output_dir")
+    return Source(
+        script=str(data.get("script") or "").strip(),
+        topic=str(data.get("topic") or "").strip(),
+        niche=str(data.get("niche") or "").strip(),
+        run_id=str(data.get("run_id") or "").strip(),
+        run_dir=Path(output_dir) if output_dir else None,
+        credits=[c for c in (data.get("attributions") or [])
+                 if isinstance(c, dict)],
+    )
+
+
+def _from_directory(directory: Path) -> Source:
+    """Read a run directory: step 5's assembly.json, or step 4's manifest."""
+    for name in (ASSEMBLY_NAME, MANIFEST_NAME):
+        path = directory / name
+        if not path.is_file():
+            continue
+        data = _read_json(path, {})
+        if not data.get("script"):
+            continue
+        resolved = _from_mapping(data)
+        resolved.assembly_path = path
+        resolved.run_dir = directory
+        return resolved
+
+    raise CaptionError(
+        f"{directory} holds no {ASSEMBLY_NAME} or {MANIFEST_NAME} with a "
+        f"script in it. Point -r at a run directory written by step 5, or "
+        f"pass the script itself with -f."
+    )
+
+
+def _from_file(path: Path) -> Source:
+    """Read a .json script/assembly, or a .txt script with its sidecar."""
+    if path.suffix.lower() == ".json":
+        data = _read_json(path, {})
+        if not data.get("script"):
+            raise CaptionError(f"{path} has no 'script' field to write about.")
+        resolved = _from_mapping(data)
+        if data.get("assembly_version") or data.get("manifest_version"):
+            resolved.assembly_path = path
+            resolved.run_dir = resolved.run_dir or path.parent
+        else:
+            resolved.script_path = path
+        return resolved
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CaptionError(f"could not read {path}: {exc}") from exc
+
+    resolved = Source(script=text.strip(), script_path=path)
+    # Step 2 writes ocean.txt and ocean.json side by side; the sidecar is the
+    # only place the topic survives, so prefer it over guessing from the name.
+    sidecar = path.with_suffix(".json")
+    if sidecar.is_file():
+        resolved.topic = str(_read_json(sidecar, {}).get("topic") or "").strip()
+    if not resolved.topic:
+        resolved.topic = path.stem.replace("_", " ").replace("-", " ").strip()
+    return resolved
+
+
+def resolve_source(source) -> Source:
+    """Accept a dict, a run directory, a script file, or the script itself."""
+    if isinstance(source, Source):
+        resolved = source
+    elif isinstance(source, dict):
+        resolved = _from_mapping(source)
+    elif isinstance(source, Path) or (
+            isinstance(source, str) and _looks_like_path(source)):
+        path = Path(source)
+        resolved = _from_directory(path) if path.is_dir() else _from_file(path)
+    else:
+        resolved = Source(script=str(source or "").strip())
+
+    resolved.script = strip_markup(resolved.script)
+    if not resolved.script:
+        raise CaptionError("the script is empty - there is nothing to caption.")
+    return resolved
+
+
+def _looks_like_path(text: str) -> bool:
+    """True when a string is a path that exists, rather than a script."""
+    if not text or len(text) > 260 or "\n" in text:
+        return False
+    try:
+        return Path(text).exists()
+    except OSError:
+        return False
+
+
+def _default_run_id(source: Source) -> str:
+    """Same shape step 4 uses: a slug of the topic plus a hash of the script."""
+    stem = _slug(source.topic) or _slug(" ".join(source.script.split()[:6]))
+    digest = sha1(source.script.encode("utf-8")).hexdigest()[:8]
+    return f"{stem or 'post'}-{digest}"
+
+
+# ---------------------------------------------------------------------------
+# Cross-run hashtag ledger
+# ---------------------------------------------------------------------------
+
+class HashtagLedger:
+    """Which tags the last few posts used.
+
+    Not a ban list. A tag that genuinely belongs on this post still goes on it;
+    this only breaks ties, so consecutive posts do not carry an identical block
+    of eight - which is what makes a feed read as automated.
+    """
+
+    def __init__(self, path: Path | str | None = None):
+        self.path = Path(path or config.POST_HASHTAG_USAGE_FILE)
+        self._data = _read_json(self.path, {"version": 1, "runs": []})
+        if not isinstance(self._data.get("runs"), list):
+            self._data["runs"] = []
+
+    def recent(self, runs: int, *, exclude: str = "") -> list[str]:
+        """Tags from the last `runs` posts, this run's own history aside.
+
+        Re-running the same run id must not see its own previous tags as
+        "recently used", or a re-run would drift away from its best answer.
+        """
+        if runs <= 0:
+            return []
+        entries = [e for e in self._data["runs"]
+                   if isinstance(e, dict) and e.get("run_id") != exclude]
+        tags: list[str] = []
+        for entry in entries[-runs:]:
+            tags.extend(str(t) for t in (entry.get("hashtags") or []))
+        return list(dict.fromkeys(tags))
+
+    def record(self, run_id: str, tags: list[str]) -> None:
+        entries = [e for e in self._data["runs"]
+                   if isinstance(e, dict) and e.get("run_id") != run_id]
+        entries.append({
+            "run_id": run_id,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "hashtags": list(tags),
+        })
+        self._data["runs"] = entries[-LEDGER_KEEP_RUNS:]
+
+    def save(self) -> list[str]:
+        """Persist. A ledger that cannot be written is a warning, not a failure."""
+        try:
+            _write_json(self.path, self._data)
+        except OSError as exc:
+            return [f"could not update the hashtag ledger at {self.path}: {exc}"]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# The draft: what the copy says, before it is held to any limit
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Draft:
+    hook: str = ""
+    body: list[str] = dataclass_field(default_factory=list)
+    cta: str = ""
+    hashtags: dict[str, list[str]] = dataclass_field(default_factory=dict)
+    source: str = "llm"
+
+
+SYSTEM_INSTRUCTION = """\
+You write the caption that sits under a short-form vertical video on Instagram.
+
+You are not writing the video - it already exists. The viewer reads you either \
+before it plays or after it has already landed, so the caption's job is to \
+earn the tap on "... more" and then be worth having read.
+
+You write like a person who knows the subject, not like a brand account. Short \
+lines. Concrete detail over adjectives. No engagement bait, no "Did you know", \
+no rows of emoji, no motivational filler, no restating what the video just said.
+
+You always return valid JSON and nothing else."""
+
+
+PROMPT_TEMPLATE = """\
+Write the Instagram caption for this reel.
+
+Topic: {topic}
+Account subject area: {niche}
+
+The narration the viewer hears, in full:
+\"\"\"
+{script}
+\"\"\"
+
+Fields:
+
+"hook" - the first line of the caption, and the only part Instagram shows \
+before it cuts to "... more". At most {hook_max} characters. It has to work \
+alone: a finished thought, never the opening half of a sentence, never ending \
+on a comma or a dangling connector. Do not restate the video's first line word \
+for word - the viewer is already getting that.
+
+"body" - {body_min} to {body_max} short paragraphs, one string per paragraph. \
+Give the reader something the narration does not: the detail behind it, the \
+number, the caveat, why it is worth knowing. Do not summarise the video.
+
+"cta" - one closing line: {cta}. Use "" if it would only be filler.
+
+"hashtags" - {tag_total} tags in three tiers, every one of them earned by what \
+THIS script is about rather than by the subject in general:
+  "broad": {broad} big tags for the subject area
+  "mid":   {mid} tags for the specific subject of this video
+  "niche": {niche_n} long-tail tags someone deep in this topic would follow
+Each tag: no "#", no spaces, no punctuation, no emoji, {tag_max} characters at \
+most. Do not repeat a word across tiers.
+
+Tone: {tone}
+{rules}
+Return ONLY this JSON object:
+{{"hook": "...", "body": ["...", "..."], "cta": "...",
+  "hashtags": {{"broad": ["..."], "mid": ["..."], "niche": ["..."]}}}}"""
+
+
+def tag_quota(count: int) -> dict[str, int]:
+    """Split `count` slots across the tiers, remainder to the widest share."""
+    count = max(0, count)
+    quota = {tier: int(count * ratio) for tier, ratio in HASHTAG_MIX}
+    widest = [tier for tier, _ in sorted(HASHTAG_MIX, key=lambda pair: -pair[1])]
+    index = 0
+    while sum(quota.values()) < count:          # the rounding remainder
+        quota[widest[index % len(widest)]] += 1
+        index += 1
+    return quota
+
+
+def build_prompt(script: str, *, topic: str, niche: str, hook_max: int,
+                 count: int, tone: str, cta: str, rules: list[str]) -> str:
+    """Render the prompt. Every constraint in it also exists in code below."""
+    quota = tag_quota(count)
+    asked = {tier: quota[tier] + HASHTAG_OVERASK if quota[tier] else 0
+             for tier in quota}
+    rule_block = "".join(f"- {rule}\n" for rule in rules if rule)
+    return PROMPT_TEMPLATE.format(
+        topic=topic or "(not given - take it from the script)",
+        niche=niche or "(not given - take it from the script)",
+        script=script,
+        hook_max=hook_max,
+        body_min=BODY_MIN_PARAGRAPHS,
+        body_max=BODY_MAX_PARAGRAPHS,
+        cta=cta or "leave it empty",
+        tag_total=sum(asked.values()),
+        broad=asked["broad"], mid=asked["mid"], niche_n=asked["niche"],
+        tag_max=HASHTAG_MAX_CHARS,
+        tone=tone,
+        rules=f"\nAlso:\n{rule_block}" if rule_block else "",
+    )
+
+
+def _prompt_rules(*, banned_words, banned_tags, must_include, recent_tags,
+                  emoji_allowed: bool, emoji_max: int) -> list[str]:
+    """The run-specific rules bolted onto the prompt, from config.py."""
+    rules = []
+    if emoji_allowed and emoji_max:
+        rules.append(f"At most {emoji_max} emoji in the whole caption, and only "
+                     f"where one earns its place. None in the hashtags.")
+    else:
+        rules.append("No emoji anywhere in the caption.")
+    if banned_words:
+        rules.append("These words must not appear anywhere in the copy: "
+                     + ", ".join(sorted(banned_words)) + ".")
+    if banned_tags:
+        rules.append("Never use these hashtags: "
+                     + ", ".join("#" + t for t in sorted(banned_tags)) + ".")
+    if must_include:
+        rules.append("Work these in verbatim, without changing the wording: "
+                     + "; ".join(must_include) + ".")
+    if recent_tags:
+        rules.append("Recent posts already used these tags - prefer fresh ones "
+                     "unless a tag genuinely belongs on this post: "
+                     + ", ".join("#" + t for t in recent_tags[:24]) + ".")
+    return rules
+
+
+def _parse_draft_json(raw: str) -> Draft:
+    """Read the model's JSON object into a Draft, tolerantly."""
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"no JSON object in model output: {text[:200]!r}")
+    data = json.loads(text[start:end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("model output was not a JSON object")
+
+    body_raw = data.get("body")
+    if isinstance(body_raw, str):
+        body_raw = [p for p in body_raw.split("\n\n")]
+    body = [strip_markup(p) for p in (body_raw or []) if str(p or "").strip()]
+
+    tiers: dict[str, list[str]] = {}
+    hashtags = data.get("hashtags")
+    if isinstance(hashtags, dict):
+        for tier, _ in HASHTAG_MIX:
+            tiers[tier] = [str(t) for t in (hashtags.get(tier) or [])
+                           if str(t or "").strip()]
+    elif isinstance(hashtags, list):     # a flat list: treat it as the mid tier
+        tiers = {"broad": [], "mid": [str(t) for t in hashtags], "niche": []}
+
+    draft = Draft(
+        hook=strip_markup(data.get("hook") or ""),
+        body=body[:BODY_MAX_PARAGRAPHS],
+        cta=strip_markup(data.get("cta") or ""),
+        hashtags=tiers,
+    )
+    if not draft.hook and not draft.body:
+        raise ValueError("model returned neither a hook nor a body")
+    return draft
+
+
+def llm_draft(script: str, *, topic: str, niche: str, count: int,
+              rules: list[str]) -> tuple[Draft | None, list[str]]:
+    """One Gemini call for the whole caption. Never raises; returns warnings.
+
+    Goes through step 2's client (`script_gen.call_gemini`) rather than
+    building a second one, so the key lookup and the model-family quirks stay
+    in one place.
+    """
+    prompt = build_prompt(
+        script, topic=topic, niche=niche,
+        hook_max=config.POST_HOOK_MAX_CHARS, count=count,
+        tone=config.POST_TONE, cta=config.POST_CTA, rules=rules,
+    )
+    try:
+        raw = script_gen.call_gemini(
+            prompt,
+            system_instruction=SYSTEM_INSTRUCTION,
+            temperature=TEMPERATURE,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            thinking_budget=THINKING_BUDGET,
+            json_mode=True,
+        )
+    except config.MissingConfigError as exc:
+        return None, [f"POST_MODE=llm but {exc} Wrote the caption from "
+                      f"keywords instead."]
+    except script_gen.ScriptGenerationError as exc:
+        return None, [f"Gemini caption generation failed ({exc}). Wrote the "
+                      f"caption from keywords instead."]
+
+    try:
+        return _parse_draft_json(raw), []
+    except (ValueError, TypeError) as exc:
+        return None, [f"Gemini returned an unusable caption ({exc}). Wrote the "
+                      f"caption from keywords instead."]
+
+
+def heuristic_draft(script: str, *, topic: str, niche: str,
+                    count: int) -> Draft:
+    """A caption with no API call behind it: the script's own best lines.
+
+    Worse than the model on every axis - it can only reuse what the narration
+    already said - but it always works, and a post with a flat caption beats a
+    run that died at step 6.
+    """
+    sentences = split_sentences(script)
+    hook = next((s for s in sentences if len(s) <= config.POST_HOOK_MAX_CHARS),
+                sentences[0] if sentences else topic)
+
+    rest = [s for s in sentences if s != hook]
+    body: list[str] = []
+    for start in range(0, min(len(rest), 4), 2):
+        paragraph = " ".join(rest[start:start + 2]).strip()
+        if paragraph:
+            body.append(paragraph)
+        if len(body) >= BODY_MAX_PARAGRAPHS - 1:
+            break
+
+    terms = keywords(f"{topic} {script}", limit=max(6, count * 2))
+    niche_terms = keywords(niche, limit=2) if niche else []
+    quota = tag_quota(count)
+    broad = list(dict.fromkeys(niche_terms + keywords(topic, limit=3)))
+    mid = [t for t in terms if t not in broad]
+    pairs = [p for p in phrases(f"{topic}. {script}", limit=count)
+             if p not in broad and p not in mid]
+
+    return Draft(
+        hook=hook,
+        body=body,
+        cta="",                       # POST_CTA describes a style, not a line
+        hashtags={
+            "broad": broad[:quota["broad"] + HASHTAG_OVERASK],
+            "mid": mid[:quota["mid"] + HASHTAG_OVERASK],
+            "niche": pairs[:quota["niche"] + HASHTAG_OVERASK],
+        },
+        source="heuristic",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Banned words
+# ---------------------------------------------------------------------------
+
+def banned_hits(draft: Draft, words) -> list[str]:
+    """Which banned words the copy actually used. Whole words, case-blind."""
+    if not words:
+        return []
+    text = " ".join([draft.hook, *draft.body, draft.cta]).lower()
+    return [w for w in words
+            if re.search(rf"\b{re.escape(w)}\b", text, flags=re.IGNORECASE)]
+
+
+def scrub_banned(draft: Draft, words) -> tuple[Draft, list[str]]:
+    """Last resort when the model keeps using a banned word.
+
+    Offending paragraphs and CTAs are dropped outright. A hook is not - a
+    caption with no first line is worse than one that needs a human's eye - so
+    that case is reported loudly and left for the operator to fix.
+    """
+    warnings: list[str] = []
+
+    def offends(text: str) -> list[str]:
+        return [w for w in words
+                if re.search(rf"\b{re.escape(w)}\b", text, flags=re.IGNORECASE)]
+
+    kept = [p for p in draft.body if not offends(p)]
+    if len(kept) != len(draft.body):
+        warnings.append(
+            f"dropped {len(draft.body) - len(kept)} paragraph(s) using banned "
+            f"word(s) from POST_BANNED_WORDS"
+        )
+    draft.body = kept or draft.body[:1]
+
+    if draft.cta and offends(draft.cta):
+        warnings.append("dropped the CTA: it used a banned word")
+        draft.cta = ""
+
+    hook_hits = offends(draft.hook)
+    if hook_hits:
+        warnings.append(
+            f"the hook still uses banned word(s) {', '.join(hook_hits)} - "
+            f"left in place rather than mangling the first line. Fix it by "
+            f"hand before posting."
+        )
+    return draft, warnings
+
+
+# ---------------------------------------------------------------------------
+# Hashtags
+# ---------------------------------------------------------------------------
+
+def select_hashtags(tiers: dict, *, count: int, always=(), banned_tags=(),
+                    banned_words=(), recent=()) -> tuple[list[str], dict, list[str]]:
+    """Pick the final tag set: mixed across tiers, deduped, freshest first.
+
+    Returns the tags in posting order, a {tag: tier} map for post.json, and any
+    warnings. Tags from POST_HASHTAGS_ALWAYS come first and are never dropped
+    for a generated one.
+    """
+    warnings: list[str] = []
+    banned_set = {str(t).lower().lstrip("#") for t in banned_tags}
+    words = tuple(str(w).lower() for w in banned_words)
+    recent_set = {str(t).lower() for t in recent}
+
+    chosen: list[str] = []
+    tier_of: dict[str, str] = {}
+    seen: set[str] = set()
+    dropped: list[str] = []
+
+    def refused(tag: str) -> bool:
+        low = tag.lower()
+        return low in banned_set or any(w and w in low for w in words)
+
+    def add(tag: str, tier: str) -> bool:
+        low = tag.lower()
+        if low in seen:
+            return False
+        seen.add(low)
+        chosen.append(tag)
+        tier_of[tag] = tier
+        return True
+
+    for raw in always:
+        tag = normalise_tag(raw)
+        if not tag:
+            continue
+        if refused(tag):
+            dropped.append(tag)
+            continue
+        add(tag, "always")
+
+    pool: dict[str, list[str]] = {}
+    for tier, _ in HASHTAG_MIX:
+        items: list[str] = []
+        for raw in tiers.get(tier) or []:
+            tag = normalise_tag(raw)
+            if not tag:
+                continue
+            if refused(tag):
+                dropped.append(tag)
+                continue
+            items.append(tag)
+        pool[tier] = items
+
+    quota = tag_quota(max(0, count - len(chosen)))
+    for tier, want in quota.items():
+        taken = 0
+        fresh = [t for t in pool[tier] if t.lower() not in recent_set]
+        stale = [t for t in pool[tier] if t.lower() in recent_set]
+        for tag in fresh + stale:
+            if taken >= want or len(chosen) >= count:
+                break
+            if add(tag, tier):
+                taken += 1
+
+    if len(chosen) < count:                 # a tier came up short - top up
+        leftovers = [(t, tier) for tier in ("mid", "niche", "broad")
+                     for t in pool.get(tier, [])]
+        leftovers.sort(key=lambda pair: pair[0].lower() in recent_set)
+        for tag, tier in leftovers:
+            if len(chosen) >= count:
+                break
+            add(tag, tier)
+
+    if dropped:
+        warnings.append("dropped banned tag(s): "
+                        + ", ".join("#" + t for t in dict.fromkeys(dropped)))
+    if len(chosen) < count:
+        warnings.append(
+            f"only {len(chosen)} of {count} hashtags survived normalising and "
+            f"deduping - the generator did not return enough usable tags"
+        )
+    if len(chosen) > config.POST_HASHTAG_LIMIT:
+        warnings.append(
+            f"trimmed to Instagram's limit of {config.POST_HASHTAG_LIMIT} tags"
+        )
+        chosen = chosen[:config.POST_HASHTAG_LIMIT]
+
+    reused = [t for t in chosen if t.lower() in recent_set]
+    if recent_set and len(reused) == len(chosen) and chosen:
+        warnings.append(
+            "every tag here was used by a recent post - the set is not varying"
+        )
+    return chosen, {t: tier_of[t] for t in chosen}, warnings
+
+
+# ---------------------------------------------------------------------------
+# Attribution carried through from step 4 (via step 5's assembly.json)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Credits:
+    """The credit block, split by whether a licence actually demands it."""
+
+    header: str = ""
+    required: list[str] = dataclass_field(default_factory=list)
+    courtesy: str = ""
+    mode: str = "required"
+    assets: int = 0
+
+    def block(self, *, courtesy: bool = True) -> str:
+        lines = list(self.required)
+        if courtesy and self.courtesy:
+            lines.append(self.courtesy)
+        if not lines:
+            return ""
+        if not self.required and courtesy and self.courtesy:
+            return f"{self.header} {self.courtesy}".strip()
+        return "\n".join([self.header, *lines]) if self.header else "\n".join(lines)
+
+
+def _credit_line(credit: dict) -> str:
+    """One asset's credit, in the form its licence asks for.
+
+    Step 4 already built the string a CC licence wants - title, creator,
+    licence and source - so it is used as given rather than rebuilt from parts.
+    """
+    line = str(credit.get("attribution") or "").strip()
+    if line:
+        return line
+    creator = str(credit.get("creator") or "unknown creator").strip()
+    provider = str(credit.get("provider") or "").strip()
+    licence = str(credit.get("license") or "").strip()
+    url = str(credit.get("source_url") or "").strip()
+    parts = [f'"{credit.get("kind") or "asset"}" by {creator}']
+    if provider:
+        parts.append(f"via {provider}")
+    if licence:
+        parts.append(f"({licence})")
+    return " ".join(parts) + (f" - {url}" if url else "")
+
+
+def build_credits(credits: list[dict], mode: str, *, header: str,
+                  maximum: int) -> tuple[Credits, list[str]]:
+    """Turn step 4's per-asset credits into the block that goes in the caption.
+
+    `required` credits are what a licence demands (CC-BY and friends) and are
+    never dropped - not by the cap, not by the character trimmer. `courtesy` is
+    the one-line "via Pexels" that most stock licences do not ask for.
+    """
+    warnings: list[str] = []
+    if mode == "off" or not credits:
+        return Credits(mode=mode, assets=len(credits)), warnings
+
+    required = [c for c in credits if c.get("attribution_required")]
+    lines = [_credit_line(c) for c in required]
+    lines = list(dict.fromkeys(line for line in lines if line))
+
+    if len(lines) > maximum:
+        warnings.append(
+            f"{len(lines)} credits are required by their licence, over the "
+            f"POST_ATTRIBUTION_MAX of {maximum} - all of them are in the "
+            f"caption anyway, because dropping one would breach the licence"
+        )
+
+    courtesy = ""
+    if mode == "all":
+        providers = list(dict.fromkeys(
+            str(c.get("provider") or "").strip()
+            for c in credits if not c.get("attribution_required")
+        ))
+        providers = [p for p in providers if p]
+        if providers:
+            courtesy = "via " + ", ".join(p.capitalize() for p in providers)
+
+    return Credits(header=header, required=lines, courtesy=courtesy,
+                   mode=mode, assets=len(credits)), warnings
+
+
+# ---------------------------------------------------------------------------
+# Composition
+# ---------------------------------------------------------------------------
+
+def compose(draft: Draft, *, tags: list[str], credits: Credits,
+            must_include: list[str], placement: str,
+            limit: int) -> tuple[str, dict, list[str]]:
+    """Assemble the caption and hold it under Instagram's character limit.
+
+    Over the limit, blocks are given up from the bottom in the order they can
+    best be spared: the courtesy credit, then body paragraphs, then the CTA,
+    then tags one at a time. The hook and any licence-required credit are never
+    given up - if only those are left and it is still too long, the caption is
+    cut and the run says so.
+    """
+    warnings: list[str] = []
+    hook = draft.hook.strip()
+    body = [p.strip() for p in draft.body if p.strip()]
+    cta = draft.cta.strip()
+    extras = [p for p in must_include if p]
+    kept_tags = list(tags)
+    courtesy = True
+
+    def render() -> str:
+        blocks = [hook, *body]
+        if cta:
+            blocks.append(cta)
+        blocks.extend(extras)
+        credit_block = credits.block(courtesy=courtesy)
+        if credit_block:
+            blocks.append(credit_block)
+        if placement == "caption" and kept_tags:
+            blocks.append(" ".join("#" + tag for tag in kept_tags))
+        return "\n\n".join(block for block in blocks if block).strip()
+
+    text = render()
+    while len(text) > limit:
+        if courtesy and credits.courtesy:
+            courtesy = False
+            warnings.append("dropped the courtesy credit line to fit the "
+                            f"{limit}-character limit")
+        elif len(body) > 1:
+            body.pop()
+            warnings.append(f"dropped a body paragraph to fit the "
+                            f"{limit}-character limit")
+        elif cta:
+            cta = ""
+            warnings.append(f"dropped the CTA to fit the {limit}-character limit")
+        elif placement == "caption" and kept_tags:
+            kept_tags.pop()
+            warnings.append(f"dropped a hashtag to fit the {limit}-character limit")
+        elif body:
+            body.pop()
+            warnings.append(f"dropped the last body paragraph to fit the "
+                            f"{limit}-character limit")
+        else:
+            text = text[:limit].rsplit(" ", 1)[0].strip()
+            warnings.append(
+                f"the hook and the required credits alone run past {limit} "
+                f"characters; the caption was cut. Check it before posting."
+            )
+            break
+        text = render()
+
+    parts = {
+        "hook": hook,
+        "body": body,
+        "cta": cta,
+        "must_include": extras,
+        "credits": credits.block(courtesy=courtesy),
+        "hashtags": kept_tags,
+    }
+    return text, parts, warnings
+
+
+def _echoes_script(hook: str, script: str) -> bool:
+    """True when the hook is just the narration's opening line again."""
+    def flatten(text: str) -> str:
+        return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+
+    first = (split_sentences(script) or [""])[0]
+    a, b = flatten(hook), flatten(first)
+    if not a or not b:
+        return False
+    return a == b or (len(a) > 24 and (a in b or b in a))
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def generate_caption(source, *, run_dir=None, run_id: str | None = None,
+                     topic: str | None = None, niche: str | None = None,
+                     hashtag_count: int | None = None, placement: str | None = None,
+                     attribution=None, mode: str | None = None,
+                     write: bool = True, overwrite: bool = True) -> dict:
+    """Write the Instagram post text for a script.
+
+    Args:
+        source: step 2's script dict, step 5's assembly dict, a run directory,
+            a .json/.txt script file, or the script text itself.
+        run_dir: where to write. Defaults to the run directory the source came
+            from, else output/<date>/<run id>/.
+        run_id: overrides the id taken from the source, which names that
+            directory.
+        topic / niche: override what the source says. `niche` falls back to
+            config.POST_NICHE.
+        hashtag_count: defaults to config.POST_HASHTAG_COUNT.
+        placement: "caption" (tags close the caption) or "comment" (tags are
+            kept out and handed to step 7 for the first comment).
+        attribution: "required" / "all" / "off", or a bool for the config
+            default vs. off. Defaults to config.POST_ATTRIBUTION.
+        mode: "llm" or "heuristic". Defaults to config.POST_MODE.
+        write: write post.txt and post.json. False plans everything and touches
+            no disk.
+        overwrite: replace an existing post.txt.
+
+    Returns:
+        The post manifest, also written as post.json: the caption text, its
+        parts, the tags and their tiers, the credits, character counts and
+        every warning raised.
+
+    Raises:
+        CaptionError: no usable script, or the destination cannot be written.
+    """
+    resolved = resolve_source(source)
+    warnings: list[str] = list(resolved.warnings)
+
+    if topic:
+        resolved.topic = topic.strip()
+    if niche is not None:
+        resolved.niche = niche.strip()
+    niche_value = resolved.niche or config.POST_NICHE
+
+    mode = str(mode or config.POST_MODE).strip().lower()
+    if mode not in ("llm", "heuristic"):
+        warnings.append(f"unknown POST_MODE {mode!r}; used 'llm'")
+        mode = "llm"
+
+    placement = str(placement or config.POST_HASHTAG_PLACEMENT).strip().lower()
+    if placement not in ("caption", "comment"):
+        warnings.append(
+            f"unknown POST_HASHTAG_PLACEMENT {placement!r}; used 'caption'"
+        )
+        placement = "caption"
+
+    if attribution is None:
+        attribution_mode = config.POST_ATTRIBUTION
+    elif isinstance(attribution, bool):
+        attribution_mode = (config.POST_ATTRIBUTION if attribution else "off")
+        if attribution and attribution_mode == "off":
+            attribution_mode = "required"
+    else:
+        attribution_mode = str(attribution)
+    attribution_mode = attribution_mode.strip().lower()
+    if attribution_mode not in ("required", "all", "off"):
+        warnings.append(
+            f"unknown POST_ATTRIBUTION {attribution_mode!r}; used 'required'"
+        )
+        attribution_mode = "required"
+
+    count = int(config.POST_HASHTAG_COUNT if hashtag_count is None
+                else hashtag_count)
+    if count < 0:
+        count = 0
+    if count > config.POST_HASHTAG_LIMIT:
+        warnings.append(
+            f"asked for {count} hashtags; Instagram takes at most "
+            f"{config.POST_HASHTAG_LIMIT}"
+        )
+        count = config.POST_HASHTAG_LIMIT
+
+    identifier = run_id or resolved.run_id or _default_run_id(resolved)
+    destination = Path(run_dir) if run_dir else (
+        resolved.run_dir or config.video_run_dir(identifier)
+    )
+
+    ledger = HashtagLedger()
+    recent = ledger.recent(config.POST_HASHTAG_HISTORY_RUNS, exclude=identifier)
+
+    # --- draft the copy ----------------------------------------------------
+    rules = _prompt_rules(
+        banned_words=config.POST_BANNED_WORDS,
+        banned_tags=config.POST_HASHTAGS_BANNED,
+        must_include=config.POST_MUST_INCLUDE,
+        recent_tags=recent,
+        emoji_allowed=config.POST_ALLOW_EMOJI,
+        emoji_max=config.POST_MAX_EMOJI,
+    )
+
+    draft: Draft | None = None
+    if mode == "llm":
+        draft, llm_warnings = llm_draft(
+            resolved.script, topic=resolved.topic, niche=niche_value,
+            count=count, rules=rules,
+        )
+        warnings += llm_warnings
+    if draft is None:
+        draft = heuristic_draft(resolved.script, topic=resolved.topic,
+                                niche=niche_value, count=count)
+
+    # A banned word is worth one more call - the model can usually write around
+    # it, and the deterministic scrub below can only delete.
+    hits = banned_hits(draft, config.POST_BANNED_WORDS)
+    if hits and draft.source == "llm":
+        warnings.append(
+            f"the copy used banned word(s) {', '.join(hits)}; asked again"
+        )
+        retry, retry_warnings = llm_draft(
+            resolved.script, topic=resolved.topic, niche=niche_value,
+            count=count,
+            rules=rules + [f"The previous attempt used {', '.join(hits)}. "
+                           f"Do not use those words in any form."],
+        )
+        warnings += retry_warnings
+        if retry is not None and not banned_hits(retry, config.POST_BANNED_WORDS):
+            draft = retry
+    if banned_hits(draft, config.POST_BANNED_WORDS):
+        draft, scrub_warnings = scrub_banned(draft, config.POST_BANNED_WORDS)
+        warnings += scrub_warnings
+
+    if draft.source == "heuristic" and mode == "llm":
+        warnings.append(
+            "this caption came from keyword extraction, not the model - it can "
+            "only reuse what the narration already said"
+        )
+
+    # --- hold it to the platform's constraints -----------------------------
+    hook, hook_warnings = fit_hook(draft.hook, config.POST_HOOK_MAX_CHARS)
+    warnings += hook_warnings
+    if hook and _echoes_script(hook, resolved.script):
+        warnings.append(
+            "the hook repeats the narration's opening line - the viewer is "
+            "hearing that already"
+        )
+    draft.hook = hook
+
+    fields, emoji_warnings = apply_emoji_budget(
+        [draft.hook, *draft.body, draft.cta],
+        allowed=config.POST_ALLOW_EMOJI, maximum=config.POST_MAX_EMOJI,
+    )
+    warnings += emoji_warnings
+    draft.hook, draft.cta = fields[0], fields[-1]
+    draft.body = fields[1:-1]
+
+    tags, tag_tiers, tag_warnings = select_hashtags(
+        draft.hashtags, count=count,
+        always=config.POST_HASHTAGS_ALWAYS,
+        banned_tags=config.POST_HASHTAGS_BANNED,
+        banned_words=config.POST_BANNED_WORDS,
+        recent=recent,
+    )
+    warnings += tag_warnings
+
+    credits, credit_warnings = build_credits(
+        resolved.credits, attribution_mode,
+        header=config.POST_ATTRIBUTION_HEADER,
+        maximum=config.POST_ATTRIBUTION_MAX,
+    )
+    warnings += credit_warnings
+
+    written = " ".join([draft.hook, *draft.body, draft.cta]).lower()
+    missing = [phrase for phrase in config.POST_MUST_INCLUDE
+               if phrase.lower() not in written]
+    if missing:
+        warnings.append(
+            "appended must-include phrase(s) the copy left out: "
+            + "; ".join(missing)
+        )
+
+    caption, parts, compose_warnings = compose(
+        draft, tags=tags, credits=credits, must_include=missing,
+        placement=placement, limit=config.POST_MAX_CHARS,
+    )
+    warnings += compose_warnings
+
+    tags = parts["hashtags"]
+    first_comment = (" ".join("#" + tag for tag in tags)
+                     if placement == "comment" and tags else None)
+
+    mentions = _MENTION_RE.findall(caption + " " + (first_comment or ""))
+    if len(mentions) > MENTION_LIMIT:
+        warnings.append(
+            f"{len(mentions)} @mentions, over Instagram's limit of "
+            f"{MENTION_LIMIT}"
+        )
+
+    post = {
+        "post_version": POST_VERSION,
+        "run_id": identifier,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "topic": resolved.topic,
+        "niche": niche_value,
+        "mode": draft.source,
+        "caption": caption,
+        "hook": parts["hook"],
+        "body": parts["body"],
+        "cta": parts["cta"],
+        "must_include": parts["must_include"],
+        "hashtags": ["#" + tag for tag in tags],
+        "hashtag_tiers": {"#" + tag: tag_tiers.get(tag, "?") for tag in tags},
+        "hashtag_placement": placement,
+        "first_comment": first_comment,
+        "attribution": {
+            "mode": attribution_mode,
+            "assets": credits.assets,
+            "required": len(credits.required),
+            "block": parts["credits"],
+        },
+        "chars": {
+            "caption": len(caption),
+            "limit": config.POST_MAX_CHARS,
+            "remaining": config.POST_MAX_CHARS - len(caption),
+            "hook": len(parts["hook"]),
+            "hook_limit": config.POST_HOOK_MAX_CHARS,
+        },
+        "counts": {
+            "hashtags": len(tags),
+            "words": script_gen.count_words(
+                " ".join([parts["hook"], *parts["body"], parts["cta"]])
+            ),
+            "paragraphs": len(parts["body"]),
+            "emoji": count_emoji(caption),
+            "mentions": len(mentions),
+        },
+        "source": {
+            "script_path": str(resolved.script_path) if resolved.script_path else None,
+            "assembly_path": (str(resolved.assembly_path)
+                              if resolved.assembly_path else None),
+            "script_chars": len(resolved.script),
+        },
+        "output_dir": str(destination.resolve()) if write else str(destination),
+        "post_text_path": None,
+        "post_json_path": None,
+        "post_comment_path": None,
+        "warnings": list(dict.fromkeys(warnings)),
+    }
+
+    if not write:
+        return post
+
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CaptionError(f"could not create {destination}: {exc}") from exc
+
+    text_path = destination / POST_TEXT_NAME
+    json_path = destination / POST_JSON_NAME
+    if text_path.exists() and not overwrite:
+        raise CaptionError(
+            f"{text_path} already exists. Pass overwrite=True to replace it."
+        )
+
+    post["post_text_path"] = str(text_path.resolve())
+    post["post_json_path"] = str(json_path.resolve())
+
+    # post.txt is the caption and nothing else - the trailing newline is the
+    # file's, not the caption's. Step 7 should post `caption` from post.json.
+    text_path.write_text(caption + "\n", encoding="utf-8")
+
+    comment_path = destination / POST_COMMENT_NAME
+    if first_comment:
+        comment_path.write_text(first_comment + "\n", encoding="utf-8")
+        post["post_comment_path"] = str(comment_path.resolve())
+    else:
+        # A leftover from a run with a different placement would be posted
+        # as a duplicate tag block by step 7.
+        comment_path.unlink(missing_ok=True)
+
+    json_path.write_text(json.dumps(post, indent=2, ensure_ascii=False),
+                         encoding="utf-8")
+
+    ledger.record(identifier, tags)
+    ledger_warnings = ledger.save()
+    if ledger_warnings:
+        post["warnings"] = list(dict.fromkeys(post["warnings"] + ledger_warnings))
+        json_path.write_text(json.dumps(post, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+    return post
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _console_safe() -> None:
+    """Keep a cp1252 Windows console from dying on one emoji in the copy."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+def _print_result(post: dict) -> None:
+    rule = "-" * 68
+    chars, counts = post["chars"], post["counts"]
+    print(rule)
+    print(f"RUN     : {post['run_id']}")
+    print(f"TOPIC   : {post.get('topic') or '(none)'}"
+          + (f"   NICHE: {post['niche']}" if post.get("niche") else ""))
+    print(f"MODE    : {post['mode']}")
+    print(f"LENGTH  : {chars['caption']}/{chars['limit']} chars "
+          f"({chars['remaining']} left), hook {chars['hook']}/{chars['hook_limit']}")
+    print(f"COPY    : {counts['paragraphs']} paragraph(s), {counts['words']} words, "
+          f"{counts['emoji']} emoji")
+    print(f"TAGS    : {counts['hashtags']} in the {post['hashtag_placement']}")
+    attribution = post["attribution"]
+    print(f"CREDITS : {attribution['mode']} - {attribution['required']} required "
+          f"of {attribution['assets']} asset(s)")
+    if post["post_text_path"]:
+        print(f"WROTE   : {post['post_text_path']}")
+        print(f"          {post['post_json_path']}")
+        if post.get("post_comment_path"):
+            print(f"          {post['post_comment_path']}")
+    else:
+        print("WROTE   : nothing (dry run)")
+
+    print(rule)
+    print("HOOK  (all Instagram shows before \"... more\")")
+    print(f"  {post['hook']}")
+    print(rule)
+    print(post["caption"])
+    if post["first_comment"]:
+        print(rule)
+        print("FIRST COMMENT")
+        print(post["first_comment"])
+    print(rule)
+    print("TAGS BY TIER")
+    for tag, tier in post["hashtag_tiers"].items():
+        print(f"  {tier:<7} {tag}")
+
+    if post["warnings"]:
+        print(rule)
+        print("WARNINGS")
+        for warning in post["warnings"]:
+            print(f"  - {warning}")
+    print(rule)
+
+
+def main(argv: list[str] | None = None) -> int:
+    _console_safe()
+    parser = argparse.ArgumentParser(
+        description="Write the Instagram caption and hashtags for a reel."
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("-r", "--run-dir", type=Path,
+                        help="step 5 run directory (reads its assembly.json "
+                             "and writes the post beside reel.mp4)")
+    source.add_argument("-f", "--script-file", type=Path,
+                        help="script .json from step 2, or a .txt")
+    source.add_argument("-s", "--script", help="the narration text itself")
+
+    parser.add_argument("-o", "--output-dir", type=Path, default=None,
+                        help="where to write (default: the run directory, else "
+                             "output/<date>/<run id>/)")
+    parser.add_argument("--run-id", default=None,
+                        help="override the run id taken from the source")
+    parser.add_argument("--topic", default=None, help="override the topic")
+    parser.add_argument("--niche", default=None,
+                        help=f"account subject area "
+                             f"(default: {config.POST_NICHE or 'from the script'})")
+    parser.add_argument("-n", "--hashtags", type=int, default=None,
+                        help=f"how many tags (default: {config.POST_HASHTAG_COUNT})")
+    parser.add_argument("--placement", default=None, choices=("caption", "comment"),
+                        help=f"where the tags go "
+                             f"(default: {config.POST_HASHTAG_PLACEMENT})")
+    parser.add_argument("--attribution", default=None,
+                        choices=("required", "all", "off"),
+                        help=f"credit policy (default: {config.POST_ATTRIBUTION})")
+    parser.add_argument("--no-attribution", action="store_true",
+                        help="shorthand for --attribution off")
+    parser.add_argument("--mode", default=None, choices=("llm", "heuristic"),
+                        help=f"how the copy is written (default: {config.POST_MODE})")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="write nothing to disk")
+    parser.add_argument("--json", action="store_true",
+                        help="print the post manifest as JSON")
+    args = parser.parse_args(argv)
+
+    given = args.run_dir or args.script_file or args.script
+    try:
+        post = generate_caption(
+            given,
+            run_dir=args.output_dir,
+            run_id=args.run_id,
+            topic=args.topic,
+            niche=args.niche,
+            hashtag_count=args.hashtags,
+            placement=args.placement,
+            attribution="off" if args.no_attribution else args.attribution,
+            mode=args.mode,
+            write=not args.dry_run,
+        )
+    except (CaptionError, config.MissingConfigError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(post, indent=2, ensure_ascii=False))
+    else:
+        _print_result(post)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
