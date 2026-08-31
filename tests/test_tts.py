@@ -563,3 +563,13 @@ def test_cli_reports_api_error_and_exits_nonzero(tmp_path, captured_post, capsys
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_the_voice_settings_come_from_config_not_from_constants():
+    """They were ElevenLabs' own defaults hard-coded here. Step 9 can only run
+    a trial on a setting it can set."""
+    assert tts.STABILITY == config.TTS_STABILITY
+    assert tts.STYLE == config.TTS_STYLE
+    assert tts.SPEED == config.TTS_SPEED
+    assert tts.SIMILARITY_BOOST == config.TTS_SIMILARITY_BOOST
+    assert tts.USE_SPEAKER_BOOST == config.TTS_SPEAKER_BOOST

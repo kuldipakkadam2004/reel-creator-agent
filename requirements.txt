@@ -6,6 +6,13 @@
 # Step 1 — scaffolding / config
 python-dotenv>=1.0.0
 
+# Step 0 — topic scouting (Reddit / YouTube / Google Trends)
+#   No new dependency. `requests` below does the HTTP, the trends feed is
+#   parsed with stdlib xml.etree, and the phrase pass goes through step 2's
+#   Gemini client. Deliberately NOT pytrends: it scrapes an internal endpoint
+#   and breaks every few months, which is not a dependency worth putting under
+#   a pipeline when the official RSS is published and stable.
+
 # Step 2 — script generation (Gemini)
 google-genai>=1.0.0
 
@@ -21,6 +28,14 @@ mutagen>=1.47.0
 #   sometimes report the original's dimensions while serving a smaller file, and
 #   the 9:16 resolution floor has to be applied to what actually arrived.
 Pillow>=10.0.0
+
+#   Optional: needed only when VISUAL_PROVIDERS includes `youtube`. The Data
+#   API is a catalogue and serves no media, so yt-dlp does both jobs - reading
+#   the real format list (the API will not say whether an upload is 1080p or
+#   4K, which is what decides whether it survives the 9:16 crop) and fetching
+#   the bytes. Left commented out because the default provider list does not
+#   include youtube, and this is a large dependency to carry unused.
+# yt-dlp>=2024.1.0
 
 # Step 5 — video assembly
 #   Raw ffmpeg subprocess calls, not moviepy: the whole edit goes into one
@@ -45,6 +60,15 @@ imageio-ffmpeg>=0.4.9
 # Step 7 — Telegram delivery
 # python-telegram-bot>=21.0
 
-# Later (NOT step 8) — scheduling / HTTP endpoints. Deliberately deferred.
+# Step 8 — end-to-end run + daily scheduling
+#   No new dependency, deliberately. The run is the six steps above called in
+#   order, and the schedule is a task definition handed to Windows Task
+#   Scheduler through schtasks, which is already on the machine. APScheduler
+#   would add a process that has to be running to fire, and the thing that
+#   would have to start THAT after a reboot is Task Scheduler - so it is Task
+#   Scheduler, with nothing of ours in the middle.
+
+# Later — the HTTP endpoints. Still deliberately deferred: nothing running
+# locally needs them, and they are a deploy-time concern.
 # fastapi>=0.110.0
 # uvicorn[standard]>=0.29.0

@@ -115,8 +115,9 @@ def probes_for(manifest: dict, ok: set[int] | None = None) -> dict[int, dict]:
     }
 
 
-def plan(manifest: dict, ok: set[int] | None = None, narration: float = NARRATION):
-    return assemble.plan_timeline(manifest, narration, probes_for(manifest, ok))
+def plan(manifest: dict, ok: set[int] | None = None, narration: float = NARRATION,
+         words: list[dict] | None = None):
+    return assemble.plan_timeline(manifest, narration, probes_for(manifest, ok), words)
 
 
 def words_from(pairs) -> list[dict]:
@@ -161,13 +162,56 @@ def test_every_shot_uses_an_asset_step_4_gave_that_beat():
     assert not any("borrow" in warning for warning in warnings)
 
 
-def test_shot_lengths_respect_the_configured_floor_and_ceiling():
+def test_no_shot_outstays_the_configured_ceiling():
     manifest = make_manifest(assets_per_beat=4, beats=3)
     shots, _ = plan(manifest)
 
     for shot in shots[:-1]:  # the last one absorbs the rounding drift
+        assert shot.duration <= config.SHOT_MAX_SECONDS + 0.01
+
+
+def test_the_floor_holds_wherever_the_pacing_curve_is_not_asking_for_less():
+    """SHOT_MIN_SECONDS stops the arithmetic chopping a beat into flashes. It is
+    not a veto over the curve, which asks for short shots at the top on purpose,
+    so it is only binding where the curve is already above it."""
+    manifest = make_manifest(assets_per_beat=4, beats=3)
+    shots, _ = plan(manifest)
+
+    total = shots[-1].end
+    for shot in shots[:-1]:
+        # A shot is laid down at the length the curve wants where it starts.
+        floor = min(config.SHOT_MIN_SECONDS,
+                    assemble.shot_target_at(shot.start, total))
+        assert shot.duration >= floor - 0.05
+
+    # And nothing anywhere is shorter than the fastest the curve ever asks for.
+    assert min(s.duration for s in shots) >= config.SHOT_HOOK_SECONDS - 0.05
+
+
+def test_the_reel_opens_faster_than_it_settles():
+    """The whole point of the curve: the first shot is materially shorter than
+    the ones in the middle, where the viewer is following something."""
+    manifest = make_manifest(assets_per_beat=4, beats=3)
+    shots, _ = plan(manifest)
+
+    settled = [s.duration for s in shots if 15.0 <= s.start <= 30.0]
+    assert settled, "the fixture should have shots in the middle of the reel"
+    assert shots[0].duration < min(settled)
+    assert shots[0].duration < config.SHOT_TARGET_SECONDS
+
+
+def test_a_flat_pacing_setting_puts_every_shot_on_the_same_target(monkeypatch):
+    monkeypatch.setattr(config, "SHOT_PACING", "flat")
+    manifest = make_manifest(assets_per_beat=4, beats=3)
+    shots, _ = plan(manifest)
+
+    for shot in shots[:-1]:
         assert shot.duration >= config.SHOT_MIN_SECONDS - 0.01
         assert shot.duration <= config.SHOT_MAX_SECONDS + 0.01
+    # Every beat in the fixture is the same length, so a flat rate divides them
+    # all the same way and every shot inside a beat is the same size.
+    first_beat = [s.duration for s in shots if s.beat_index == 0]
+    assert max(first_beat) - min(first_beat) < 0.05
 
 
 def test_a_beat_cycles_its_own_assets_in_order():
@@ -484,15 +528,14 @@ def test_an_in_point_becomes_a_seek_before_the_input():
     assert args[args.index("-ss") + 1] == "2.500"
 
 
-def test_a_still_is_fed_as_one_frame_when_it_will_be_zoomed(monkeypatch):
-    monkeypatch.setattr(config, "IMAGE_ZOOM", 1.12)
-    args = assemble._shot_inputs(shot(kind="image", path=Path("/nowhere/x.jpg")))
+def test_a_still_is_fed_as_one_frame_when_it_will_be_moved():
+    args = assemble._shot_inputs(shot(kind="image", path=Path("/nowhere/x.jpg"),
+                                      motion="push", motion_zoom=1.12))
     # -loop 1 here would multiply against zoompan's d= and emit minutes of video
     assert "-loop" not in args
 
 
-def test_a_still_is_looped_when_the_zoom_is_switched_off(monkeypatch):
-    monkeypatch.setattr(config, "IMAGE_ZOOM", 1.0)
+def test_a_still_is_looped_when_it_will_not_move():
     args = assemble._shot_inputs(shot(kind="image", path=Path("/nowhere/x.jpg")))
     assert "-loop" in args and "-t" in args
 
@@ -985,3 +1028,1089 @@ def test_a_soft_open_is_still_available(monkeypatch):
         ass_path=None, fonts_dir=None,
     )
     assert "fade=t=in:st=0:d=0.4" in graph
+
+
+# ---------------------------------------------------------------------------
+# Pacing: the reel does not cut at one rate throughout
+# ---------------------------------------------------------------------------
+
+def test_the_curve_opens_fast_settles_and_tightens_again():
+    total = 45.0
+    opening = assemble.shot_target_at(0.0, total)
+    settled = assemble.shot_target_at(total / 2, total)
+    closing = assemble.shot_target_at(total - 0.5, total)
+
+    assert opening == pytest.approx(config.SHOT_HOOK_SECONDS, abs=0.01)
+    assert settled == pytest.approx(config.SHOT_TARGET_SECONDS, abs=0.01)
+    assert opening < settled
+    assert closing < settled
+
+
+def test_the_curve_rises_monotonically_out_of_the_opening():
+    total = 60.0
+    ramp = config.SHOT_PACING_RAMP_SECONDS
+    samples = [assemble.shot_target_at(ramp * i / 10, total) for i in range(11)]
+    for earlier, later in zip(samples, samples[1:]):
+        assert later >= earlier - 1e-9
+
+
+def test_a_flat_setting_ignores_the_position_entirely(monkeypatch):
+    monkeypatch.setattr(config, "SHOT_PACING", "flat")
+    for position in (0.0, 5.0, 20.0, 44.0):
+        assert assemble.shot_target_at(position, 45.0) == config.SHOT_TARGET_SECONDS
+
+
+def test_an_opening_beat_gets_more_cuts_than_the_same_beat_would_mid_reel():
+    """The count comes from integrating the curve across the window, so a long
+    opening beat is not handed the steady rate just because its midpoint is
+    past the ramp."""
+    opening = assemble._shot_count(15.0, 8, position=0.0, total=45.0)
+    middle = assemble._shot_count(15.0, 8, position=15.0, total=45.0)
+    assert opening > middle
+
+
+def test_shot_spans_lengthen_through_the_opening_and_fill_the_window_exactly():
+    spans = assemble._shot_spans(0.0, 15.0, 6, 45.0)
+    lengths = [round(end - start, 3) for start, end in spans]
+
+    assert spans[0][0] == 0.0
+    assert spans[-1][1] == 15.0
+    for earlier, later in zip(lengths, lengths[1:]):
+        assert later >= earlier - 0.01, lengths
+    assert sum(lengths) == pytest.approx(15.0, abs=0.01)
+    for earlier, later in zip(spans, spans[1:]):
+        assert earlier[1] == pytest.approx(later[0], abs=0.001)
+
+
+def test_one_shot_spans_the_whole_window():
+    assert assemble._shot_spans(2.0, 7.0, 1, 45.0) == [(2.0, 7.0)]
+
+
+# ---------------------------------------------------------------------------
+# Snapping: cuts land on words, not on the arithmetic
+# ---------------------------------------------------------------------------
+
+def test_a_cut_mid_word_is_moved_into_the_neighbouring_silence():
+    # A cut wants to fall at 3.0, which is halfway through "darkness".
+    words = words_from([
+        ("total", 2.0, 2.6), ("darkness", 2.8, 3.4), ("sunlight", 3.9, 4.5),
+    ])
+    plan_rows = [
+        {"start": 0.0, "end": 3.0},
+        {"start": 3.0, "end": 6.0},
+    ]
+    moved = assemble._snap_boundaries(plan_rows, words)
+
+    assert moved == 1
+    # Two silences: 2.6-2.8 and 3.4-3.9. Only the first is inside
+    # SHOT_SNAP_MAX_SECONDS of the cut, so the cut goes to its midpoint.
+    assert plan_rows[0]["end"] == pytest.approx(2.7, abs=0.01)
+    assert plan_rows[1]["start"] == plan_rows[0]["end"]
+
+
+def test_a_cut_already_sitting_in_a_gap_is_left_alone():
+    words = words_from([("one", 1.0, 1.4), ("two", 2.0, 2.4)])
+    plan_rows = [{"start": 0.0, "end": 1.7}, {"start": 1.7, "end": 4.0}]
+
+    assert assemble._snap_boundaries(plan_rows, words) == 0
+    assert plan_rows[0]["end"] == 1.7
+
+
+def test_a_cut_is_never_moved_further_than_the_configured_limit():
+    # The only gap is at 8.0, far outside SHOT_SNAP_MAX_SECONDS of the cut.
+    words = words_from([("one", 7.0, 7.5), ("two", 8.5, 9.0)])
+    plan_rows = [{"start": 0.0, "end": 3.0}, {"start": 3.0, "end": 12.0}]
+
+    assert assemble._snap_boundaries(plan_rows, words) == 0
+    assert plan_rows[0]["end"] == 3.0
+
+
+def test_snapping_never_collapses_a_shot():
+    """A nudge that would leave either neighbour under the floor is declined,
+    however good the landing would have been."""
+    # The gap at 3.2-3.3 is well within reach of the cut at 3.0, but taking it
+    # would leave the second shot 0.35s long.
+    words = words_from([("a", 2.6, 3.2), ("b", 3.3, 3.6)])
+    plan_rows = [{"start": 0.0, "end": 3.0}, {"start": 3.0, "end": 3.6}]
+
+    assert assemble._snap_boundaries(plan_rows, words) == 0
+    assert plan_rows[0]["end"] == 3.0
+
+
+def test_the_open_and_the_close_are_never_moved():
+    words = words_from([("a", 0.3, 0.5), ("b", 1.4, 1.6), ("c", 2.6, 2.9)])
+    plan_rows = [
+        {"start": 0.0, "end": 1.0},
+        {"start": 1.0, "end": 2.0},
+        {"start": 2.0, "end": 4.0},
+    ]
+    assemble._snap_boundaries(plan_rows, words)
+
+    assert plan_rows[0]["start"] == 0.0
+    assert plan_rows[-1]["end"] == 4.0
+
+
+def test_a_moved_cut_becomes_the_floor_for_the_next_one():
+    words = words_from([("a", 0.9, 1.1), ("b", 1.9, 2.1), ("c", 3.0, 3.2)])
+    plan_rows = [
+        {"start": 0.0, "end": 1.0},
+        {"start": 1.0, "end": 2.0},
+        {"start": 2.0, "end": 5.0},
+    ]
+    assemble._snap_boundaries(plan_rows, words)
+
+    for earlier, later in zip(plan_rows, plan_rows[1:]):
+        assert earlier["end"] == later["start"]
+        assert later["start"] > earlier["start"]
+
+
+def test_a_very_short_silence_is_not_treated_as_somewhere_to_cut():
+    """What looks like a gap can be the stop consonant inside one phrase."""
+    gaps, starts = assemble._word_cut_points(
+        words_from([("hot", 1.0, 1.5), ("pot", 1.52, 2.0)])
+    )
+    assert gaps == []
+    assert starts == [1.0, 1.52]
+
+
+def test_words_with_no_timings_at_all_are_survived():
+    plan_rows = [{"start": 0.0, "end": 3.0}, {"start": 3.0, "end": 6.0}]
+    assert assemble._snap_boundaries(plan_rows, [{"text": "x"}]) == 0
+    assert assemble._snap_boundaries(plan_rows, []) == 0
+
+
+def test_the_timeline_reports_how_many_cuts_it_moved():
+    manifest = make_manifest(assets_per_beat=2, beats=3)
+    words = words_from([(f"w{i}", i * 0.5, i * 0.5 + 0.3) for i in range(90)])
+    shots, warnings = plan(manifest, words=words)
+
+    assert any("nudged onto a word boundary" in warning for warning in warnings)
+    assert shots[0].start == 0.0
+    for earlier, later in zip(shots, shots[1:]):
+        assert earlier.end == pytest.approx(later.start, abs=0.01)
+
+
+def test_snapping_off_leaves_the_cuts_where_the_arithmetic_put_them(monkeypatch):
+    manifest = make_manifest(assets_per_beat=2, beats=3)
+    words = words_from([(f"w{i}", i * 0.5, i * 0.5 + 0.3) for i in range(90)])
+
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_WORDS", False)
+    without = [s.start for s in plan(manifest, words=words)[0]]
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_WORDS", True)
+    with_snap = [s.start for s in plan(manifest, words=words)[0]]
+
+    assert without != with_snap
+    assert plan(manifest)[0][0].duration == pytest.approx(without[1], abs=0.01)
+
+
+def test_a_snapped_shot_still_decides_looping_from_its_final_length():
+    """Looping depends on the slot the clip has to fill, and snapping changes
+    that - so the decision has to come after the nudge, not before it."""
+    manifest = make_manifest(assets_per_beat=1, beats=2)
+    for asset in manifest["assets"]:
+        asset["duration"] = 7.0
+    words = words_from([(f"w{i}", i * 0.4, i * 0.4 + 0.25) for i in range(110)])
+    shots, _ = plan(manifest, words=words)
+
+    for shot_ in shots:
+        if not shot_.looped:
+            assert shot_.source_start + shot_.duration <= 7.0 + 0.05
+
+
+# ---------------------------------------------------------------------------
+# The hook card
+# ---------------------------------------------------------------------------
+
+def ass_with_hook(text: str, seconds: float = 2.2, **overrides) -> str:
+    cues = [Cue(words_from([("salt", 0.2, 0.6)]), 0.2, 0.6)]
+    return assemble.build_ass(cues, "Arial Black", None,
+                              hook=text, hook_seconds=seconds)
+
+
+def test_the_hook_card_is_a_top_anchored_style_of_its_own():
+    body = ass_with_hook("The ocean never gets saltier")
+    style = next(line for line in body.splitlines()
+                 if line.startswith("Style: Hook,"))
+    fields = style.split(",")
+
+    assert fields[-5] == "8", "alignment 8 is top-centre"
+    assert fields[-2] == str(config.HOOK_CARD_MARGIN_V)
+    assert fields[2] == str(config.HOOK_CARD_FONT_SIZE)
+
+
+def test_the_hook_card_holds_from_the_first_frame():
+    body = ass_with_hook("Nobody has seen it", seconds=2.0)
+    event = next(line for line in body.splitlines() if ",Hook," in line)
+
+    assert event.startswith("Dialogue: 0,0:00:00.00,0:00:02.00,Hook,")
+
+
+def test_the_hook_card_fades_at_both_ends():
+    body = ass_with_hook("Nobody has seen it")
+    event = next(line for line in body.splitlines() if ",Hook," in line)
+    assert f"\\fad({config.HOOK_CARD_FADE_MS},{config.HOOK_CARD_FADE_MS})" in event
+
+
+def test_no_hook_means_the_ass_is_exactly_what_it_always_was():
+    cues = [Cue(words_from([("salt", 0.2, 0.6)]), 0.2, 0.6)]
+    plain = assemble.build_ass(cues, "Arial Black", None)
+
+    assert "Style: Hook," not in plain
+    assert ",Hook," not in plain
+    assert plain == assemble.build_ass(cues, "Arial Black", None,
+                                       hook="", hook_seconds=2.2)
+    assert plain == assemble.build_ass(cues, "Arial Black", None,
+                                       hook="something", hook_seconds=0.0)
+
+
+def test_the_hook_card_is_uppercased_when_configured(monkeypatch):
+    monkeypatch.setattr(config, "HOOK_CARD_UPPERCASE", True)
+    assert "NOBODY HAS SEEN IT" in ass_with_hook("Nobody has seen it")
+    monkeypatch.setattr(config, "HOOK_CARD_UPPERCASE", False)
+    assert "Nobody has seen it" in ass_with_hook("Nobody has seen it")
+
+
+def test_a_hook_card_cannot_escape_into_ass_markup():
+    body = ass_with_hook("{\\an5}drop\\Ntable")
+    event = next(line for line in body.splitlines() if ",Hook," in line)
+    text = event.split(",,", 1)[1]
+
+    assert "{\\an5}" not in text
+    assert "\\N" not in text
+
+
+def test_a_hook_card_too_wide_for_two_lines_is_scaled_down():
+    long_card = "Extraordinarily unpronounceable bioluminescence phenomenon"
+    small = assemble._hook_card_font_size(long_card, None)
+    assert small < config.HOOK_CARD_FONT_SIZE
+
+    assert assemble._hook_card_font_size("Short", None) == config.HOOK_CARD_FONT_SIZE
+
+
+def test_the_hook_card_gets_two_lines_before_it_shrinks():
+    """A headline of a few words wraps; shrinking it to stay on one row would
+    make the biggest text in the reel the smallest thing about it."""
+    text = "The ocean never gets any saltier"
+    one_line = assemble._fit_font_size(
+        text, None, base=config.HOOK_CARD_FONT_SIZE,
+        ink=2 * config.HOOK_CARD_OUTLINE_WIDTH,
+        margin_h=config.CAPTION_MARGIN_H, lines=1,
+    )
+    two_lines = assemble._hook_card_font_size(text, None)
+    assert two_lines > one_line
+
+
+def test_a_card_is_derived_from_the_script_when_the_manifest_has_none():
+    card = assemble._derive_hook_card(
+        "Imagine living in total darkness. Sunlight dies at 650 feet."
+    )
+    assert card
+    assert "sunlight" not in card.lower()
+    assert len(card.split()) <= config.HOOK_CARD_MAX_WORDS
+
+
+# ---------------------------------------------------------------------------
+# Sound design
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sfx_dir(monkeypatch, tmp_path):
+    """An effects library of the suite's own, never the real assets/sfx/."""
+    directory = tmp_path / "sfx"
+    directory.mkdir()
+    monkeypatch.setattr(config, "SFX_DIR", directory)
+    monkeypatch.setattr(config, "SFX_ENABLED", True)
+    monkeypatch.setattr(assemble, "probe_peak_db", lambda path: -6.0)
+    return directory
+
+
+def sfx_file(directory: Path, name: str) -> Path:
+    path = directory / name
+    path.write_bytes(b"RIFFfake")
+    return path
+
+
+def test_the_role_is_read_off_the_front_of_the_filename():
+    for name, role in (("whoosh.wav", "whoosh"), ("whoosh-02.wav", "whoosh"),
+                       ("whoosh_soft.mp3", "whoosh"), ("impact.wav", "impact"),
+                       ("03-whoosh.wav", "")):
+        assert assemble._sfx_role(Path(name)) == role
+
+
+def test_the_library_groups_files_by_role(sfx_dir):
+    sfx_file(sfx_dir, "whoosh.wav")
+    sfx_file(sfx_dir, "whoosh-02.wav")
+    sfx_file(sfx_dir, "impact.wav")
+    sfx_file(sfx_dir, "notes.txt")
+
+    library = assemble.available_sfx()
+    assert [p.name for p in library["whoosh"]] == ["whoosh-02.wav", "whoosh.wav"]
+    assert [p.name for p in library["impact"]] == ["impact.wav"]
+    assert "notes" not in library
+
+
+def test_each_one_shot_is_levelled_to_the_configured_peak(sfx_dir, monkeypatch):
+    sfx_file(sfx_dir, "whoosh.wav")
+    monkeypatch.setattr(assemble, "probe_peak_db", lambda path: -3.0)
+    warnings: list[str] = []
+
+    effect = assemble.resolve_sfx(None, warnings)["whoosh"][0]
+    assert effect.gain_db == pytest.approx(config.SFX_PEAK_TARGET + 3.0, abs=0.01)
+    assert not warnings
+
+
+def test_a_hot_and_a_quiet_one_shot_end_up_in_the_same_place(sfx_dir, monkeypatch):
+    """The whole reason the peak is measured rather than assumed."""
+    sfx_file(sfx_dir, "whoosh.wav")
+    sfx_file(sfx_dir, "whoosh-02.wav")
+    peaks = {"whoosh.wav": -1.0, "whoosh-02.wav": -18.0}
+    monkeypatch.setattr(assemble, "probe_peak_db",
+                        lambda path: peaks[Path(path).name])
+
+    effects = assemble.resolve_sfx(None, [])["whoosh"]
+    landed = [effect.peak_db + effect.gain_db for effect in effects]
+    assert all(value == pytest.approx(config.SFX_PEAK_TARGET, abs=0.01)
+               for value in landed)
+
+
+def test_a_silent_file_is_dropped_with_a_warning_not_amplified(sfx_dir, monkeypatch):
+    sfx_file(sfx_dir, "whoosh.wav")
+    monkeypatch.setattr(assemble, "probe_peak_db", lambda path: -91.0)
+    warnings: list[str] = []
+
+    assert assemble.resolve_sfx(None, warnings) == {}
+    assert any("no signal in it" in warning for warning in warnings)
+
+
+def test_an_unmeasurable_file_is_dropped_with_a_warning(sfx_dir, monkeypatch):
+    sfx_file(sfx_dir, "impact.wav")
+    monkeypatch.setattr(assemble, "probe_peak_db", lambda path: None)
+    warnings: list[str] = []
+
+    assert assemble.resolve_sfx(None, warnings) == {}
+    assert any("could not be measured" in warning for warning in warnings)
+
+
+def test_a_misnamed_role_is_reported_rather_than_silently_ignored(sfx_dir):
+    sfx_file(sfx_dir, "wooosh.wav")
+    warnings: list[str] = []
+
+    assert assemble.resolve_sfx(None, warnings) == {}
+    assert any("no role this step places" in warning for warning in warnings)
+
+
+def test_an_empty_library_is_not_a_problem_worth_a_warning(sfx_dir):
+    warnings: list[str] = []
+    assert assemble.resolve_sfx(None, warnings) == {}
+    assert warnings == []
+
+
+def test_effects_can_be_switched_off_entirely(sfx_dir, monkeypatch):
+    sfx_file(sfx_dir, "whoosh.wav")
+    assert assemble.resolve_sfx(False, []) == {}
+    monkeypatch.setattr(config, "SFX_ENABLED", False)
+    assert assemble.resolve_sfx(None, []) == {}
+
+
+def one_shot(role: str, name: str = "x.wav") -> assemble.Sfx:
+    return assemble.Sfx(role=role, path=Path(name), peak_db=-6.0, gain_db=-8.0)
+
+
+def test_the_impact_lands_on_the_first_frame():
+    shots = [shot(index=i, start=i * 4.0, duration=4.0) for i in range(4)]
+    cues = assemble.plan_sfx(shots, 16.0, {"impact": [one_shot("impact")]})
+
+    assert len(cues) == 1
+    assert cues[0].at == 0.0
+    assert cues[0].sfx.role == "impact"
+
+
+def test_a_whoosh_rides_every_cut_but_never_the_opening_frame():
+    shots = [shot(index=i, start=i * 4.0, duration=4.0) for i in range(4)]
+    cues = assemble.plan_sfx(shots, 16.0, {"whoosh": [one_shot("whoosh")]})
+
+    assert len(cues) == 3, "three cuts between four shots"
+    assert all(cue.at > 0 for cue in cues)
+
+
+def test_a_whoosh_is_placed_early_so_its_transient_lands_on_the_cut():
+    shots = [shot(index=0, start=0.0, duration=4.0),
+             shot(index=1, start=4.0, duration=4.0)]
+    cues = assemble.plan_sfx(shots, 8.0, {"whoosh": [one_shot("whoosh")]})
+
+    assert cues[0].at == pytest.approx(4.0 - config.SFX_LEAD_SECONDS, abs=0.001)
+
+
+def test_cuts_crowded_together_get_one_effect_between_them(monkeypatch):
+    monkeypatch.setattr(config, "SFX_MIN_GAP_SECONDS", 2.0)
+    shots = [shot(index=i, start=i * 0.8, duration=0.8) for i in range(10)]
+    cues = assemble.plan_sfx(shots, 8.0, {"whoosh": [one_shot("whoosh")]})
+
+    times = [cue.at for cue in cues]
+    for earlier, later in zip(times, times[1:]):
+        assert later - earlier >= 2.0 - 0.01
+
+
+def test_the_impact_holds_the_open_against_an_immediate_cut(monkeypatch):
+    """The effect at 0 counts towards the spacing, so a cut 0.4s in does not
+    fire a whoosh on top of it."""
+    monkeypatch.setattr(config, "SFX_MIN_GAP_SECONDS", 1.6)
+    shots = [shot(index=0, start=0.0, duration=0.4),
+             shot(index=1, start=0.4, duration=4.0)]
+    cues = assemble.plan_sfx(shots, 5.0, {"impact": [one_shot("impact")],
+                                          "whoosh": [one_shot("whoosh")]})
+
+    assert [cue.sfx.role for cue in cues] == ["impact"]
+
+
+def test_several_whooshes_are_rotated_rather_than_one_being_reused():
+    shots = [shot(index=i, start=i * 4.0, duration=4.0) for i in range(5)]
+    library = {"whoosh": [one_shot("whoosh", "a.wav"), one_shot("whoosh", "b.wav")]}
+    cues = assemble.plan_sfx(shots, 20.0, library)
+
+    names = [cue.sfx.name for cue in cues]
+    assert len(set(names)) == 2, names
+
+
+def test_effects_are_delayed_into_place_and_mixed_over_the_finished_audio():
+    cues = [assemble.SfxCue(sfx=one_shot("impact"), at=0.0, reason="the open"),
+            assemble.SfxCue(sfx=one_shot("whoosh"), at=3.92, reason="cut")]
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None, sfx_cues=cues, sfx_index=2,
+    )
+
+    assert "adelay=3920:all=1" in graph
+    assert "[abed][sfx0][sfx1]amix=inputs=3:normalize=0:duration=first[aout]" in graph
+    assert "volume=-8.00dB" in graph
+
+
+def test_an_effect_at_zero_needs_no_delay():
+    cues = [assemble.SfxCue(sfx=one_shot("impact"), at=0.0, reason="the open")]
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None, sfx_cues=cues, sfx_index=2,
+    )
+    assert "[2:a]" in graph and "adelay" not in graph
+
+
+def test_effects_ride_over_the_ducking_rather_than_through_it(monkeypatch):
+    """A compressor keyed off the narration would pull each transient down at
+    exactly the moment it fired."""
+    monkeypatch.setattr(config, "MUSIC_DUCKING", True)
+    cues = [assemble.SfxCue(sfx=one_shot("whoosh"), at=2.0, reason="cut")]
+    graph, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None, music_index=2,
+        sfx_cues=cues, sfx_index=3,
+    )
+
+    assert "sidechaincompress" in graph
+    assert "[ducked]amix=inputs=2:normalize=0:duration=first[abed]" in graph
+    assert graph.endswith("[aout]")
+    # The effect is not one of the sidechain's inputs.
+    assert "[sfx0][duckkey]" not in graph
+
+
+def test_no_effects_leaves_the_audio_graph_untouched():
+    plain, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None,
+    )
+    with_none, _ = assemble.build_filter_graph(
+        [shot()], audio_index=1, total=10.0, narration=9.0,
+        ass_path=None, fonts_dir=None, sfx_cues=[], sfx_index=2,
+    )
+    assert plain == with_none
+    assert "abed" not in plain
+    assert "sfx" not in plain
+
+
+# ---------------------------------------------------------------------------
+# The cover frame
+# ---------------------------------------------------------------------------
+
+def cover_manifest(**overrides) -> dict:
+    """A manifest whose assets carry the descriptive fields step 4 now keeps."""
+    manifest = make_manifest(assets_per_beat=2, beats=3)
+    for index, asset in enumerate(manifest["assets"]):
+        asset["source_url"] = (
+            f"https://www.pexels.com/video/blue-ocean-clip-{index}-99{index}/"
+        )
+        asset["query"] = "deep ocean"
+    manifest.update(overrides)
+    return manifest
+
+
+def plan_a_cover(shots=None, manifest=None, probes=None, *, card="Hook card",
+                 card_seconds=2.2, source=None, warnings=None):
+    manifest = manifest if manifest is not None else cover_manifest()
+    if shots is None:
+        shots, _ = plan(manifest)
+    probes = probes if probes is not None else probes_for(manifest)
+    return assemble.plan_cover(
+        shots, manifest, probes, card=card, card_seconds=card_seconds,
+        font_file=None, source=source,
+        warnings=warnings if warnings is not None else [],
+    )
+
+
+def test_an_aspect_is_read_as_width_and_height():
+    assert assemble.parse_aspect("4:5") == (4, 5)
+    assert assemble.parse_aspect("1:1") == (1, 1)
+    assert assemble.parse_aspect("9x16") == (9, 16)
+
+
+def test_an_unreadable_aspect_falls_back_to_the_whole_frame():
+    top, bottom = assemble.safe_band("not an aspect")
+    assert (top, bottom) == (0.0, float(assemble.CAPTION_REFERENCE_HEIGHT))
+
+
+def test_the_safe_band_is_the_centre_crop_of_the_reference_frame():
+    # 1080x1920 cropped to 4:5 is 1080x1350, centred: 285px of frame each end.
+    assert assemble.safe_band("4:5") == (285.0, 1635.0)
+    # ...and to 1:1 is 1080x1080, which takes 420px off the top.
+    assert assemble.safe_band("1:1") == (420.0, 1500.0)
+
+
+def test_the_default_hook_card_clears_a_four_by_five_crop():
+    clears, why = assemble.card_clears_crop("Snailfish: extreme pressure",
+                                            None, "4:5")
+    assert clears and why == ""
+
+
+def test_a_square_crop_would_cut_the_top_off_the_hook_card(monkeypatch):
+    monkeypatch.setattr(config, "HOOK_CARD_MARGIN_V", 320)
+    clears, why = assemble.card_clears_crop("Snailfish: extreme pressure",
+                                            None, "1:1")
+    assert not clears
+    assert "320px" in why and "420px" in why
+
+
+def test_a_card_low_enough_survives_a_square_crop(monkeypatch):
+    monkeypatch.setattr(config, "HOOK_CARD_MARGIN_V", 460)
+    clears, _ = assemble.card_clears_crop("Short", None, "1:1")
+    assert clears
+
+
+# --- what the picture shows -------------------------------------------------
+
+def test_a_provider_slug_is_read_as_the_words_in_it():
+    assert assemble._describe("medusa-blue-ocean-13693981") == "medusa blue ocean"
+
+
+def test_the_asset_id_is_not_mistaken_for_part_of_the_description():
+    assert not any(char.isdigit()
+                   for char in assemble._describe("lions-walking-safari-37551601"))
+
+
+def test_words_about_the_file_rather_than_the_picture_are_dropped():
+    assert assemble._describe("vertical video of a jellyfish") == "a jellyfish"
+    assert assemble._describe("jellyfish footage") == "jellyfish"
+
+
+def test_a_comma_separated_tag_list_survives_readably():
+    assert assemble._describe("ocean,  waves,sea") == "ocean, waves, sea"
+
+
+def test_the_providers_own_title_is_preferred_over_everything_else():
+    described, source = assemble._cover_depiction({
+        "title": "A jellyfish drifting in open water",
+        "source_url": "https://www.pexels.com/video/medusa-blue-ocean-13693981/",
+        "query": "snailfish deep ocean",
+    })
+    assert described == "A jellyfish drifting in open water"
+    assert source == "provider_title"
+
+
+def test_the_source_url_describes_the_clip_when_there_is_no_title():
+    described, source = assemble._cover_depiction({
+        "title": "",
+        "source_url": "https://www.pexels.com/video/medusa-blue-ocean-13693981/",
+        "query": "snailfish deep ocean",
+    })
+    assert described == "medusa blue ocean"
+    assert source == "source_url"
+
+
+def test_the_query_is_the_last_resort_because_it_is_what_was_asked_for():
+    described, source = assemble._cover_depiction({"query": "snailfish deep ocean"})
+    assert described == "snailfish deep ocean"
+    assert source == "query"
+
+
+def test_the_beats_image_prompt_is_never_used_to_describe_the_cover():
+    """Step 4's prompt says what was wanted. Stock search does not always agree.
+
+    On a real run "a snailfish swims in the deep ocean" was filled by a clip of
+    a jellyfish - so describing the cover from it would put a confident, wrong
+    sentence in front of someone who cannot check it.
+    """
+    described, source = assemble._cover_depiction({
+        "image_prompt": "A snailfish swims in the deep ocean.",
+        "source_url": "https://www.pexels.com/video/medusa-blue-ocean-1/",
+    })
+    assert "snailfish" not in described
+    assert source == "source_url"
+
+
+# --- which shot -------------------------------------------------------------
+
+def test_a_shot_that_held_the_screen_outranks_a_glimpse():
+    probe = {"width": 1080, "height": 1920, "ok": True}
+    long_shot = assemble.cover_score(shot(duration=3.2), probe)
+    brief = assemble.cover_score(shot(duration=0.6), probe)
+    assert long_shot > brief
+
+
+def test_a_looped_or_reused_shot_is_marked_down():
+    probe = {"width": 1080, "height": 1920, "ok": True}
+    plain = assemble.cover_score(shot(duration=3.0), probe)
+    assert assemble.cover_score(shot(duration=3.0, looped=True), probe) < plain
+    assert assemble.cover_score(shot(duration=3.0, reused=True), probe) < plain
+
+
+def test_footage_that_needs_no_crop_is_worth_more_than_footage_that_does():
+    portrait = assemble.cover_score(
+        shot(duration=3.0), {"width": 1080, "height": 1920, "ok": True})
+    landscape = assemble.cover_score(
+        shot(duration=3.0), {"width": 3840, "height": 2160, "ok": True})
+    assert portrait > landscape
+
+
+def test_the_top_of_the_reel_is_preferred_to_the_end_of_it():
+    probe = {"width": 1080, "height": 1920, "ok": True}
+    early = assemble.cover_score(shot(duration=3.0, start=1.0), probe)
+    late = assemble.cover_score(shot(duration=3.0, start=40.0), probe)
+    assert early > late
+
+
+# --- the choice -------------------------------------------------------------
+
+def test_auto_opens_on_the_hook_card_when_the_crop_allows_it():
+    cover = plan_a_cover(source="auto")
+    assert cover["source"] == "hook_card"
+    assert cover["hook_card_text"] == "Hook card"
+    assert "clears a centre crop" in cover["reason"]
+    assert cover["card_in_safe_band"] is True
+
+
+def test_auto_falls_back_to_footage_when_the_crop_would_cut_the_card(monkeypatch):
+    monkeypatch.setattr(config, "COVER_SAFE_ASPECT", "1:1")
+    warnings: list[str] = []
+    cover = plan_a_cover(source="auto", warnings=warnings)
+    assert cover["source"] == "footage"
+    assert cover["hook_card_text"] == ""
+    assert cover["card_in_safe_band"] is False
+    assert any("rather than the hook card" in w for w in warnings)
+
+
+def test_hook_card_keeps_the_card_even_where_the_crop_bites(monkeypatch):
+    monkeypatch.setattr(config, "COVER_SAFE_ASPECT", "1:1")
+    cover = plan_a_cover(source="hook_card")
+    assert cover["source"] == "hook_card"
+    assert "kept it anyway" in cover["reason"]
+
+
+def test_footage_never_takes_the_frame_from_under_the_card():
+    cover = plan_a_cover(source="footage", card_seconds=2.2)
+    assert cover["source"] == "footage"
+    assert cover["hook_card_text"] == ""
+    assert cover["time"] >= 2.2
+
+
+def test_a_reel_with_no_card_takes_its_cover_from_the_footage():
+    cover = plan_a_cover(card="", card_seconds=0.0, source="auto")
+    assert cover["source"] == "footage"
+    assert cover["card_in_safe_band"] is None
+
+
+def test_asking_for_a_card_that_does_not_exist_says_so():
+    warnings: list[str] = []
+    cover = plan_a_cover(card="", card_seconds=0.0, source="hook_card",
+                         warnings=warnings)
+    assert cover["source"] == "footage"
+    assert any("no hook card" in w for w in warnings)
+
+
+def test_an_unknown_cover_source_is_reported_and_treated_as_auto():
+    warnings: list[str] = []
+    cover = plan_a_cover(source="whatever", warnings=warnings)
+    assert cover["mode"] == "auto"
+    assert any("unknown COVER_SOURCE" in w for w in warnings)
+
+
+def test_covers_can_be_switched_off_entirely(monkeypatch):
+    monkeypatch.setattr(config, "COVER_ENABLED", False)
+    assert plan_a_cover() is None
+
+
+def test_the_card_frame_is_taken_while_the_card_is_still_up():
+    cover = plan_a_cover(source="hook_card", card_seconds=2.2)
+    assert 0 < cover["time"] < 2.2
+
+
+def test_the_frame_is_taken_away_from_both_cuts_of_its_shot():
+    manifest = cover_manifest()
+    shots, _ = plan(manifest)
+    cover = plan_a_cover(shots=shots, manifest=manifest, source="footage")
+    chosen = next(s for s in shots if s.index == cover["shot_index"])
+    assert cover["time"] > chosen.start
+    assert cover["time"] < chosen.end
+
+
+def test_a_clip_is_seeked_to_the_same_in_point_the_edit_uses():
+    manifest = cover_manifest()
+    shots, _ = plan(manifest)
+    cover = plan_a_cover(shots=shots, manifest=manifest, source="footage")
+    chosen = next(s for s in shots if s.index == cover["shot_index"])
+    assert cover["source_time"] == pytest.approx(
+        chosen.source_start + (cover["time"] - chosen.start), abs=0.002
+    )
+
+
+def test_a_still_has_only_one_frame_to_take():
+    manifest = cover_manifest()
+    for asset in manifest["assets"]:
+        asset["kind"] = "image"
+        asset["duration"] = 0.0
+    shots, _ = plan(manifest)
+    cover = plan_a_cover(shots=shots, manifest=manifest, source="footage")
+    assert cover["kind"] == "image"
+    assert cover["source_time"] == 0.0
+
+
+def test_only_shots_near_the_top_of_the_reel_are_candidates(monkeypatch):
+    monkeypatch.setattr(config, "COVER_SEARCH_SECONDS", 6.0)
+    manifest = cover_manifest()
+    shots, _ = plan(manifest)
+    cover = plan_a_cover(shots=shots, manifest=manifest, source="footage")
+    assert cover["time"] < 6.0
+
+
+def test_the_cover_is_planned_but_not_written_until_something_writes_it():
+    cover = plan_a_cover()
+    assert cover["written"] is False
+    assert cover["path"] is None
+    assert cover["bytes"] == 0
+
+
+def test_the_record_says_which_shot_and_why():
+    cover = plan_a_cover()
+    for key in ("source", "mode", "reason", "time", "shot_index", "beat_index",
+                "asset_index", "file", "kind", "depicts", "depicts_source",
+                "safe_aspect", "score"):
+        assert key in cover, key
+    assert cover["reason"]
+
+
+def test_a_cover_frame_is_the_size_of_the_reels_own_frame():
+    cover = plan_a_cover()
+    assert cover["width"] == config.VIDEO_WIDTH
+    assert cover["height"] == config.VIDEO_HEIGHT
+
+
+def test_footage_nothing_describes_is_reported_rather_than_left_blank():
+    manifest = cover_manifest()
+    for asset in manifest["assets"]:
+        asset["title"] = ""
+        asset["source_url"] = ""
+        asset["query"] = ""
+    warnings: list[str] = []
+    cover = plan_a_cover(manifest=manifest, warnings=warnings)
+    # The topic is the last thing standing, and the run says so.
+    assert cover["depicts_source"] == "topic"
+    assert any("nothing describes" in w for w in warnings)
+
+
+# --- the card the cover is drawn through ------------------------------------
+
+def test_the_covers_card_is_drawn_without_the_reels_fade():
+    """One frame at t=0 is the middle of the reel's fade-in."""
+    faded = assemble.build_ass([], "Arial Black", None,
+                               hook="Hook card", hook_seconds=1.0)
+    flat = assemble.build_ass([], "Arial Black", None, hook="Hook card",
+                              hook_seconds=1.0, hook_fade_ms=0)
+    assert "\\fad(" in faded
+    assert "\\fad(" not in flat
+    assert "HOOK CARD" in flat
+
+
+def test_the_covers_card_is_built_by_the_same_code_as_the_reels():
+    """So the headline on the cover cannot drift from the one in the video."""
+    def card_style(ass: str) -> list[str]:
+        return [line for line in ass.splitlines()
+                if line.startswith("Style: Hook")]
+
+    reel = assemble.build_ass([], "Arial Black", None,
+                              hook="A longer hook card that wraps",
+                              hook_seconds=2.2, hook_fade_ms=0)
+    cover = assemble.build_ass([], "Arial Black", None,
+                               hook="A longer hook card that wraps",
+                               hook_seconds=1.0, hook_fade_ms=0)
+    assert card_style(reel) == card_style(cover)
+
+
+# ---------------------------------------------------------------------------
+# Motion - how the frame moves across a shot
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def moving(monkeypatch):
+    """The shipped defaults, pinned so a config change cannot rewrite a test."""
+    monkeypatch.setattr(config, "SHOT_MOTION", "alternate")
+    monkeypatch.setattr(config, "SHOT_MOTION_ZOOM", 1.08)
+    monkeypatch.setattr(config, "SHOT_MOTION_HOOK_ZOOM", 1.18)
+    monkeypatch.setattr(config, "IMAGE_ZOOM", 1.12)
+
+
+def planned(kinds: str, **overrides) -> list[Shot]:
+    """A settled shot list from a string of kinds: "vvi" is clip, clip, still."""
+    shots = [
+        shot(index=i, beat_index=i // 2, asset_index=i, start=i * 3.0,
+             kind="image" if letter == "i" else "video",
+             path=Path("/nowhere/x.jpg" if letter == "i" else "/nowhere/c.mp4"),
+             **overrides)
+        for i, letter in enumerate(kinds)
+    ]
+    assemble._plan_motion(shots)
+    return shots
+
+
+def test_the_opening_shot_pushes_in_harder_than_the_rest(moving):
+    shots = planned("vvv")
+
+    assert (shots[0].motion, shots[0].motion_zoom) == ("push", 1.18)
+    assert shots[1].motion_zoom == 1.08
+
+
+def test_the_opening_shot_never_pulls_back(moving):
+    """A pull-back on the first shot moves away from the subject at exactly the
+    moment the reel is asking to be watched."""
+    assert planned("v")[0].motion == "push"
+
+
+def test_clips_push_and_pull_in_turn(moving):
+    """A run of shots all moving the same way reads as one mechanical move on
+    repeat, which is the thing being fixed rather than a milder version of it."""
+    assert [s.motion for s in planned("vvvvv")] == [
+        "push", "pull", "push", "pull", "push"]
+
+
+def test_push_mode_moves_every_shot_the_same_way(moving, monkeypatch):
+    monkeypatch.setattr(config, "SHOT_MOTION", "push")
+
+    assert {s.motion for s in planned("vvvvv")} == {"push"}
+
+
+def test_motion_off_leaves_clips_exactly_as_they_were(moving, monkeypatch):
+    monkeypatch.setattr(config, "SHOT_MOTION", "off")
+    shots = planned("vvv")
+
+    assert [s.motion for s in shots] == ["", "", ""]
+    assert {s.motion_zoom for s in shots} == {1.0}
+
+
+def test_a_zoom_of_one_is_no_motion_at_all(moving, monkeypatch):
+    monkeypatch.setattr(config, "SHOT_MOTION_ZOOM", 1.0)
+
+    assert [s.motion for s in planned("vvv")] == ["", "", ""]
+
+
+def test_stills_keep_their_own_zoom_and_always_push(moving):
+    """IMAGE_ZOOM governs stills and SHOT_MOTION governs clips, because a still
+    has no motion of its own at all and a clip only needs enough to read as a
+    camera move."""
+    shots = planned("vivi")
+
+    assert [(s.motion, s.motion_zoom) for s in shots[1::2]] == [
+        ("push", 1.12), ("push", 1.12)]
+
+
+def test_turning_clip_motion_off_does_not_freeze_the_stills(moving, monkeypatch):
+    monkeypatch.setattr(config, "SHOT_MOTION", "off")
+    shots = planned("vi")
+
+    assert shots[0].motion == ""
+    assert (shots[1].motion, shots[1].motion_zoom) == ("push", 1.12)
+
+
+def test_a_still_with_its_zoom_switched_off_does_not_move(moving, monkeypatch):
+    monkeypatch.setattr(config, "IMAGE_ZOOM", 1.0)
+    shots = planned("vi")
+
+    assert shots[1].motion == ""
+    assert shots[0].motion, "the clip is unaffected"
+
+
+def test_a_still_takes_its_turn_in_the_alternation(moving):
+    """It does not honour the pull half, but it does not skip the count either -
+    so the clips either side carry on in the order they would have had."""
+    assert [s.motion for s in planned("vivv")] == ["push", "push", "push", "pull"]
+
+
+def test_motion_is_planned_after_merging_so_the_alternation_has_no_gaps(moving):
+    """Two neighbours showing the same thing are folded into one shot, and the
+    fold renumbers everything after it. Deciding direction before that would
+    leave two shots running the same way where the seam was."""
+    # A still used twice running restarts on the frame it just left, so these
+    # two are one shot by the time anything asks how they should move.
+    raw = [
+        shot(index=0, asset_index=0, start=0.0, kind="video"),
+        shot(index=1, asset_index=1, start=3.0, kind="image",
+             path=Path("/nowhere/x.jpg")),
+        shot(index=2, asset_index=1, start=6.0, kind="image",
+             path=Path("/nowhere/x.jpg")),
+        shot(index=3, asset_index=2, start=9.0, kind="video"),
+        shot(index=4, asset_index=3, start=12.0, kind="video"),
+    ]
+    merged = assemble._merge_identical_neighbours(raw)
+    assemble._plan_motion(merged)
+
+    assert len(merged) == 4, "the repeated still folded into one shot"
+    assert [s.index for s in merged] == [0, 1, 2, 3]
+    # Index 3 is the second clip after the fold. Had direction been read off the
+    # pre-merge numbering it would still be sitting on 4, and pushing like 2.
+    assert [s.motion for s in merged] == ["push", "push", "push", "pull"]
+
+
+def test_a_timeline_off_the_planner_comes_out_already_moving(moving):
+    shots, _ = plan(make_manifest(beats=3, assets_per_beat=1))
+
+    assert [s.index for s in shots] == list(range(len(shots)))
+    assert all(s.motion for s in shots), "every shot was given a move"
+    assert shots[0].motion_zoom == config.SHOT_MOTION_HOOK_ZOOM
+
+
+def test_the_manifest_records_how_every_shot_moved(moving):
+    shots = planned("vvi")
+    entries = [
+        {"motion": s.motion, "motion_zoom": s.motion_zoom} for s in shots
+    ]
+
+    assert entries == [
+        {"motion": "push", "motion_zoom": 1.18},
+        {"motion": "pull", "motion_zoom": 1.08},
+        {"motion": "push", "motion_zoom": 1.12},
+    ]
+
+
+# --- and what that becomes in the filter graph ------------------------------
+
+def test_a_moving_clip_settles_its_frame_rate_before_zoompan_counts_frames():
+    """zoompan with d=1 emits one output frame per *input* frame, so a 24fps
+    source left unnormalised hands back 24 frames labelled as 30 and the shot
+    plays a quarter too fast. Measured on real 24fps and 30fps sources, this
+    ordering returns the identical frame count to the static path."""
+    chain = assemble._shot_chain(
+        shot(motion="push", motion_zoom=1.08), "0:v", "v0")
+
+    assert chain.index(f"fps={config.VIDEO_FPS}") < chain.index("zoompan")
+
+
+def test_a_moving_clip_emits_one_frame_per_input_frame():
+    chain = assemble._shot_chain(
+        shot(motion="push", motion_zoom=1.08), "0:v", "v0")
+
+    assert ":d=1:" in chain
+
+
+def test_a_moving_still_builds_the_whole_shot_out_of_its_one_frame():
+    chain = assemble._shot_chain(
+        shot(kind="image", path=Path("/nowhere/x.jpg"), duration=2.0,
+             motion="push", motion_zoom=1.12), "0:v", "v0")
+
+    assert f":d={2 * config.VIDEO_FPS}:" in chain
+    assert "fps=" in chain, "zoompan still needs its own output rate"
+
+
+def test_a_push_starts_on_the_frame_and_a_pull_ends_on_it():
+    push = assemble._shot_chain(shot(motion="push", motion_zoom=1.08), "0:v", "v0")
+    pull = assemble._shot_chain(shot(motion="pull", motion_zoom=1.08), "0:v", "v0")
+
+    assert "z='min(1+0.0800*on/" in push
+    assert "z='max(1.0800-0.0800*on/" in pull
+
+
+def test_the_zoom_is_clamped_at_both_ends():
+    """`on` keeps counting past the frame the shot was planned for when a source
+    hands over more frames than expected; an unclamped ramp zooms into it."""
+    push = assemble._shot_chain(shot(motion="push", motion_zoom=1.08), "0:v", "v0")
+    pull = assemble._shot_chain(shot(motion="pull", motion_zoom=1.08), "0:v", "v0")
+
+    assert ",1.0800)'" in push
+    assert ",1.0000)'" in pull
+
+
+def test_a_moving_shot_is_oversampled_before_it_is_moved():
+    """zoompan quantises its zoom to whole input pixels, so the move is only as
+    smooth as the picture it crops out of."""
+    chain = assemble._shot_chain(shot(motion="push", motion_zoom=1.08), "0:v", "v0")
+    big_w = int(config.VIDEO_WIDTH * assemble.MOTION_OVERSAMPLE) // 2 * 2
+
+    assert f"crop={big_w}:" in chain
+    assert f"s={config.VIDEO_WIDTH}x{config.VIDEO_HEIGHT}" in chain, \
+        "zoompan lands it on the output size itself"
+
+
+def test_a_static_shot_still_crops_straight_to_the_frame():
+    chain = assemble._shot_chain(shot(), "0:v", "v0")
+
+    assert f"crop={config.VIDEO_WIDTH}:{config.VIDEO_HEIGHT}" in chain
+    assert "zoompan" not in chain
+def test_a_beat_splits_rather_than_holding_past_the_curve(monkeypatch):
+    """The measured fault: a window between one and one-and-a-half targets
+    rounded down to a single shot and then held for all of it.
+
+    4.5s against a 3.2s target is 1.4x - it used to round to one shot and hold
+    4.5s while the beat's second downloaded clip went unused.
+    """
+    monkeypatch.setattr(config, "SHOT_PACING", "flat")
+    monkeypatch.setattr(config, "SHOT_TARGET_SECONDS", 3.2)
+    monkeypatch.setattr(config, "SHOT_MAX_OVERRUN", 1.25)
+
+    assert assemble._shot_count(4.5, 2, position=0.0, total=40.0) == 2
+
+
+def test_the_overrun_ceiling_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(config, "SHOT_PACING", "flat")
+    monkeypatch.setattr(config, "SHOT_TARGET_SECONDS", 3.2)
+    monkeypatch.setattr(config, "SHOT_MAX_OVERRUN", 0.0)
+
+    assert assemble._shot_count(4.5, 2, position=0.0, total=40.0) == 1
+
+
+def test_the_overrun_ceiling_never_invents_footage(monkeypatch):
+    """It is still capped at twice what step 4 sourced for the beat, so a beat
+    with one clip cannot be cut into four."""
+    monkeypatch.setattr(config, "SHOT_PACING", "flat")
+    monkeypatch.setattr(config, "SHOT_TARGET_SECONDS", 3.2)
+    monkeypatch.setattr(config, "SHOT_MAX_OVERRUN", 1.25)
+
+    assert assemble._shot_count(20.0, 1, position=0.0, total=40.0) <= 2
+
+
+def test_a_window_already_inside_the_curve_is_left_alone(monkeypatch):
+    monkeypatch.setattr(config, "SHOT_PACING", "flat")
+    monkeypatch.setattr(config, "SHOT_TARGET_SECONDS", 3.2)
+    monkeypatch.setattr(config, "SHOT_MAX_OVERRUN", 1.25)
+
+    assert assemble._shot_count(3.0, 3, position=0.0, total=40.0) == 1
+
+
+def test_the_ceiling_follows_the_curve_rather_than_a_constant(monkeypatch):
+    """The point of measuring the overrun against the curve: the same window
+    is a long hold at the top of a reel and an ordinary shot in the middle."""
+    monkeypatch.setattr(config, "SHOT_PACING", "curve")
+    monkeypatch.setattr(config, "SHOT_HOOK_SECONDS", 1.4)
+    monkeypatch.setattr(config, "SHOT_TARGET_SECONDS", 3.2)
+    monkeypatch.setattr(config, "SHOT_PACING_RAMP_SECONDS", 8.0)
+    monkeypatch.setattr(config, "SHOT_OUTRO_WINDOW_SECONDS", 0.0)
+    monkeypatch.setattr(config, "SHOT_MAX_OVERRUN", 1.25)
+
+    opening = assemble._shot_count(3.0, 4, position=0.0, total=40.0)
+    middle = assemble._shot_count(3.0, 4, position=20.0, total=40.0)
+    assert opening > middle
+
+
+

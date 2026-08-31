@@ -48,24 +48,19 @@ MODEL_ID = config.ELEVENLABS_MODEL
 OUTPUT_FORMAT = "mp3_44100_128"
 
 # --- voice_settings ---------------------------------------------------------
-# All 0.0-1.0 unless noted. Values below are ElevenLabs' own defaults.
+# All 0.0-1.0 unless noted. These were ElevenLabs' own defaults written in
+# here as constants; they live in config.py now, because a narrator is worth
+# trying variants of and step 9 can only run a trial on something it can set.
+# Read once at import, the way the rest of this module reads its settings.
 
-#: Lower = more emotional range and more variation between takes.
-#: Higher = flatter, more repeatable. 0.4-0.6 suits narration.
-STABILITY = 0.5
+STABILITY = config.TTS_STABILITY
+SIMILARITY_BOOST = config.TTS_SIMILARITY_BOOST
+STYLE = config.TTS_STYLE
+USE_SPEAKER_BOOST = config.TTS_SPEAKER_BOOST
 
-#: How hard the model tries to match the original voice's timbre. Pushed too
-#: high on a noisy source voice, it reproduces the artefacts too.
-SIMILARITY_BOOST = 0.75
-
-#: Style exaggeration. Costs latency and hurts stability; 0 for straight reads.
-STYLE = 0.0
-
-#: Slight clarity/likeness bump. Free, so on by default.
-USE_SPEAKER_BOOST = True
-
-#: Playback rate. 1.0 = natural. Accepted range is 0.7-1.2.
-SPEED = 1.0
+#: Playback rate. 1.0 = natural. Accepted range is 0.7-1.2. Step 2's
+#: WORDS_PER_MINUTE is derived from this, so the two cannot drift apart.
+SPEED = config.TTS_SPEED
 
 # --- request behaviour ------------------------------------------------------
 

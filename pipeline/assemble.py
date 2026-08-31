@@ -99,6 +99,25 @@ CUE_LINGER_SECONDS = 0.25
 #: Word endings that close a cue even when it is still under the word limit.
 _SENTENCE_END = re.compile(r"[.!?][\"')\]]*$")
 
+#: A cut may never leave a shot shorter than this, whatever snapping wants.
+#: Well under the pacing curve's fastest opening, so it only ever bites on a
+#: shot that was already too short to see.
+_SNAP_MIN_SHOT_SECONDS = 0.5
+
+#: A silence has to be at least this long to count as somewhere to cut. Below
+#: it, what looks like a gap between two words is the stop consonant inside one
+#: phrase, and cutting there is no better than cutting mid-word.
+_SNAP_MIN_GAP_SECONDS = 0.06
+
+#: How much bigger than the output frame a moving shot is scaled before
+#: zoompan sees it. zoompan quantises its zoom to whole input pixels, so the
+#: move is only as smooth as the picture it is cropping out of - at 1:1 a slow
+#: push advances in visible steps. Not a config knob: it trades encode time for
+#: smoothness on a curve with nothing interesting on it, and 1.5 is past the
+#: knee. It is also why a moving shot never carries a `crop` to the output
+#: size - zoompan's own `s=` does that at the end of the chain.
+MOTION_OVERSAMPLE = 1.5
+
 #: How many characters of ffmpeg's stderr to quote when it fails. Enough for the
 #: real error, which ffmpeg prints last.
 FFMPEG_ERROR_TAIL = 1800
@@ -124,7 +143,23 @@ ALIGNMENT_NAME = "alignment.json"
 ATTRIBUTION_NAME = "attribution.txt"
 ASSEMBLY_NAME = "assembly.json"
 
-ASSEMBLY_VERSION = 1
+#: The card-only subtitle file the cover is drawn through. Kept rather than
+#: written to a temp file: when a cover looks wrong, this is the thing to look at.
+COVER_ASS_NAME = "cover.ass"
+
+#: Where inside the chosen shot the cover frame is taken from, as a fraction of
+#: its length. Mechanical rather than a matter of taste: far enough past the cut
+#: that the picture has settled, far enough before the next one that the subject
+#: has not already left the frame.
+_COVER_SHOT_POSITION = 0.45
+
+#: ...and never closer than this to either end of the shot, whatever the
+#: fraction works out to on a very short one.
+_COVER_EDGE_SECONDS = 0.25
+
+#: Bumped to 2 when the cover frame was added - steps 6 and 9 read this file,
+#: and version 1 has no `cover` in it.
+ASSEMBLY_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +436,13 @@ class Shot:
     looped: bool = False
     #: This asset is already on the timeline somewhere earlier.
     reused: bool = False
+    #: How the frame moves across this shot: "push", "pull", or "" for static.
+    #: Decided by `_plan_motion` once the timeline is settled, never at render
+    #: time - the direction alternates along the shot list, and merging two
+    #: neighbours changes what that list is.
+    motion: str = ""
+    #: How far it travels, as a zoom factor. 1.0 is no movement.
+    motion_zoom: float = 1.0
 
     @property
     def end(self) -> float:
@@ -474,21 +516,132 @@ def _beat_slots(manifest: dict, usable: dict[int, dict], total: float,
     return slots
 
 
-def _shot_count(window: float, available: int) -> int:
+def shot_target_at(position: float, total: float) -> float:
+    """How long a shot should hold, `position` seconds into a `total`-second reel.
+
+    One rate for the whole reel is the obvious thing to do and the wrong one.
+    A cut costs the viewer a moment's re-orientation and buys back a moment's
+    attention, and the exchange rate is not constant: at the top there is no
+    attention yet to lose, so cuts are nearly free and nearly all of what keeps
+    someone watching; in the middle the viewer is following an argument, and a
+    cut every second is just noise over the top of it. At the close the reel
+    has to land rather than fade, so the rate comes back up.
+
+    So: SHOT_HOOK_SECONDS at t=0, easing linearly out to SHOT_TARGET_SECONDS
+    over SHOT_PACING_RAMP_SECONDS, then tightening to SHOT_OUTRO_SECONDS across
+    the final SHOT_OUTRO_WINDOW_SECONDS.
+    """
+    steady = max(0.3, config.SHOT_TARGET_SECONDS)
+    if (config.SHOT_PACING or "").strip().lower() != "curve":
+        return steady
+
+    target = steady
+    ramp = max(0.0, config.SHOT_PACING_RAMP_SECONDS)
+    if ramp > 0 and position < ramp:
+        opening = max(0.3, config.SHOT_HOOK_SECONDS)
+        target = opening + (steady - opening) * (position / ramp)
+
+    window = max(0.0, config.SHOT_OUTRO_WINDOW_SECONDS)
+    if window > 0 and total > 0 and position > total - window:
+        into = min(1.0, (position - (total - window)) / window)
+        closing = max(0.3, config.SHOT_OUTRO_SECONDS)
+        # `min` rather than a straight assignment: on a reel short enough that
+        # the ramp and the outro window overlap, whichever phase wants the
+        # faster cutting gets it, instead of the outro undoing the opening.
+        target = min(target, steady + (closing - steady) * into)
+
+    return max(0.3, target)
+
+
+def _curve_shots_in(start: float, end: float, total: float,
+                    steps: int = 64) -> float:
+    """How many shot-lengths the pacing curve fits between two times.
+
+    The integral of dt/target(t), which is the only honest way to ask the
+    question when the target is not constant across the window. Sampling the
+    curve once at the middle of the beat instead would quietly cancel the whole
+    feature on exactly the beat that matters: a long opening beat's midpoint
+    already sits past the ramp, so it would be handed the steady rate and the
+    reel would open at the same pace as its middle.
+    """
+    span = end - start
+    if span <= 0:
+        return 0.0
+    step = span / steps
+    return sum(step / max(0.3, shot_target_at(start + (i + 0.5) * step, total))
+               for i in range(steps))
+
+
+def _shot_count(window: float, available: int, *,
+                position: float = 0.0, total: float = 0.0) -> int:
     """How many cuts a window of narration should get.
 
-    Aims for SHOT_TARGET_SECONDS a shot, then respects the floor and the
-    ceiling. An asset may be used twice inside one beat if that is what the
-    ceiling needs, but no further - past that the shot simply runs long.
-    """
-    target = max(0.5, config.SHOT_TARGET_SECONDS)
-    count = max(1, int(round(window / target)))
+    Follows the pacing curve across the window, then respects the floor and
+    both ceilings - the absolute SHOT_MAX_SECONDS and the SHOT_MAX_OVERRUN one
+    that is measured against the curve. An asset may be used twice inside one
+    beat if that is what a ceiling needs, but no further - past that the shot
+    simply runs long.
 
-    while count > 1 and window / count < config.SHOT_MIN_SECONDS:
+    The floor gives way to the curve rather than fighting it. SHOT_MIN_SECONDS
+    exists to stop a short beat being chopped into flashes by the arithmetic;
+    where the curve is deliberately asking for 1.4s shots through the opening,
+    that is the edit and not an accident, so the floor steps aside.
+    """
+    count = max(1, int(round(_curve_shots_in(position, position + window, total))))
+
+    floor = min(config.SHOT_MIN_SECONDS,
+                shot_target_at(position + window / 2, total))
+    while count > 1 and window / count < floor:
         count -= 1
     if config.SHOT_MAX_SECONDS > 0:
         count = max(count, math.ceil(window / config.SHOT_MAX_SECONDS - 1e-6))
+
+    # The ceiling that actually binds. SHOT_MAX_SECONDS sits at 6.0s while the
+    # curve asks for 3.2s, so it never fires, and what decided shot length was
+    # the rounding above: a window up to 1.49 targets long rounds to one shot
+    # and then holds for all of it. This charges that overrun against the curve
+    # instead of against a constant, which is the only ceiling that means the
+    # same thing at the top of a reel and in the middle of one.
+    if config.SHOT_MAX_OVERRUN > 0:
+        ceiling = shot_target_at(position + window / 2, total) * config.SHOT_MAX_OVERRUN
+        if ceiling > 0:
+            count = max(count, math.ceil(window / ceiling - 1e-6))
+
     return max(1, min(count, max(1, available * 2)))
+
+
+def _shot_spans(start: float, end: float, count: int,
+                total: float) -> list[tuple[float, float]]:
+    """Divide [start, end] into `count` shots whose lengths follow the curve.
+
+    Dividing the window evenly would put the right *number* of cuts in the
+    opening beat and still space them identically, which is not what the curve
+    asked for. Each shot is instead laid down at the length the curve wants
+    where it begins, and the run is then rescaled to land exactly on `end` -
+    so a beat that straddles the ramp opens short and finishes at the steady
+    rate, rather than averaging the two.
+    """
+    span = end - start
+    if count <= 1 or span <= 0:
+        return [(start, end)]
+
+    lengths: list[float] = []
+    cursor = start
+    for _ in range(count):
+        length = max(0.3, shot_target_at(cursor, total))
+        lengths.append(length)
+        cursor += length
+
+    scale = span / sum(lengths)
+    spans: list[tuple[float, float]] = []
+    cursor = start
+    for length in lengths:
+        following = cursor + length * scale
+        spans.append((round(cursor, 3), round(following, 3)))
+        cursor = following
+    # The last shot takes the rounding, so the beat ends exactly where it must.
+    spans[-1] = (spans[-1][0], round(end, 3))
+    return spans
 
 
 def _source_in_point(clip_duration: float, slot: float) -> float:
@@ -537,12 +690,157 @@ def _merge_identical_neighbours(shots: list[Shot]) -> list[Shot]:
     return merged
 
 
+def _plan_motion(shots: list[Shot]) -> None:
+    """Decide how the frame moves across each shot, in place.
+
+    Runs after the timeline is final - after snapping and after identical
+    neighbours have been merged - because the direction alternates along the
+    shot list, and both of those change what that list is. A merge that folded
+    two shots into one would otherwise leave a gap in the alternation.
+
+    Three rules, in order of who wins:
+
+    * the opening shot always pushes in, and harder than the rest. It is on
+      screen for the second and a half in which the viewer decides, and it is
+      the frame the cover is drawn from;
+    * every other clip moves by SHOT_MOTION_ZOOM, pushing and pulling in turn
+      under `alternate` so that a run of shots does not read as one move on
+      repeat;
+    * stills keep IMAGE_ZOOM and always push. They are a separate knob because
+      they are a separate problem - a still has no motion of its own at all -
+      and turning clip motion off has never been a reason to freeze them.
+
+    Stills still take their turn in the alternation count rather than being
+    skipped over, so the clips either side of one carry on in the order they
+    would have had. A still simply does not honour the "pull" half of it.
+    """
+    mode = (config.SHOT_MOTION or "off").strip().lower()
+    clips_move = mode not in ("", "off", "none") and config.SHOT_MOTION_ZOOM > 1.0
+
+    for shot in shots:
+        if shot.index == 0 and clips_move:
+            shot.motion, shot.motion_zoom = "push", config.SHOT_MOTION_HOOK_ZOOM
+        elif shot.kind == "image":
+            shot.motion = "push" if config.IMAGE_ZOOM > 1.0 else ""
+            shot.motion_zoom = config.IMAGE_ZOOM
+        elif clips_move:
+            pull = mode == "alternate" and shot.index % 2 == 1
+            shot.motion = "pull" if pull else "push"
+            shot.motion_zoom = config.SHOT_MOTION_ZOOM
+        else:
+            shot.motion, shot.motion_zoom = "", 1.0
+
+        if shot.motion_zoom <= 1.0:
+            shot.motion, shot.motion_zoom = "", 1.0
+
+
+def _word_cut_points(words: list[dict]) -> tuple[list[float], list[float]]:
+    """Where a cut can land without falling through the middle of a word.
+
+    Returns (gaps, starts): the midpoints of the silences between consecutive
+    words, and every word's start. Gaps are the better landing - a cut in a
+    pause is inaudible - and word starts are the fallback for continuous
+    speech, where a cut on the attack of a syllable still reads as deliberate.
+    """
+    gaps: list[float] = []
+    starts: list[float] = []
+    for word in words:
+        try:
+            starts.append(float(word["start"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    for earlier, later in zip(words, words[1:]):
+        try:
+            end, start = float(earlier["end"]), float(later["start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start - end >= _SNAP_MIN_GAP_SECONDS:
+            gaps.append((end + start) / 2)
+    return sorted(gaps), sorted(starts)
+
+
+def _nearest_within(points: list[float], target: float,
+                    lower: float, upper: float) -> float | None:
+    """The point closest to `target` that lies inside [lower, upper]."""
+    best: float | None = None
+    best_distance = float("inf")
+    for point in points:
+        if point < lower or point > upper:
+            continue
+        distance = abs(point - target)
+        if distance < best_distance:
+            best, best_distance = point, distance
+    return best
+
+
+def _snap_boundaries(plan: list[dict], words: list[dict]) -> int:
+    """Nudge each cut onto the nearest word boundary. Returns how many moved.
+
+    Step 5 already knows when every word is spoken, because it aligns the
+    narration to write the captions. Without this, a cut lands wherever
+    dividing a beat window by a shot count happened to put it - which is,
+    reliably, halfway through a word. The picture changes mid-syllable and the
+    edit reads as something that went wrong rather than something that was
+    done.
+
+    Only interior boundaries move: the reel still opens at 0 and still ends
+    where the narration does. Each cut is constrained to leave both of the
+    shots it separates at least _SNAP_MIN_SHOT_SECONDS long, so a nudge can
+    never collapse a shot, and boundaries are walked in order so a moved cut
+    becomes the floor for the next one.
+    """
+    if len(plan) < 2 or not words:
+        return 0
+
+    gaps, starts = _word_cut_points(words)
+    if not gaps and not starts:
+        return 0
+
+    limit = max(0.0, config.SHOT_SNAP_MAX_SECONDS)
+    if limit <= 0:
+        return 0
+
+    moved = 0
+    for index in range(1, len(plan)):
+        boundary = plan[index]["start"]
+        lower = max(plan[index - 1]["start"] + _SNAP_MIN_SHOT_SECONDS,
+                    boundary - limit)
+        upper = min(plan[index]["end"] - _SNAP_MIN_SHOT_SECONDS,
+                    boundary + limit)
+        if upper <= lower:
+            continue
+
+        # A pause first; the attack of a word only if there is no pause to be
+        # had within reach.
+        landing = (_nearest_within(gaps, boundary, lower, upper)
+                   or _nearest_within(starts, boundary, lower, upper))
+        if landing is None or abs(landing - boundary) < 0.005:
+            continue
+
+        plan[index - 1]["end"] = plan[index]["start"] = round(landing, 3)
+        moved += 1
+    return moved
+
+
 def plan_timeline(manifest: dict, audio_duration: float,
-                  probes: dict[int, dict]) -> tuple[list[Shot], list[str]]:
+                  probes: dict[int, dict],
+                  words: list[dict] | None = None) -> tuple[list[Shot], list[str]]:
     """Lay step 4's assets out across the narration.
 
-    Beat order and beat timings are taken as given; the only decisions made here
-    are how many cuts each beat gets and which of its assets fill them.
+    Beat order and beat timings are taken as given; the decisions made here are
+    how many cuts each beat gets, which of its assets fill them, and - once
+    `words` is on hand - exactly where those cuts land.
+
+    It runs in three passes, and the order matters. Which asset covers which
+    stretch is settled first; the cuts between them are then nudged onto word
+    boundaries; and only after that is each shot asked how it should be played,
+    because whether a clip has to loop depends on how long its slot ended up
+    being, and snapping changes that by up to SHOT_SNAP_MAX_SECONDS either way.
+
+    Args:
+        words: aligned narration, for snapping cuts to word boundaries. Without
+            it the cuts fall where the arithmetic put them, which is what
+            happens when captions are off and SHOT_SNAP_TO_WORDS is not set.
     """
     warnings: list[str] = []
     assets = manifest["assets"]
@@ -574,7 +872,8 @@ def plan_timeline(manifest: dict, audio_duration: float,
     slots = _beat_slots(manifest, usable, total, scale, warnings)
     used: set[int] = set()
 
-    shots: list[Shot] = []
+    # --- pass 1: which asset covers which stretch --------------------------
+    plan: list[dict] = []
     for slot in slots:
         available = list(slot.assets)
 
@@ -583,60 +882,86 @@ def plan_timeline(manifest: dict, audio_duration: float,
         # something else. _beat_slots has already folded away any beat with
         # nothing, and _shot_count never asks for more than two passes over what
         # is here, so cycling is always enough.
-        wanted = _shot_count(slot.duration, len(available))
+        wanted = _shot_count(slot.duration, len(available),
+                             position=slot.start, total=total)
         chosen = [available[position % len(available)] for position in range(wanted)]
 
-        share = slot.duration / len(chosen)
-        if share > config.SHOT_MAX_SECONDS + 0.5:
+        spans = _shot_spans(slot.start, slot.end, len(chosen), total)
+        longest = max(end - start for start, end in spans)
+        if longest > config.SHOT_MAX_SECONDS + 0.5:
             warnings.append(
-                f"beat {slot.beat_index} holds one shot for {share:.1f}s - "
+                f"beat {slot.beat_index} holds one shot for {longest:.1f}s - "
                 f"step 4 sourced only {len(available)} usable asset(s) for it"
             )
 
         seen_here: dict[int, int] = {}
-        for position, asset_index in enumerate(chosen):
-            asset = assets[asset_index]
-            start = round(slot.start + position * share, 3)
-            duration = round(
-                (slot.end - start) if position == len(chosen) - 1 else share, 3
-            )
+        for asset_index, (start, end) in zip(chosen, spans):
             repeat = seen_here.get(asset_index, 0)
             seen_here[asset_index] = repeat + 1
+            plan.append({
+                "beat_index": slot.beat_index,
+                "asset_index": asset_index,
+                "start": start,
+                "end": end,
+                "repeat": repeat,
+            })
 
-            kind = asset.get("kind", "video")
-            clip_length = probes[asset_index].get("duration") or 0.0
-            looped = False
-            in_point = 0.0
-            if kind == "video":
-                if clip_length <= 0 or clip_length < duration + 0.05:
-                    # Unknown or too short: let ffmpeg loop it and trim to the slot.
-                    looped = True
-                else:
-                    in_point = _source_in_point(clip_length, duration)
-                    # A second pass over the same clip cuts in somewhere else, so
-                    # the repeat does not read as a glitch.
-                    if repeat:
-                        in_point = round(max(0.0, min(
-                            clip_length - duration, in_point + repeat * duration
-                        )), 3)
+    # --- pass 2: put the cuts on word boundaries ---------------------------
+    snapped = 0
+    if words and config.SHOT_SNAP_TO_WORDS:
+        snapped = _snap_boundaries(plan, words)
 
-            shots.append(Shot(
-                index=len(shots),
-                beat_index=slot.beat_index,
-                asset_index=asset_index,
-                path=_asset_path(asset, asset_dir),
-                kind=kind,
-                start=start,
-                duration=duration,
-                source_start=in_point,
-                looped=looped,
-                reused=asset_index in used or repeat > 0,
-            ))
-            used.add(asset_index)
+    # --- pass 3: decide how each shot is played ----------------------------
+    shots: list[Shot] = []
+    for entry in plan:
+        asset_index = entry["asset_index"]
+        asset = assets[asset_index]
+        duration = round(entry["end"] - entry["start"], 3)
+        if duration <= 0:
+            continue
+
+        kind = asset.get("kind", "video")
+        clip_length = probes[asset_index].get("duration") or 0.0
+        looped = False
+        in_point = 0.0
+        if kind == "video":
+            if clip_length <= 0 or clip_length < duration + 0.05:
+                # Unknown or too short: let ffmpeg loop it and trim to the slot.
+                looped = True
+            else:
+                in_point = _source_in_point(clip_length, duration)
+                # A second pass over the same clip cuts in somewhere else, so
+                # the repeat does not read as a glitch.
+                if entry["repeat"]:
+                    in_point = round(max(0.0, min(
+                        clip_length - duration,
+                        in_point + entry["repeat"] * duration
+                    )), 3)
+
+        shots.append(Shot(
+            index=len(shots),
+            beat_index=entry["beat_index"],
+            asset_index=asset_index,
+            path=_asset_path(asset, asset_dir),
+            kind=kind,
+            start=entry["start"],
+            duration=duration,
+            source_start=in_point,
+            looped=looped,
+            reused=asset_index in used or entry["repeat"] > 0,
+        ))
+        used.add(asset_index)
 
     shots = _merge_identical_neighbours(shots)
     if shots:  # absorb the rounding drift rather than ending a frame short
         shots[-1].duration = round(total - shots[-1].start, 3)
+    _plan_motion(shots)
+
+    if snapped:
+        warnings.append(
+            f"{snapped} of {len(plan) - 1} cuts were nudged onto a word "
+            f"boundary (up to {config.SHOT_SNAP_MAX_SECONDS:g}s)"
+        )
 
     spare = len(usable) - len(used)
     if spare:
@@ -968,19 +1293,19 @@ def _ass_escape(text: str) -> str:
                 .replace("\n", " ").strip())
 
 
-def _cue_font_size(text: str, font_file: Path | None) -> int:
-    """Shrink a cue that would otherwise run past the frame edge.
+def _fit_font_size(text: str, font_file: Path | None, *, base: int,
+                   ink: float, margin_h: int, lines: int = 1) -> int:
+    """Shrink text that would otherwise run past the frame edge.
 
     A long single word - "bioluminescence" - cannot be wrapped, so it is scaled
     down instead. Measured with the real font when its file was found, and with
-    a conservative width-per-character otherwise.
+    a conservative width-per-character otherwise. `lines` is how many rows the
+    text is allowed to wrap onto before it has to shrink.
     """
-    base = config.CAPTION_FONT_SIZE
     # The outline grows the text on both sides and the shadow trails it on one,
     # so the glyphs get less than the bare margin-to-margin width. Leaving that
-    # out lets a cue that measures as an exact fit wrap onto a second line.
-    ink = 2 * config.CAPTION_OUTLINE_WIDTH + config.CAPTION_SHADOW_DEPTH
-    usable = CAPTION_REFERENCE_WIDTH - 2 * config.CAPTION_MARGIN_H - ink
+    # out lets text that measures as an exact fit wrap onto an extra line.
+    usable = (CAPTION_REFERENCE_WIDTH - 2 * margin_h - ink) * max(1, lines)
     if usable <= 0 or not text:
         return base
 
@@ -1007,12 +1332,89 @@ def _cue_font_size(text: str, font_file: Path | None) -> int:
     return max(24, int(base * usable / width))
 
 
-def build_ass(cues: list[Cue], font_name: str, font_file: Path | None) -> str:
+def _cue_font_size(text: str, font_file: Path | None) -> int:
+    """The size one caption cue is drawn at, shrunk if it would not fit."""
+    return _fit_font_size(
+        text, font_file,
+        base=config.CAPTION_FONT_SIZE,
+        ink=2 * config.CAPTION_OUTLINE_WIDTH + config.CAPTION_SHADOW_DEPTH,
+        margin_h=config.CAPTION_MARGIN_H,
+        lines=1,
+    )
+
+
+def _hook_card_font_size(text: str, font_file: Path | None) -> int:
+    """The size the hook card is drawn at.
+
+    Allowed two lines before it starts shrinking: the card is a headline of a
+    handful of words, and wrapping one of them onto a second row is how a
+    headline is normally set. Shrinking to keep it on one line would make the
+    biggest text in the reel the smallest thing about it.
+    """
+    return _fit_font_size(
+        text, font_file,
+        base=config.HOOK_CARD_FONT_SIZE,
+        ink=2 * config.HOOK_CARD_OUTLINE_WIDTH,
+        margin_h=config.CAPTION_MARGIN_H,
+        lines=2,
+    )
+
+
+def _hook_card_events(hook: str, seconds: float, font_file: Path | None,
+                      fade_ms: int | None = None) -> tuple[list[str], list[str]]:
+    """The style and the one dialogue line that draw the hook card.
+
+    Returns (styles, events) - both empty when there is no card to draw, so the
+    ASS of a reel without one is byte-for-byte what it always was.
+
+    `fade_ms` overrides HOOK_CARD_FADE_MS. The cover passes 0: it is a single
+    frame at t=0, which in the reel is the middle of the fade-in, and a cover
+    with its headline at half opacity looks like a rendering fault.
+    """
+    text = _ass_escape(hook or "")
+    if not text or seconds <= 0:
+        return [], []
+    if config.HOOK_CARD_UPPERCASE:
+        text = text.upper()
+
+    colour = _ass_colour(config.HOOK_CARD_COLOR)
+    outline = _ass_colour(config.HOOK_CARD_OUTLINE_COLOR)
+    size = _hook_card_font_size(text, font_file)
+
+    # Alignment 8 is top-centre, and with it MarginV is measured down from the
+    # top of the frame rather than up from the bottom - which is why the card
+    # and the captions can share a file without ever meeting.
+    styles = [
+        f"Style: Hook,{{font}},{size},{colour},{colour},{outline},"
+        f"&H80000000,0,0,0,0,100,100,0,0,1,"
+        f"{config.HOOK_CARD_OUTLINE_WIDTH:g},0,8,"
+        f"{config.CAPTION_MARGIN_H},{config.CAPTION_MARGIN_H},"
+        f"{config.HOOK_CARD_MARGIN_V},1"
+    ]
+
+    fade = max(0, config.HOOK_CARD_FADE_MS if fade_ms is None else fade_ms)
+    prefix = f"{{\\fad({fade},{fade})}}" if fade else ""
+    events = [
+        f"Dialogue: 0,{_ass_time(0.0)},{_ass_time(seconds)},Hook,,0,0,0,,"
+        f"{prefix}{text}"
+    ]
+    return styles, events
+
+
+def build_ass(cues: list[Cue], font_name: str, font_file: Path | None, *,
+              hook: str = "", hook_seconds: float = 0.0,
+              hook_fade_ms: int | None = None) -> str:
     """The subtitle file libass burns in.
 
     One dialogue line per cue in "plain" style; in "highlight" style one line
     per word, each showing the whole cue with the word being spoken tinted -
     which is what reads as the caption keeping up with the voice.
+
+    `hook` adds the hook card over the opening: the same file, a second style,
+    one more event. It rides along here rather than in the filter graph because
+    libass is already being run over the picture - a drawtext pass for it would
+    be a second text renderer with its own font handling and its own idea of
+    where the margins are.
     """
     primary = _ass_colour(config.CAPTION_PRIMARY_COLOR)
     highlight = _ass_colour(config.CAPTION_HIGHLIGHT_COLOR)
@@ -1040,11 +1442,18 @@ def build_ass(cues: list[Cue], font_name: str, font_file: Path | None) -> str:
          f"{config.CAPTION_OUTLINE_WIDTH:g},{config.CAPTION_SHADOW_DEPTH:g},2,"
          f"{config.CAPTION_MARGIN_H},{config.CAPTION_MARGIN_H},"
          f"{config.CAPTION_MARGIN_V},1"),
+    ]
+
+    card_styles, card_events = _hook_card_events(hook, hook_seconds, font_file,
+                                                 hook_fade_ms)
+    header += [style.format(font=font_name) for style in card_styles]
+    header += [
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
         "Effect, Text",
     ]
+    header += card_events
 
     frame = 1.0 / max(1, config.VIDEO_FPS)
     lines: list[str] = []
@@ -1127,7 +1536,7 @@ def _filter_path(path: Path) -> str:
 def _shot_inputs(shot: Shot) -> list[str]:
     """The `-ss`/`-t`/`-i` group that feeds one shot into the graph."""
     if shot.kind == "image":
-        if config.IMAGE_ZOOM > 1.0:
+        if shot.motion:
             # zoompan turns a *single* input frame into the whole shot. Looping
             # the input as well would multiply the two and emit minutes of video
             # for a three-second slot.
@@ -1143,24 +1552,49 @@ def _shot_inputs(shot: Shot) -> list[str]:
     return args + ["-t", f"{shot.duration:.3f}", "-i", str(shot.path)]
 
 
+def _zoom_expression(shot: Shot, frames: int) -> str:
+    """zoompan's `z`, moving from 1.0 to the shot's zoom or back the other way.
+
+    Clamped at both ends rather than left to run on: `on` keeps counting past
+    the frame the shot was planned for when a source hands over more frames
+    than expected, and an unclamped ramp would carry on zooming into it.
+    """
+    zoom, travel = shot.motion_zoom, shot.motion_zoom - 1.0
+    if shot.motion == "pull":
+        return f"z='max({zoom:.4f}-{travel:.4f}*on/{frames},1.0000)'"
+    return f"z='min(1+{travel:.4f}*on/{frames},{zoom:.4f})'"
+
+
 def _shot_chain(shot: Shot, label_in: str, label_out: str) -> str:
     """The filter chain that turns one source into a frame-shaped segment."""
     width, height, fps = config.VIDEO_WIDTH, config.VIDEO_HEIGHT, config.VIDEO_FPS
 
-    if shot.kind == "image" and config.IMAGE_ZOOM > 1.0:
+    if shot.motion:
         frames = max(1, int(round(shot.duration * fps)))
-        zoom = config.IMAGE_ZOOM
         # Oversample first: zoompan quantises its zoom to whole input pixels, so
-        # a larger source makes the push-in smooth instead of steppy.
-        big_w, big_h = int(width * 1.5) // 2 * 2, int(height * 1.5) // 2 * 2
+        # a larger source makes the move smooth instead of steppy.
+        big_w, big_h = int(width * MOTION_OVERSAMPLE) // 2 * 2, \
+            int(height * MOTION_OVERSAMPLE) // 2 * 2
         steps = [
             f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase"
             f":flags=lanczos",
             f"crop={big_w}:{big_h}",
-            (f"zoompan=z='min(1+{zoom - 1:.4f}*on/{frames},{zoom:.4f})'"
-             f":d={frames}:s={width}x{height}:fps={fps}"
-             f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"),
         ]
+        if shot.kind == "image":
+            # One input frame, and zoompan makes the whole shot out of it.
+            hold = f"d={frames}"
+        else:
+            # A clip arrives at whatever rate it was shot at, and zoompan with
+            # d=1 emits one output frame per *input* frame. Settle the rate
+            # before it starts counting, or a 24fps source hands back 24 frames
+            # labelled as 30 and the shot plays a quarter too fast. Measured
+            # against the static path on 24fps and 30fps sources, this ordering
+            # returns the identical frame count; the other one does not.
+            steps.append(f"fps={fps}")
+            hold = "d=1"
+        steps.append(f"zoompan={_zoom_expression(shot, frames)}"
+                     f":{hold}:s={width}x{height}:fps={fps}"
+                     f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'")
     else:
         steps = [
             f"scale={width}:{height}:force_original_aspect_ratio=increase"
@@ -1181,7 +1615,8 @@ def _shot_chain(shot: Shot, label_in: str, label_out: str) -> str:
 
 
 def _music_chains(audio_index: int, music_index: int,
-                  narration_chain: list[str], total: float) -> list[str]:
+                  narration_chain: list[str], total: float,
+                  out_label: str = "aout") -> list[str]:
     """The bed, and how it goes under the voice.
 
     Ducking needs the narration twice over - once as the thing you actually
@@ -1224,14 +1659,17 @@ def _music_chains(audio_index: int, music_index: int,
 
     # normalize=0 is not optional: amix divides by the input count by default,
     # so leaving it out would halve the narration the moment music was added.
-    chains.append(f"[narr][{mixed}]amix=inputs=2:normalize=0:duration=first[aout]")
+    chains.append(f"[narr][{mixed}]amix=inputs=2:normalize=0:duration=first"
+                  f"[{out_label}]")
     return chains
 
 
 def build_filter_graph(shots: list[Shot], audio_index: int, total: float,
                        narration: float, ass_path: Path | None,
                        fonts_dir: Path | None,
-                       music_index: int | None = None) -> tuple[str, str]:
+                       music_index: int | None = None,
+                       sfx_cues: list[SfxCue] | None = None,
+                       sfx_index: int = 0) -> tuple[str, str]:
     """The whole edit as one filter graph: shots, concat, captions, audio."""
     chains = [_shot_chain(shot, f"{i}:v", f"v{i}") for i, shot in enumerate(shots)]
 
@@ -1275,10 +1713,27 @@ def build_filter_graph(shots: list[Shot], audio_index: int, total: float,
     # with silence so the mux does not end the file early.
     audio.append("apad")
 
+    effect_chains, effect_labels = _sfx_chains(sfx_cues or [], sfx_index)
+    # With effects to add, the voice-and-music mix is no longer the last word.
+    bed = "abed" if effect_labels else "aout"
+
     if music_index is None:
-        chains.append(f"[{audio_index}:a]" + ",".join(audio) + "[aout]")
+        chains.append(f"[{audio_index}:a]" + ",".join(audio) + f"[{bed}]")
     else:
-        chains += _music_chains(audio_index, music_index, audio, total)
+        chains += _music_chains(audio_index, music_index, audio, total,
+                                out_label=bed)
+
+    if effect_labels:
+        chains += effect_chains
+        joined = "".join(f"[{label}]" for label in effect_labels)
+        # The effects go on top of the finished mix rather than through the
+        # ducking with it. They are transients whose whole job is to punch, and
+        # a compressor keyed off the narration would pull each one down at
+        # exactly the moment it fired.
+        chains.append(
+            f"[{bed}]{joined}amix=inputs={1 + len(effect_labels)}"
+            f":normalize=0:duration=first[aout]"
+        )
 
     return ";".join(chains), stage
 
@@ -1286,6 +1741,7 @@ def build_filter_graph(shots: list[Shot], audio_index: int, total: float,
 def render(shots: list[Shot], audio_path: Path, output_path: Path, *,
            total: float, narration: float, ass_path: Path | None,
            fonts_dir: Path | None, work_dir: Path, music: Track | None = None,
+           sfx: list[SfxCue] | None = None,
            overwrite: bool = True) -> list[str]:
     """Encode the reel. One ffmpeg pass: no intermediates, one generation loss."""
     if not shots:
@@ -1305,8 +1761,17 @@ def render(shots: list[Shot], audio_path: Path, output_path: Path, *,
         # of it in memory to loop from.
         inputs += ["-stream_loop", "-1", "-i", str(music.path)]
 
+    # One input per placement, not per file: the same whoosh landing on four
+    # cuts is four inputs, because each one needs its own delay. They are a few
+    # hundred milliseconds each, so the decode costs nothing worth avoiding.
+    sfx_cues = list(sfx or [])
+    sfx_index = (music_index if music_index is not None else audio_index) + 1
+    for cue in sfx_cues:
+        inputs += ["-i", str(cue.sfx.path)]
+
     graph, stage = build_filter_graph(
-        shots, audio_index, total, narration, ass_path, fonts_dir, music_index
+        shots, audio_index, total, narration, ass_path, fonts_dir, music_index,
+        sfx_cues=sfx_cues, sfx_index=sfx_index,
     )
 
     args = [ffmpeg_binary(), "-hide_banner", "-nostdin",
@@ -1358,6 +1823,352 @@ def render(shots: list[Shot], audio_path: Path, output_path: Path, *,
         line.strip() for line in (done.stderr or "").splitlines()
         if "Warning" in line or "Error" in line
     ][:5]
+
+
+# ---------------------------------------------------------------------------
+# The cover frame
+#
+# The still Instagram shows in the grid, on the profile and in search. The reel
+# earns the watch; the cover earns the tap that gets it played at all.
+#
+# It is deliberately NOT a frame lifted out of reel.mp4. The running captions
+# are burned into every frame of that file - measured on a real run, the first
+# cue is up at 0.079s and there is one on screen essentially continuously - so
+# a grab from the finished video puts three words out of the middle of a
+# sentence across the bottom of the tile. The cover is rebuilt from the source
+# asset instead, with the edit's own scale and crop, and the hook card redrawn
+# over it through the same libass path the video uses. That way the card on the
+# cover cannot drift from the card in the reel: it is built by the same code.
+# ---------------------------------------------------------------------------
+
+#: Line height as a multiple of font size, for working out how far down the
+#: frame the hook card reaches. Approximate on purpose - it is used for a
+#: clearance check with a lot of room in it, not for layout.
+_CARD_LINE_HEIGHT = 1.2
+
+#: Rows to assume the card wraps onto for that check. `_hook_card_font_size`
+#: fits to two before it starts shrinking, but that governs the shrink, not
+#: libass's wrapping - a real card measured here came out on three. The check
+#: is a clearance, so it takes the taller number.
+_CARD_ASSUMED_LINES = 3
+
+#: Trailing "-12345678" on a stock provider's URL slug: the asset id, not words.
+_SLUG_ID_RE = re.compile(r"[-_]\d+$")
+
+#: Words a stock library puts in its own titles that describe the file rather
+#: than the picture. "vertical video of a jellyfish" is alt text about a video.
+_SLUG_NOISE = ("free stock video", "stock footage", "stock video",
+               "vertical video of", "vertical video", "video of", "footage of",
+               "free video", "video", "footage", "clip", "vertical")
+
+
+def parse_aspect(text: str) -> tuple[int, int]:
+    """"4:5" -> (4, 5). Anything unreadable falls back to the frame's own."""
+    match = re.fullmatch(r"\s*(\d+)\s*[:xX/]\s*(\d+)\s*", str(text or ""))
+    if match and int(match[1]) > 0 and int(match[2]) > 0:
+        return int(match[1]), int(match[2])
+    return config.VIDEO_WIDTH, config.VIDEO_HEIGHT
+
+
+def safe_band(aspect: str) -> tuple[float, float]:
+    """Top and bottom of what survives a centre crop of the frame to `aspect`.
+
+    In CAPTION_REFERENCE_* pixels, which is what the hook card's margins are
+    expressed in - so the two can be compared without knowing the output size.
+    """
+    across, down = parse_aspect(aspect)
+    height = min(CAPTION_REFERENCE_HEIGHT,
+                 CAPTION_REFERENCE_WIDTH * down / max(1, across))
+    margin = (CAPTION_REFERENCE_HEIGHT - height) / 2
+    return margin, margin + height
+
+
+def card_clears_crop(card: str, font_file: Path | None,
+                     aspect: str) -> tuple[bool, str]:
+    """Does the hook card survive being centre-cropped to `aspect`?
+
+    The card is top-anchored at HOOK_CARD_MARGIN_V, so what a centre crop takes
+    is the top of it - the first line of the headline, which is the half that
+    matters. The bottom is estimated from _CARD_ASSUMED_LINES rather than
+    measured, because this is a clearance check and the wrong way to be wrong
+    is optimistic.
+    """
+    top, bottom = safe_band(aspect)
+    size = _hook_card_font_size(card, font_file)
+    card_top = float(config.HOOK_CARD_MARGIN_V)
+    card_bottom = card_top + _CARD_ASSUMED_LINES * size * _CARD_LINE_HEIGHT
+    if card_top < top:
+        return False, (f"the hook card sits {card_top:.0f}px down and a centre "
+                       f"crop to {aspect} starts at {top:.0f}px, so its first "
+                       f"line would be cut off")
+    if card_bottom > bottom:
+        return False, (f"the hook card reaches {card_bottom:.0f}px down and a "
+                       f"centre crop to {aspect} ends at {bottom:.0f}px")
+    return True, ""
+
+
+def _describe(text: str) -> str:
+    """Tidy a provider's own words for a clip into something readable.
+
+    Handles a URL slug ("medusa-blue-ocean-13693981"), Pexels' alt text and
+    Pixabay's comma-separated tags with the same treatment, because all three
+    arrive as the same kind of thing: words about the picture, loosely punctuated.
+    """
+    words = _SLUG_ID_RE.sub("", str(text or "").strip().strip("/"))
+    words = words.replace("-", " ").replace("_", " ")
+    words = re.sub(r"\s*,\s*", ", ", words)
+    words = " ".join(words.split())
+
+    lowered = words.lower()
+    for noise in _SLUG_NOISE:
+        if lowered.startswith(noise + " "):
+            words = words[len(noise) + 1:]
+        elif lowered.endswith(" " + noise):
+            words = words[: -len(noise) - 1]
+        lowered = words.lower()
+    return " ".join(words.split()).strip(" ,.")
+
+
+def _cover_depiction(asset: dict) -> tuple[str, str]:
+    """What the cover actually shows, and where that description came from.
+
+    Ordered by how close each source sits to the picture on screen. Step 4's
+    `image_prompt` is deliberately NOT in this list, and it is the one that
+    looks like it should be: it describes what the beat ASKED for, and stock
+    search does not always answer. On a real run "a snailfish swims in the deep
+    ocean" was filled by a clip of a jellyfish, and "a dark, high-pressure
+    environment" by a diver in bright, clear water. Alt text is read by people
+    who cannot check it against the image, so it is built from the words the
+    provider put on the file that was actually used.
+    """
+    for field, name in (("title", "provider_title"),
+                        ("source_url", "source_url"),
+                        ("query", "query")):
+        raw = asset.get(field) or ""
+        if name == "source_url":
+            raw = str(raw).rstrip("/").rsplit("/", 1)[-1]
+        described = _describe(raw)
+        if described:
+            return described, name
+    return "", "none"
+
+
+def cover_score(shot: Shot, probe: dict) -> float:
+    """Rank a shot as a candidate for the cover. Higher is better.
+
+    A different question from `score_candidate` in step 4, which asks whether a
+    clip can carry a beat. This asks whether one frame of it, with no motion and
+    no sound, is worth a stranger's tap.
+    """
+    score = 0.0
+
+    # The assembler gave this shot a long slot, which means the beat it belongs
+    # to had footage worth holding on.
+    score += 3.0 * min(shot.duration / max(0.1, config.SHOT_TARGET_SECONDS), 1.0)
+
+    width = int(probe.get("width") or 0)
+    height = int(probe.get("height") or 0)
+    if width and height:
+        # Native vertical needs no crop, so the cover is the whole picture the
+        # way it was shot rather than a slice out of the middle of it.
+        wanted = config.VIDEO_WIDTH / config.VIDEO_HEIGHT
+        if width / height <= wanted * 1.02:
+            score += 2.0
+        # Resolution headroom, capped the way step 4 caps it.
+        score += min(height / max(1, config.VISUAL_MIN_HEIGHT), 2.0)
+
+    if shot.looped:
+        score -= 2.5      # too short for its slot: a scrap, not a hero shot
+    if shot.reused:
+        score -= 2.0      # already on screen elsewhere; nothing distinctive
+
+    # Mild preference for the top of the reel, where the promise is.
+    score -= shot.start / max(1.0, config.COVER_SEARCH_SECONDS)
+    return round(score, 4)
+
+
+def plan_cover(shots: list[Shot], manifest: dict, probes: dict[int, dict], *,
+               card: str, card_seconds: float, font_file: Path | None,
+               source: str | None = None,
+               warnings: list[str] | None = None) -> dict | None:
+    """Choose the cover frame. Decides everything; writes nothing.
+
+    Split from `write_cover` the way `plan_timeline` is split from `render`, so
+    the choice can be tested without an encoder and honoured by --dry-run.
+
+    Returns the cover record for assembly.json, or None when covers are off or
+    there is nothing to take one from.
+    """
+    notes = warnings if warnings is not None else []
+    if not config.COVER_ENABLED or not shots:
+        return None
+
+    mode = str(source or config.COVER_SOURCE).strip().lower()
+    if mode not in ("auto", "hook_card", "footage"):
+        notes.append(f"unknown COVER_SOURCE {mode!r}; used 'auto'")
+        mode = "auto"
+
+    aspect = config.COVER_SAFE_ASPECT
+    has_card = bool(card) and card_seconds > 0
+    clears, clearance = (card_clears_crop(card, font_file, aspect)
+                         if has_card else (False, ""))
+
+    # --- which shot ---------------------------------------------------------
+    window = max(0.0, config.COVER_SEARCH_SECONDS)
+    early = [shot for shot in shots if shot.start < window] or [shots[0]]
+
+    if mode == "hook_card" and not has_card:
+        notes.append("COVER_SOURCE=hook_card but this reel has no hook card; "
+                     "took the cover from the footage instead")
+        mode = "auto"
+
+    want_card = has_card and (
+        mode == "hook_card" or (mode == "auto" and clears)
+    )
+    if mode == "auto" and has_card and not clears:
+        notes.append(f"cover taken from the footage rather than the hook card: "
+                     f"{clearance}")
+
+    if want_card:
+        # The card usually spans more than one shot. Take the frame from the
+        # best of the ones underneath it, so the picture behind the headline is
+        # chosen rather than whatever happened to be running at that instant.
+        under = [shot for shot in shots if shot.start < card_seconds]
+        # A shot that only catches the last fraction of the card is a bad place
+        # to take the frame from: there is barely any of it inside the window,
+        # and what there is sits under a card that is on its way out.
+        solid = [shot for shot in under
+                 if min(shot.end, card_seconds) - shot.start >= 2 * _COVER_EDGE_SECONDS]
+        pool = solid or under or [shots[0]]
+        reason = "the reel opens on a hook card"
+        if mode == "hook_card" and not clears:
+            reason += f", and {clearance} (COVER_SOURCE=hook_card kept it anyway)"
+        else:
+            reason += f", and it clears a centre crop to {aspect}"
+    else:
+        pool = [shot for shot in early if shot.start >= card_seconds] or early
+        reason = "the strongest footage shot near the top of the reel"
+
+    chosen = max(pool, key=lambda shot: (cover_score(shot, probes.get(shot.asset_index, {})),
+                                         -shot.index))
+    probe = probes.get(chosen.asset_index, {})
+
+    # --- which frame of it --------------------------------------------------
+    edge = min(_COVER_EDGE_SECONDS, chosen.duration / 3)
+    offset = min(max(chosen.duration * _COVER_SHOT_POSITION, edge),
+                 max(edge, chosen.duration - edge))
+    if want_card:
+        # Has to land while the card is actually up, or the cover is a frame of
+        # footage with a headline pasted on that the viewer never sees.
+        offset = min(offset, max(edge, card_seconds - chosen.start - edge))
+        offset = max(0.0, offset)
+    time = round(chosen.start + offset, 3)
+
+    # Stills have one frame; clips are seeked inside the same in-point the edit
+    # uses, so the cover is a frame the reel genuinely contains.
+    source_time = 0.0 if chosen.kind == "image" else round(
+        chosen.source_start + offset, 3
+    )
+
+    assets = manifest.get("assets") or []
+    asset = (assets[chosen.asset_index]
+             if 0 <= chosen.asset_index < len(assets) else {})
+    depicts, depicts_source = _cover_depiction(asset)
+    if not depicts:
+        depicts = _describe(manifest.get("topic") or "")
+        depicts_source = "topic" if depicts else "none"
+        notes.append("nothing describes the cover's footage - step 6 has only "
+                     "the topic to write alt text from")
+
+    return {
+        "path": None,
+        "filename": config.COVER_FILENAME,
+        "written": False,
+        "source": "hook_card" if want_card else "footage",
+        "mode": mode,
+        "reason": reason,
+        "time": time,
+        "source_time": source_time,
+        "shot_index": chosen.index,
+        "beat_index": chosen.beat_index,
+        "asset_index": chosen.asset_index,
+        "file": chosen.path.name,
+        "kind": chosen.kind,
+        "hook_card_text": card if want_card else "",
+        "depicts": depicts,
+        "depicts_source": depicts_source,
+        "safe_aspect": aspect,
+        "card_in_safe_band": clears if has_card else None,
+        "score": cover_score(chosen, probe),
+        "width": config.VIDEO_WIDTH,
+        "height": config.VIDEO_HEIGHT,
+        "bytes": 0,
+    }
+
+
+def write_cover(cover: dict, shots: list[Shot], destination: Path, *,
+                font_name: str, font_file: Path | None,
+                fonts_dir: Path | None) -> list[str]:
+    """Extract the planned cover frame. One ffmpeg call, one frame out.
+
+    Mutates `cover` with where it landed and how big it is. Never fatal: a reel
+    with no cover is still a reel, and the .mp4 is already on disk by here.
+    """
+    shot = next((s for s in shots if s.index == cover["shot_index"]), None)
+    if shot is None:
+        return ["the planned cover shot is not on the timeline"]
+
+    args = [ffmpeg_binary(), "-hide_banner", "-nostdin", "-y"]
+    if shot.kind != "image" and cover["source_time"] > 0:
+        args += ["-ss", f"{cover['source_time']:.3f}"]
+    args += ["-i", str(shot.path)]
+
+    width, height = config.VIDEO_WIDTH, config.VIDEO_HEIGHT
+    steps = [
+        f"scale={width}:{height}:force_original_aspect_ratio=increase"
+        f":flags=lanczos",
+        f"crop={width}:{height}",
+        "setsar=1",
+    ]
+
+    ass_path: Path | None = None
+    if cover["hook_card_text"]:
+        # A card-only subtitle file, built by the same function that builds the
+        # reel's - so the cover's headline wraps, shrinks and sits exactly where
+        # the video's does. No fade: this is one frame at t=0, which in the reel
+        # is the middle of the fade-in.
+        ass_path = destination / COVER_ASS_NAME
+        ass_path.write_text(
+            build_ass([], font_name, font_file,
+                      hook=cover["hook_card_text"], hook_seconds=1.0,
+                      hook_fade_ms=0),
+            encoding="utf-8",
+        )
+        burn = f"subtitles=filename={_filter_path(ass_path)}"
+        if fonts_dir is not None:
+            burn += f":fontsdir={_filter_path(fonts_dir)}"
+        steps.append(burn)
+
+    output = destination / config.COVER_FILENAME
+    args += ["-vf", ",".join(steps), "-frames:v", "1", "-update", "1",
+             "-q:v", str(config.COVER_JPEG_QUALITY), str(output)]
+
+    try:
+        done = subprocess.run(
+            args, capture_output=True, text=True, errors="replace",
+            timeout=FFMPEG_TIMEOUT, cwd=str(config.BASE_DIR),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"could not write the cover frame: {exc}"]
+
+    if done.returncode != 0 or not output.is_file():
+        return ["ffmpeg could not write the cover frame: "
+                + (done.stderr or "")[-400:].strip()]
+
+    cover["path"] = str(output.resolve())
+    cover["written"] = True
+    cover["bytes"] = output.stat().st_size
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -1581,6 +2392,214 @@ def prepare_track(track: Track | None, warnings: list[str]) -> Track | None:
 
 
 # ---------------------------------------------------------------------------
+# Sound design
+#
+# One-shots come from assets/sfx/ and nowhere else - nothing is downloaded and
+# nothing is generated, exactly like the music bed. The role is read off the
+# front of the filename, so whoosh.wav, whoosh-02.wav and whoosh_soft.mp3 are
+# all whooshes and the placement rotates between them.
+#
+# A whoosh across a cut is the cheapest production value in the whole pipeline:
+# it costs one small file and it turns a change of picture into a deliberate
+# edit. It is also the easiest thing here to overdo, which is what
+# SFX_MIN_GAP_SECONDS exists to prevent.
+# ---------------------------------------------------------------------------
+
+#: Roles this module knows how to place. Anything else in assets/sfx/ is
+#: reported rather than ignored - a file named wooosh.wav is a typo, and
+#: silently doing nothing with it is how that typo survives for months.
+SFX_ROLES = ("whoosh", "impact")
+
+#: Peak measured below this is a file with no signal in it - a silent export,
+#: or a lead-in so long that nothing lands where it was placed.
+SFX_SILENCE_FLOOR_DB = -60.0
+
+#: Bounds on the correction a file may be given. A near-silent one-shot must
+#: not be lifted 70 dB into its own noise floor to reach the target.
+SFX_MAX_GAIN_DB = 20.0
+SFX_MIN_GAIN_DB = -40.0
+
+_MAX_VOLUME_RE = re.compile(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB")
+
+
+@dataclass
+class Sfx:
+    """One effect file, and what it has to be scaled by to sit in the mix."""
+
+    role: str
+    path: Path
+    peak_db: float
+    gain_db: float
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+@dataclass
+class SfxCue:
+    """One effect, placed at one moment on the timeline."""
+
+    sfx: Sfx
+    at: float
+    reason: str
+
+    def to_dict(self) -> dict:
+        return {
+            "role": self.sfx.role,
+            "file": self.sfx.name,
+            "at": round(self.at, 3),
+            "gain_db": round(self.sfx.gain_db, 2),
+            "reason": self.reason,
+        }
+
+
+def _sfx_role(path: Path) -> str:
+    """The role a filename declares: the letters before the first separator."""
+    match = re.match(r"[a-z]+", path.stem.strip().lower())
+    return match.group(0) if match else ""
+
+
+def probe_peak_db(path: Path) -> float | None:
+    """Peak level of an audio file in dBFS, or None if it cannot be measured.
+
+    volumedetect rather than ebur128 on purpose. These are 200ms transients and
+    EBU R128 integrates over 400ms blocks, so it would hand back nothing usable
+    for exactly the files this is for. Peak is also what a sound editor levels
+    a one-shot by, which makes it the right measure and not merely the
+    available one.
+    """
+    args = [ffmpeg_binary(), "-hide_banner", "-nostdin", "-i", str(path),
+            "-af", "volumedetect", "-f", "null", "-"]
+    try:
+        done = subprocess.run(args, capture_output=True, text=True,
+                              errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    match = _MAX_VOLUME_RE.search(done.stderr or "")
+    return float(match.group(1)) if match else None
+
+
+def available_sfx() -> dict[str, list[Path]]:
+    """Every one-shot in assets/sfx/, grouped by the role its name declares."""
+    library: dict[str, list[Path]] = {}
+    if not config.SFX_DIR.is_dir():
+        return library
+
+    suffixes = {s.lower() if s.startswith(".") else f".{s.lower()}"
+                for s in config.SFX_EXTENSIONS}
+    for path in sorted(config.SFX_DIR.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in suffixes:
+            continue
+        library.setdefault(_sfx_role(path), []).append(path)
+    return library
+
+
+def resolve_sfx(sfx, warnings: list[str]) -> dict[str, list[Sfx]]:
+    """Measure the one-shots this reel can use, keyed by role.
+
+    `sfx` is False to go without and None to use whatever is in assets/sfx/.
+    Everything degrades: an unreadable or silent file is dropped with a
+    warning, an unknown role is reported, and an empty directory is not a
+    problem at all - it is how a fresh clone arrives, and it means the reel
+    sounds exactly as it did before any of this existed.
+    """
+    if sfx is False or not config.SFX_ENABLED:
+        return {}
+
+    found = available_sfx()
+    if not found:
+        return {}
+
+    unknown = sorted(set(found) - set(SFX_ROLES))
+    if unknown:
+        warnings.append(
+            "assets/sfx/ holds file(s) with no role this step places: "
+            + ", ".join(f"{role or '(unnamed)'}*" for role in unknown)
+            + f". Rename them to one of {', '.join(SFX_ROLES)} to use them."
+        )
+
+    library: dict[str, list[Sfx]] = {}
+    for role in SFX_ROLES:
+        for path in found.get(role, []):
+            peak = probe_peak_db(path)
+            if peak is None:
+                warnings.append(
+                    f"sound effect {path.name!r} could not be measured and was "
+                    f"left out"
+                )
+                continue
+            if peak <= SFX_SILENCE_FLOOR_DB:
+                warnings.append(
+                    f"sound effect {path.name!r} peaks at {peak:.1f} dBFS - "
+                    f"there is no signal in it, so it was left out"
+                )
+                continue
+            gain = max(SFX_MIN_GAIN_DB,
+                       min(SFX_MAX_GAIN_DB, config.SFX_PEAK_TARGET - peak))
+            library.setdefault(role, []).append(
+                Sfx(role=role, path=path, peak_db=peak, gain_db=round(gain, 2))
+            )
+    return library
+
+
+def plan_sfx(shots: list[Shot], total: float,
+             library: dict[str, list[Sfx]]) -> list[SfxCue]:
+    """Decide where the one-shots land.
+
+    An impact on the first frame - the one effect with no cut to ride, which is
+    the point of it - and a whoosh across each cut after that, thinned so two
+    never crowd each other. The whoosh is placed SFX_LEAD_SECONDS *before* its
+    cut so the transient lands on the change of picture rather than after it: a
+    whoosh that arrives once the picture has already changed is heard as a
+    separate noise instead of as the cut itself.
+    """
+    cues: list[SfxCue] = []
+    placed_at: float | None = None
+
+    impacts = library.get("impact") or []
+    if config.SFX_IMPACT_AT_OPEN and impacts:
+        cues.append(SfxCue(sfx=impacts[0], at=0.0, reason="the open"))
+        placed_at = 0.0
+
+    whooshes = library.get("whoosh") or []
+    if config.SFX_ON_CUTS and whooshes:
+        for shot in shots[1:]:          # every shot after the first opens on a cut
+            if placed_at is not None and (
+                shot.start - placed_at < config.SFX_MIN_GAP_SECONDS
+            ):
+                continue
+            at = max(0.0, shot.start - config.SFX_LEAD_SECONDS)
+            if at >= total:
+                break
+            chosen = whooshes[len(cues) % len(whooshes)]
+            cues.append(SfxCue(sfx=chosen, at=at, reason=f"cut into shot {shot.index}"))
+            placed_at = shot.start
+
+    cues.sort(key=lambda cue: cue.at)
+    return cues
+
+
+def _sfx_chains(cues: list[SfxCue], first_index: int) -> tuple[list[str], list[str]]:
+    """One filter chain per placed effect, and the labels they come out on."""
+    chains: list[str] = []
+    labels: list[str] = []
+    for position, cue in enumerate(cues):
+        label = f"sfx{position}"
+        steps = [f"aresample={config.AUDIO_SAMPLE_RATE}"]
+        if abs(cue.sfx.gain_db) >= 0.05:
+            steps.append(f"volume={cue.sfx.gain_db:.2f}dB")
+        delay = int(round(cue.at * 1000))
+        if delay > 0:
+            # all=1 or only the first channel is delayed and the effect arrives
+            # twice, once in each ear.
+            steps.append(f"adelay={delay}:all=1")
+        chains.append(f"[{first_index + position}:a]" + ",".join(steps) + f"[{label}]")
+        labels.append(label)
+    return chains, labels
+
+# ---------------------------------------------------------------------------
 # Attribution carried over from step 4
 # ---------------------------------------------------------------------------
 
@@ -1676,14 +2695,31 @@ def write_attribution_file(path: Path, manifest: dict, credits: list[dict]) -> N
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _derive_hook_card(script: str) -> str:
+    """Step 2's hook card, worked out here when the manifest has none.
+
+    A run built before the hook pass existed, or one whose script came from
+    somewhere other than step 2, still gets a card - cut from the opening
+    sentence by the same two functions step 2 would have used, so the wording
+    does not depend on which path it arrived by.
+    """
+    try:
+        from pipeline import script_gen
+    except Exception:      # noqa: BLE001 - a card is never worth a failed reel
+        return ""
+    opening, _ = script_gen.split_first_sentence(script or "")
+    return script_gen.hook_card_text(opening)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                    run_id: str | None = None, captions: bool | None = None,
-                   alignment: str | None = None, music=None,
-                   dry_run: bool = False, overwrite: bool = True) -> dict:
+                   alignment: str | None = None, music=None, sfx=None,
+                   hook=None, cover=None, dry_run: bool = False,
+                   overwrite: bool = True) -> dict:
     """Cut step 3's narration and step 4's footage into a finished reel.
 
     Args:
@@ -1695,13 +2731,21 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         alignment: caption timing backend. Defaults to config.CAPTION_ALIGNMENT.
         music: a track to pin under the reel, or False for none. Defaults to
             rotating over whatever is in assets/music/.
+        sfx: False to render without sound effects. Defaults to using whatever
+            is in assets/sfx/.
+        hook: text for the hook card burned over the opening. False for no
+            card; None takes step 2's `hook_card` from the manifest, falling
+            back to the script's own opening sentence.
+        cover: where the cover frame comes from - "auto", "hook_card" or
+            "footage". False writes none; None takes config.COVER_SOURCE.
         dry_run: plan the edit and write the captions, but do not encode.
         overwrite: replace an existing .mp4 at the destination.
 
     Returns:
         The assembly manifest, also written to assembly.json in the output
         directory: the video's path and length, the shot-by-shot timeline, the
-        caption files, and step 4's attribution for every asset used.
+        caption files, the cover frame and why it was chosen, and step 4's
+        attribution for every asset used.
 
     Raises:
         AssemblyError (or a subclass) for anything that stops a reel being made.
@@ -1732,13 +2776,47 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         index: probe_media(_asset_path(asset, asset_dir))
         for index, asset in enumerate(manifest["assets"])
     }
-    shots, plan_warnings = plan_timeline(manifest, narration, probes)
+    # --- word timings, ahead of the edit -----------------------------------
+    # This used to sit after the timeline was planned, because the only thing
+    # that wanted it was the captions. Snapping cuts onto word boundaries needs
+    # it *before*: it is what decides where the cuts go, and that cannot be
+    # worked out after they have been placed.
+    #
+    # Which means a run with captions off but SHOT_SNAP_TO_WORDS on still pays
+    # for one alignment. That is the deal being struck - cutting on the words
+    # requires knowing where the words are - and SHOT_SNAP_TO_WORDS=false opts
+    # out of both the cost and the feature.
+    words: list[dict] = []
+    backend: str | None = None
+    loss: float | None = None
+    if use_captions or config.SHOT_SNAP_TO_WORDS:
+        words, backend, loss, align_warnings = align_words(
+            audio_path, manifest, narration, backend_mode
+        )
+        warnings += align_warnings
+
+    shots, plan_warnings = plan_timeline(manifest, narration, probes, words)
     warnings += plan_warnings
     total = round(shots[-1].end, 3)
 
     # --- the music bed -----------------------------------------------------
     track, ledger = resolve_track(music, warnings)
     track = prepare_track(track, warnings)
+
+    # --- sound design ------------------------------------------------------
+    sfx_library = resolve_sfx(sfx, warnings)
+    sfx_cues = plan_sfx(shots, total, sfx_library) if sfx_library else []
+
+    # --- the hook card -----------------------------------------------------
+    if hook is False or not config.HOOK_CARD_ENABLED:
+        card, card_source = "", "off"
+    elif hook:
+        card, card_source = " ".join(str(hook).split()), "given"
+    elif manifest.get("hook_card"):
+        card, card_source = str(manifest["hook_card"]).strip(), "step 2"
+    else:
+        card, card_source = _derive_hook_card(manifest.get("script") or ""), "script"
+    card_seconds = min(config.HOOK_CARD_SECONDS, total) if card else 0.0
 
     # --- captions ----------------------------------------------------------
     caption_report = {
@@ -1748,13 +2826,16 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
     }
     ass_path: Path | None = None
     fonts_dir: Path | None = None
+    # Resolved below only when there is text to draw. The cover reads them too,
+    # and only ever when it is drawing the card - which is the case that fills
+    # them in.
+    font_name: str = config.CAPTION_FONT_NAME
+    font_file: Path | None = None
 
-    if use_captions:
-        words, backend, loss, align_warnings = align_words(
-            audio_path, manifest, narration, backend_mode
-        )
-        warnings += align_warnings
-        cues = group_cues(words, total)
+    # A card with the captions switched off still needs a subtitle file - it is
+    # drawn by the same libass pass - so the two are decided together.
+    if use_captions or card:
+        cues = group_cues(words, total) if use_captions else []
         font_name, font_file, fonts_dir = resolve_font()
         if font_file is None:
             warnings.append(
@@ -1764,7 +2845,15 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             )
 
         ass_path = destination / CAPTIONS_ASS_NAME
-        ass_path.write_text(build_ass(cues, font_name, font_file), encoding="utf-8")
+        ass_path.write_text(
+            build_ass(cues, font_name, font_file,
+                      hook=card, hook_seconds=card_seconds),
+            encoding="utf-8",
+        )
+        caption_report["ass_path"] = str(ass_path.resolve())
+        caption_report["font"] = font_name
+
+    if use_captions:
         srt_path = destination / CAPTIONS_SRT_NAME
         srt_path.write_text(build_srt(cues), encoding="utf-8")
         alignment_path = destination / ALIGNMENT_NAME
@@ -1774,11 +2863,19 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         )
         caption_report.update({
             "backend": backend, "cues": len(cues), "words": len(words),
-            "loss": round(loss, 4) if loss else loss, "font": font_name,
-            "ass_path": str(ass_path.resolve()),
+            "loss": round(loss, 4) if loss else loss,
             "srt_path": str(srt_path.resolve()),
             "alignment_path": str(alignment_path.resolve()),
         })
+
+    # --- the cover frame ---------------------------------------------------
+    # Planned here and written after the encode. A dry run gets the whole
+    # decision - which shot, which frame, why - and no file, the same way it
+    # gets a timeline and no .mp4.
+    cover = None if cover is False else plan_cover(
+        shots, manifest, probes, card=card, card_seconds=card_seconds,
+        font_file=font_file, source=cover, warnings=warnings,
+    )
 
     # --- render ------------------------------------------------------------
     if dry_run:
@@ -1788,7 +2885,8 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             shots, audio_path, video_path,
             total=total, narration=narration,
             ass_path=ass_path, fonts_dir=fonts_dir,
-            work_dir=destination, music=track, overwrite=overwrite,
+            work_dir=destination, music=track, sfx=sfx_cues,
+            overwrite=overwrite,
         )
         if track is not None and ledger is not None:
             # Recorded after the encode, not before: a run that never produced
@@ -1804,6 +2902,10 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                 f"the rendered video is {rendered['duration']:.2f}s against a "
                 f"planned {total:.2f}s"
             )
+        if cover is not None:
+            warnings += write_cover(cover, shots, destination,
+                                    font_name=font_name, font_file=font_file,
+                                    fonts_dir=fonts_dir)
 
     # --- carry step 4's attribution forward --------------------------------
     credits = collect_attribution(manifest, shots)
@@ -1835,6 +2937,13 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         "visuals_manifest": manifest.get("manifest_path"),
         "asset_dir": manifest.get("asset_dir"),
         "captions": caption_report,
+        "hook_card": {
+            "text": card,
+            "seconds": round(card_seconds, 3),
+            "source": card_source,
+        },
+        "cover": cover,
+        "sfx": [cue.to_dict() for cue in sfx_cues],
         "timeline": [
             {
                 "index": shot.index,
@@ -1847,6 +2956,8 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                 "source_start": shot.source_start,
                 "looped": shot.looped,
                 "reused": shot.reused,
+                "motion": shot.motion,
+                "motion_zoom": shot.motion_zoom,
             }
             for shot in shots
         ],
@@ -1860,7 +2971,10 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             "assets_sourced": len(manifest["assets"]),
             "looped_shots": sum(1 for shot in shots if shot.looped),
             "reused_shots": sum(1 for shot in shots if shot.reused),
+            "moving_shots": sum(1 for shot in shots if shot.motion),
             "mean_shot_seconds": round(total / len(shots), 2) if shots else 0.0,
+            "first_shot_seconds": shots[0].duration if shots else 0.0,
+            "sfx_cues": len(sfx_cues),
             "file_bytes": video_path.stat().st_size if video_path.is_file() else 0,
         },
     }
@@ -1890,7 +3004,12 @@ def _print_result(assembly: dict) -> None:
           f"+ {assembly['tail_seconds']}s tail)")
     print(f"SHOTS   : {stats['shots']} across {stats['beats']} beats, "
           f"~{stats['mean_shot_seconds']}s each "
-          f"({stats['assets_used']}/{stats['assets_sourced']} assets used)")
+          f"(first {stats.get('first_shot_seconds', 0):.2f}s, "
+          f"{stats['assets_used']}/{stats['assets_sourced']} assets used)")
+    card = assembly.get("hook_card") or {}
+    if card.get("text"):
+        print(f"HOOK    : \"{card['text']}\" for {card['seconds']:g}s "
+              f"(from {card['source']})")
     if captions["enabled"]:
         print(f"CAPTIONS: {captions['cues']} cues from {captions['words']} words "
               f"via {captions['backend']}"
@@ -1909,6 +3028,26 @@ def _print_result(assembly: dict) -> None:
         # does not need to be advised to add music.
         hint = "" if available_tracks() else "  (drop a track into assets/music/)"
         print(f"MUSIC   : none{hint}")
+    effects = assembly.get("sfx") or []
+    if effects:
+        by_role: dict[str, int] = {}
+        for cue in effects:
+            by_role[cue["role"]] = by_role.get(cue["role"], 0) + 1
+        print("SFX     : " + ", ".join(f"{n}x {role}"
+                                       for role, n in sorted(by_role.items()))
+              + f" @ {config.SFX_PEAK_TARGET:g} dBFS peak")
+    elif config.SFX_ENABLED and not available_sfx():
+        print("SFX     : none  (drop whoosh.wav / impact.wav into assets/sfx/)")
+
+    cover = assembly.get("cover")
+    if cover:
+        print(f"COVER   : {cover['source']} at {cover['time']:g}s "
+              f"(shot {cover['shot_index']}, {cover['file'][:34]})"
+              + ("" if cover["written"] else "  (dry run - not written)"))
+        print(f"          {cover['reason']}")
+    elif config.COVER_ENABLED:
+        print("COVER   : none")
+
     if stats["file_bytes"]:
         print(f"SIZE    : {stats['file_bytes'] / 1024 / 1024:.1f} MB")
     print(f"CREDITS : {assembly['attribution_path']}")
@@ -1955,6 +3094,19 @@ def main(argv: list[str] | None = None) -> int:
                              "whatever is in assets/music/")
     parser.add_argument("--no-music", action="store_true",
                         help="render without a music bed")
+    parser.add_argument("--no-sfx", action="store_true",
+                        help="render without the one-shots in assets/sfx/")
+    parser.add_argument("--hook", default=None,
+                        help="text for the hook card burned over the opening "
+                             "(default: step 2's, or the script's first line)")
+    parser.add_argument("--no-hook-card", action="store_true",
+                        help="render without the hook card")
+    parser.add_argument("--cover", default=None,
+                        choices=("auto", "hook_card", "footage"),
+                        help=f"where the cover frame comes from "
+                             f"(default: {config.COVER_SOURCE})")
+    parser.add_argument("--no-cover", action="store_true",
+                        help="do not write a cover frame")
     parser.add_argument("--dry-run", action="store_true",
                         help="plan the edit and write the captions, do not encode")
     parser.add_argument("--json", action="store_true",
@@ -1969,6 +3121,9 @@ def main(argv: list[str] | None = None) -> int:
             captions=False if args.no_captions else None,
             alignment=args.alignment,
             music=False if args.no_music else args.music,
+            sfx=False if args.no_sfx else None,
+            hook=False if args.no_hook_card else args.hook,
+            cover=False if args.no_cover else args.cover,
             dry_run=args.dry_run,
         )
     except (AssemblyError, config.MissingConfigError) as exc:

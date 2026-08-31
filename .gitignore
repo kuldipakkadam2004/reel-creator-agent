@@ -15,6 +15,11 @@ assets/music/*
 !assets/music/.gitkeep
 !assets/music/*.txt
 
+# Sound effects: same deal as the music. Drop your own one-shots in; the audio
+# is not something to commit.
+assets/sfx/*
+!assets/sfx/.gitkeep
+
 # Python
 __pycache__/
 *.py[cod]
