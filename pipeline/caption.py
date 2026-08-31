@@ -55,7 +55,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
-from pipeline import script_gen  # noqa: E402
+from pipeline import script_gen, tagvolume  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tunables. The voice, the tag count and the attribution policy are config.py's
@@ -64,7 +64,9 @@ from pipeline import script_gen  # noqa: E402
 # ---------------------------------------------------------------------------
 
 #: Bumped when the shape of post.json changes, so step 7 can tell.
-POST_VERSION = 1
+#: 2 added "hashtag_volumes" - the post count behind every tag.
+#: 3 added "alt_text" and "alt" - the description of step 5's cover frame.
+POST_VERSION = 3
 
 #: Written into the run directory. The `captions.*` files beside them are step
 #: 5's burned-in subtitles - deliberately a different word.
@@ -75,6 +77,11 @@ POST_JSON_NAME = "post.json"
 #: that file is always exactly the caption and nothing else - step 7 posting
 #: it verbatim can never put the tag block in the caption by accident.
 POST_COMMENT_NAME = "post_comment.txt"
+
+#: The cover's alt text, on its own for the same reason as the comment file:
+#: it goes in a different Instagram field from the caption, and posting by hand
+#: means copying from somewhere. Only written when there is a cover to describe.
+POST_ALT_NAME = "post_alt.txt"
 
 #: Written by step 5. Where the script, topic and per-asset credits come from
 #: when this is pointed at a run directory.
@@ -98,6 +105,18 @@ HASHTAG_MIX = (("broad", 0.25), ("mid", 0.45), ("niche", 0.30))
 #: Ask each tier for a few more than its quota, so dedupe and the banned list
 #: have something to eat without leaving the mix short.
 HASHTAG_OVERASK = 3
+
+#: When this share of a pool priced purely by estimate comes back dead, the
+#: estimator is out of its depth on the subject rather than the generator
+#: having returned a pool of junk. Nothing is dropped in that case - see
+#: _weigh_the_verdict.
+ESTIMATE_DOUBT_SHARE = 0.5
+
+#: With volume banding on, the band filter eats the pool as well - and it is
+#: the hungriest of the three, because a whole tier of the model's "niche"
+#: guesses can turn out to be dead tags. Ask for more up front; an unused
+#: suggestion costs nothing, a short tag block costs reach.
+HASHTAG_OVERASK_BANDED = 6
 
 #: Longest tag worth having. Instagram accepts more; nobody searches it.
 HASHTAG_MAX_CHARS = 30
@@ -380,6 +399,10 @@ class Source:
     run_id: str = ""
     run_dir: Path | None = None
     credits: list[dict] = dataclass_field(default_factory=list)
+    #: Step 5's cover record, when this came from an assembly.json that has one.
+    #: The alt text is written from this and nothing else - it is a description
+    #: of that image, so with no cover there is nothing to describe.
+    cover: dict = dataclass_field(default_factory=dict)
     script_path: Path | None = None
     assembly_path: Path | None = None
     warnings: list[str] = dataclass_field(default_factory=list)
@@ -416,9 +439,11 @@ def _from_mapping(data: dict) -> Source:
     """Read step 2's script dict, step 4's manifest or step 5's assembly.
 
     All three carry `topic` and `script` under the same names; only the last
-    two carry `attributions`, and only step 5's names an output directory.
+    two carry `attributions`, and only step 5's names an output directory or a
+    `cover` (and only from assembly_version 2 on).
     """
     output_dir = data.get("output_dir")
+    cover = data.get("cover")
     return Source(
         script=str(data.get("script") or "").strip(),
         topic=str(data.get("topic") or "").strip(),
@@ -427,6 +452,7 @@ def _from_mapping(data: dict) -> Source:
         run_dir=Path(output_dir) if output_dir else None,
         credits=[c for c in (data.get("attributions") or [])
                  if isinstance(c, dict)],
+        cover=cover if isinstance(cover, dict) else {},
     )
 
 
@@ -579,6 +605,10 @@ class Draft:
     body: list[str] = dataclass_field(default_factory=list)
     cta: str = ""
     hashtags: dict[str, list[str]] = dataclass_field(default_factory=dict)
+    #: Only asked for, and only ever filled in, when POST_ALT_MODE=llm. It is a
+    #: rephrasing of words step 5 recorded, not a description of an image the
+    #: model has seen - which it has not.
+    alt: str = ""
     source: str = "llm"
 
 
@@ -628,12 +658,25 @@ THIS script is about rather than by the subject in general:
   "niche": {niche_n} long-tail tags someone deep in this topic would follow
 Each tag: no "#", no spaces, no punctuation, no emoji, {tag_max} characters at \
 most. Do not repeat a word across tiers.
-
+{alt_field}
 Tone: {tone}
 {rules}
 Return ONLY this JSON object:
-{{"hook": "...", "body": ["...", "..."], "cta": "...",
+{{"hook": "...", "body": ["...", "..."], "cta": "...",{alt_json}
   "hashtags": {{"broad": ["..."], "mid": ["..."], "niche": ["..."]}}}}"""
+
+
+#: Asked for only when POST_ALT_MODE=llm. The instruction is deliberately
+#: narrow: the model has not seen the cover, and the one failure that matters
+#: here is a confident description of something that is not in the picture.
+ALT_FIELD_TEMPLATE = """
+"alt" - alt text for the reel's cover image, at most {alt_max} characters. \
+All that is known about that image is this: {depicts}. Rewrite ONLY those \
+words into one plain, literal sentence describing the picture. Do not name a \
+species, place, colour or action that is not in them, do not guess at what is \
+happening, do not mention the video, and do not write a second caption. If \
+they are already a sentence, leave them as they are.
+"""
 
 
 def tag_quota(count: int) -> dict[str, int]:
@@ -649,13 +692,21 @@ def tag_quota(count: int) -> dict[str, int]:
 
 
 def build_prompt(script: str, *, topic: str, niche: str, hook_max: int,
-                 count: int, tone: str, cta: str, rules: list[str]) -> str:
+                 count: int, tone: str, cta: str, rules: list[str],
+                 alt_depicts: str = "") -> str:
     """Render the prompt. Every constraint in it also exists in code below."""
     quota = tag_quota(count)
-    asked = {tier: quota[tier] + HASHTAG_OVERASK if quota[tier] else 0
+    overask = (HASHTAG_OVERASK_BANDED if config.TAG_VOLUME_ENABLED
+               else HASHTAG_OVERASK)
+    asked = {tier: quota[tier] + overask if quota[tier] else 0
              for tier in quota}
     rule_block = "".join(f"- {rule}\n" for rule in rules if rule)
+    alt_field = (ALT_FIELD_TEMPLATE.format(alt_max=config.POST_ALT_MAX_CHARS,
+                                           depicts=alt_depicts)
+                 if alt_depicts else "")
     return PROMPT_TEMPLATE.format(
+        alt_field=alt_field,
+        alt_json=' "alt": "...",' if alt_depicts else "",
         topic=topic or "(not given - take it from the script)",
         niche=niche or "(not given - take it from the script)",
         script=script,
@@ -729,6 +780,7 @@ def _parse_draft_json(raw: str) -> Draft:
         body=body[:BODY_MAX_PARAGRAPHS],
         cta=strip_markup(data.get("cta") or ""),
         hashtags=tiers,
+        alt=strip_markup(data.get("alt") or ""),
     )
     if not draft.hook and not draft.body:
         raise ValueError("model returned neither a hook nor a body")
@@ -736,7 +788,8 @@ def _parse_draft_json(raw: str) -> Draft:
 
 
 def llm_draft(script: str, *, topic: str, niche: str, count: int,
-              rules: list[str]) -> tuple[Draft | None, list[str]]:
+              rules: list[str],
+              alt_depicts: str = "") -> tuple[Draft | None, list[str]]:
     """One Gemini call for the whole caption. Never raises; returns warnings.
 
     Goes through step 2's client (`script_gen.call_gemini`) rather than
@@ -747,6 +800,7 @@ def llm_draft(script: str, *, topic: str, niche: str, count: int,
         script, topic=topic, niche=niche,
         hook_max=config.POST_HOOK_MAX_CHARS, count=count,
         tone=config.POST_TONE, cta=config.POST_CTA, rules=rules,
+        alt_depicts=alt_depicts,
     )
     try:
         raw = script_gen.call_gemini(
@@ -865,13 +919,127 @@ def scrub_banned(draft: Draft, words) -> tuple[Draft, list[str]]:
 # Hashtags
 # ---------------------------------------------------------------------------
 
+def _reading(volumes: dict, tag: str):
+    """The reading for `tag`, however it was keyed."""
+    return volumes.get(tag) or volumes.get(tag.lower())
+
+
+def _weigh_the_verdict(pool: dict, dead: list[str], volumes: dict, *,
+                       offered: list[str]) -> tuple[dict, list[str], list[str]]:
+    """Decide whether the dead really are dead, or the estimator is lost.
+
+    The estimator prices a tag by the words in it, so a subject it has no
+    vocabulary for looks exactly like a subject full of coinages. #MariusHills
+    and #RomanEmpire are the same shape to it - a name it does not hold and an
+    ordinary word - and only one of them is a bad tag.
+
+    A measured count is evidence and is acted on. A guess that condemns most of
+    the pool is not evidence about the tags; it is evidence about the guesser.
+    In that case nothing is dropped - the suspect tags go to the back of the
+    queue instead, and the run says plainly that the reading is unreliable.
+    """
+    if not dead:
+        return pool, dead, []
+
+    readings = [_reading(volumes, tag) for tag in offered]
+    guessed = [r for r in readings if r is not None and r.source == "estimate"]
+    all_guesswork = readings and len(guessed) == len(readings)
+    most_of_it = len(dead) >= max(2, ESTIMATE_DOUBT_SHARE * len(offered))
+
+    if all_guesswork and most_of_it:
+        # Biggest first: even a guess ranks them against each other.
+        recovered = sorted(
+            dead, key=lambda t: -((_reading(volumes, t) or
+                                   tagvolume.Volume(t, 0, "", "")).count)
+        )
+        pool = dict(pool)
+        pool["niche"] = list(pool.get("niche") or []) + recovered
+        return pool, [], [
+            f"{len(dead)} of {len(offered)} tags priced as too small to find, "
+            f"which is more likely the estimator having no vocabulary for this "
+            f"subject than {len(dead)} bad tags - kept, but ranked last. Seed "
+            f"real counts in {config.TAG_VOLUME_FILE.name} to settle it."
+        ]
+
+    measured = [t for t in dead if (_reading(volumes, t) or
+                                    tagvolume.Volume(t, 0, "estimate", "")
+                                    ).source != "estimate"]
+    return pool, dead, [
+        f"dropped {len(dead)} tag(s) with too few posts to be found: "
+        + ", ".join("#" + t for t in dead)
+        + ("" if len(measured) == len(dead) else
+           f" (estimated - seed real counts in "
+           f"{config.TAG_VOLUME_FILE.name} to overrule)")
+    ]
+
+
+def _relax_floor(dead: list[str], volumes: dict, *, count: int,
+                 chosen: list[str], add) -> list[str]:
+    """Take back the largest of the dead tags rather than post a short block.
+
+    Only down to TAG_VOLUME_FLOOR * TAG_VOLUME_RELAX, only in descending order
+    of size, and never quietly: these are tags the filter already judged too
+    small to be found, and the operator should see that the mix needed them.
+    """
+    floor = config.TAG_VOLUME_FLOOR * config.TAG_VOLUME_RELAX
+    ranked = sorted(
+        ((tag, (volumes.get(tag) or volumes.get(tag.lower())).count)
+         for tag in dead
+         if volumes.get(tag) or volumes.get(tag.lower())),
+        key=lambda pair: -pair[1],
+    )
+    admitted: list[str] = []
+    for tag, size in ranked:
+        if len(chosen) >= count or size < floor:
+            break
+        if add(tag, "below-floor"):
+            admitted.append(tag)
+    if not admitted:
+        return []
+    return [
+        f"put back {len(admitted)} tag(s) below the volume floor to reach "
+        f"{count}: " + ", ".join("#" + t for t in admitted)
+        + " - small, but the alternative was a shorter block"
+    ]
+
+
+def band_pool(pool: dict, volumes: dict) -> tuple[dict, list[str]]:
+    """Re-bucket a tiered pool by the band each tag's post count puts it in.
+
+    The generator's tiers are a guess about words; this replaces them with the
+    only thing that decides whether a tag can be found. A tag the model filed
+    under "niche" that turns out to carry two million posts is a broad tag, and
+    one it filed under "mid" carrying four hundred is not a tag at all.
+
+    Returns a pool keyed by band, and the tags dropped as dead.
+    """
+    banded: dict[str, list[str]] = {band: [] for band in tagvolume.BANDS}
+    for tier, _ in HASHTAG_MIX:
+        for tag in pool.get(tier) or []:
+            volume = volumes.get(tag) or volumes.get(tag.lower())
+            # No reading at all is not evidence of a bad tag - keep it in the
+            # band the generator meant, rather than inventing a verdict.
+            band = volume.band if volume else tier
+            if tag not in banded[band]:
+                banded[band].append(tag)
+    return banded, list(banded["dead"])
+
+
 def select_hashtags(tiers: dict, *, count: int, always=(), banned_tags=(),
-                    banned_words=(), recent=()) -> tuple[list[str], dict, list[str]]:
-    """Pick the final tag set: mixed across tiers, deduped, freshest first.
+                    banned_words=(), recent=(),
+                    volumes: dict | None = None
+                    ) -> tuple[list[str], dict, list[str]]:
+    """Pick the final tag set: mixed across bands, deduped, freshest first.
 
     Returns the tags in posting order, a {tag: tier} map for post.json, and any
     warnings. Tags from POST_HASHTAGS_ALWAYS come first and are never dropped
     for a generated one.
+
+    With TAG_VOLUME_ENABLED the tiers the generator returned are only a
+    starting pool: every tag is priced (see pipeline/tagvolume.py), dead ones
+    are dropped, and the rest are filled into the mix by the band they measure
+    at rather than the tier they were labelled with. `volumes` lets the caller
+    pass readings it has already taken; otherwise they are looked up here.
     """
     warnings: list[str] = []
     banned_set = {str(t).lower().lstrip("#") for t in banned_tags}
@@ -918,25 +1086,70 @@ def select_hashtags(tiers: dict, *, count: int, always=(), banned_tags=(),
             items.append(tag)
         pool[tier] = items
 
-    quota = tag_quota(max(0, count - len(chosen)))
-    for tier, want in quota.items():
-        taken = 0
-        fresh = [t for t in pool[tier] if t.lower() not in recent_set]
-        stale = [t for t in pool[tier] if t.lower() in recent_set]
+    # --- price every tag, and re-bucket by what it measured at -------------
+    banding = config.TAG_VOLUME_ENABLED
+    dead: list[str] = []
+    if banding:
+        every = list(dict.fromkeys(t for tier, _ in HASHTAG_MIX
+                                   for t in pool.get(tier, [])))
+        if volumes is None:
+            volumes, volume_warnings = tagvolume.lookup(every)
+            warnings += volume_warnings
+        pool, dead = band_pool(pool, volumes or {})
+        pool, dead, doubt_warnings = _weigh_the_verdict(pool, dead, volumes,
+                                                        offered=every)
+        warnings += doubt_warnings
+    order = [tier for tier, _ in HASHTAG_MIX]
+    bands_for = (lambda tier: tagvolume.TIER_BANDS[tier]) if banding \
+        else (lambda tier: (tier,))
+
+    # A saturated tag places the post in a subject area; a block of them just
+    # enters the post in competitions it cannot win.
+    saturated_used = 0
+
+    def spendable(tag: str, band: str) -> bool:
+        nonlocal saturated_used
+        if band != "saturated":
+            return True
+        if saturated_used >= config.TAG_VOLUME_MAX_SATURATED:
+            return False
+        saturated_used += 1
+        return True
+
+    def drain(band: str, tier: str, want: int, taken: int) -> int:
+        """Take up to `want` tags from one band, freshest first."""
+        candidates = pool.get(band) or []
+        fresh = [t for t in candidates if t.lower() not in recent_set]
+        stale = [t for t in candidates if t.lower() in recent_set]
         for tag in fresh + stale:
             if taken >= want or len(chosen) >= count:
                 break
-            if add(tag, tier):
+            if tag.lower() in seen or not spendable(tag, band):
+                continue
+            # Labelled with what it measured at, not with the slot that wanted
+            # it - post.json should say what a tag is, not what it was for.
+            if add(tag, band if banding else tier):
                 taken += 1
+        return taken
 
-    if len(chosen) < count:                 # a tier came up short - top up
-        leftovers = [(t, tier) for tier in ("mid", "niche", "broad")
-                     for t in pool.get(tier, [])]
-        leftovers.sort(key=lambda pair: pair[0].lower() in recent_set)
-        for tag, tier in leftovers:
-            if len(chosen) >= count:
+    quota = tag_quota(max(0, count - len(chosen)))
+    for tier in order:
+        taken = 0
+        for band in bands_for(tier):
+            if taken >= quota[tier] or len(chosen) >= count:
                 break
-            add(tag, tier)
+            taken = drain(band, tier, quota[tier], taken)
+
+    if len(chosen) < count:                 # a band came up short - top up
+        for tier in ("mid", "niche", "broad"):
+            for band in bands_for(tier):
+                if len(chosen) >= count:
+                    break
+                drain(band, tier, count, len(chosen))
+
+    if banding and len(chosen) < count and dead and config.TAG_VOLUME_RELAX < 1:
+        warnings += _relax_floor(dead, volumes or {}, count=count,
+                                 chosen=chosen, add=add)
 
     if dropped:
         warnings.append("dropped banned tag(s): "
@@ -958,6 +1171,135 @@ def select_hashtags(tiers: dict, *, count: int, always=(), banned_tags=(),
             "every tag here was used by a recent post - the set is not varying"
         )
     return chosen, {t: tier_of[t] for t in chosen}, warnings
+
+
+# ---------------------------------------------------------------------------
+# Alt text for step 5's cover frame
+#
+# The description that goes in Instagram's "Write alt text" field. It does two
+# jobs at once and they do not pull against each other: a screen reader reads
+# it aloud, and Instagram reads it for what the picture is of.
+#
+# It is a description of an IMAGE, not a second caption. No hook, no selling,
+# no hashtags - and short, because the field is short and because a screen
+# reader user is listening to it rather than skimming it.
+#
+# Everything it says comes from what step 5 recorded about the cover it chose.
+# ---------------------------------------------------------------------------
+
+#: Cut here rather than mid-word when the description runs long.
+_ALT_TRIM_RE = re.compile(r"[\s,;:]+\S*$")
+
+#: Below this there is no room left to say anything about the picture, so the
+#: description is dropped rather than trimmed to a stub.
+_ALT_MIN_PICTURE_CHARS = 16
+
+
+def _sentence_case(text: str) -> str:
+    """Capitalise the first letter and leave the rest of the casing alone.
+
+    `.capitalize()` would lower-case the rest, which turns a provider's "Blue
+    Ocean Medusa" into something that reads as though it were retyped badly.
+    """
+    text = str(text or "").strip()
+    return text[:1].upper() + text[1:] if text else ""
+
+
+def _fit_alt(text: str, limit: int) -> str:
+    """Trim alt text to the limit at a word boundary, ending in a full stop."""
+    text = " ".join(str(text or "").split())
+    if limit <= 0 or len(text) <= limit:
+        return text
+    cut = text[:limit].rstrip()
+    trimmed = _ALT_TRIM_RE.sub("", cut) or cut
+    return trimmed.rstrip(" ,;:") + "."
+
+
+def build_alt_text(cover: dict, *, limit: int, mode: str = "literal",
+                   rewritten: str = "") -> tuple[str, dict, list[str]]:
+    """Describe the cover image. Returns (text, report, warnings).
+
+    Two facts go in, in this order of importance:
+
+      1. any text burned into the cover - the hook card. This is the half that
+         matters most: a viewer using a screen reader gets nothing at all from
+         a cover that is mostly a headline unless the alt text says what the
+         headline said;
+      2. what the picture underneath shows, in the words step 5 recorded.
+
+    `rewritten` is the model's phrasing of (2) when POST_ALT_MODE=llm. It only
+    ever replaces the wording of the depiction - never the card text, which is
+    quoted exactly because it is a quotation.
+    """
+    warnings: list[str] = []
+    report = {
+        "mode": mode, "source": "none", "chars": 0, "limit": limit,
+        "from_cover": "", "depicts": "", "has_card_text": False,
+    }
+    if not isinstance(cover, dict) or not cover:
+        return "", report, warnings
+
+    depicts = " ".join(str(cover.get("depicts") or "").split())
+    source = str(cover.get("depicts_source") or "none")
+    if rewritten:
+        rephrased = " ".join(str(rewritten).split())
+        if rephrased:
+            depicts, source = rephrased, "llm"
+
+    card = " ".join(str(cover.get("hook_card_text") or "").split())
+    report.update({
+        "source": source,
+        "from_cover": str(cover.get("filename") or ""),
+        "depicts": depicts,
+        "has_card_text": bool(card),
+    })
+
+    if not depicts and not card:
+        warnings.append(
+            "step 5's cover record describes nothing, so the post has no alt "
+            "text - the cover is the one thing a screen reader cannot reach"
+        )
+        return "", report, warnings
+
+    # Two sentences rather than one clause. `depicts` arrives either as a
+    # provider's lower-case slug ("medusa blue ocean") or, in llm mode, as a
+    # capitalised sentence - and there is no join that reads correctly for both
+    # ("... over A jellyfish drifts in blue water"). Kept apart, each is
+    # grammatical whichever it is, and quoting the card in its own sentence is
+    # how a screen reader is normally told an image has words on it.
+    picture = f"{_sentence_case(depicts)}." if depicts else ""
+    on_image = ""
+    if card:
+        # A card too long for the field on its own is trimmed *inside* the
+        # quotes. Trimming the sentence instead leaves "Text on the image.",
+        # which tells a listener there are words and not what they say.
+        room = limit - len('Text on the image: "".')
+        quoted = _sentence_case(card)
+        if room > 0 and len(quoted) > room:
+            quoted = _fit_alt(quoted, room).rstrip(".")
+        on_image = f'Text on the image: "{quoted}".'
+
+    if picture and on_image:
+        # The card text is the half a screen reader cannot get any other way,
+        # so the picture gives up its characters first rather than last - and
+        # is dropped outright rather than left as a stub too short to mean
+        # anything ("Bl. Text on the image: ...").
+        room = limit - len(on_image) - 1
+        trimmed = _fit_alt(picture, room) if len(picture) > room else picture
+        if room < _ALT_MIN_PICTURE_CHARS:
+            trimmed = ""
+        text = f"{trimmed} {on_image}".strip() if trimmed else on_image
+    else:
+        text = picture or on_image
+
+    fitted = _fit_alt(text, limit)
+    if len(f"{picture} {on_image}".strip()) > limit:
+        warnings.append(
+            f"alt text did not fit {limit} characters and was trimmed; the "
+            f"text on the cover is kept ahead of the description of it"
+        )
+    report["chars"] = len(fitted)
+    return fitted, report, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1137,7 +1479,7 @@ def _echoes_script(hook: str, script: str) -> bool:
 def generate_caption(source, *, run_dir=None, run_id: str | None = None,
                      topic: str | None = None, niche: str | None = None,
                      hashtag_count: int | None = None, placement: str | None = None,
-                     attribution=None, mode: str | None = None,
+                     attribution=None, mode: str | None = None, alt=None,
                      write: bool = True, overwrite: bool = True) -> dict:
     """Write the Instagram post text for a script.
 
@@ -1156,6 +1498,8 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         attribution: "required" / "all" / "off", or a bool for the config
             default vs. off. Defaults to config.POST_ATTRIBUTION.
         mode: "llm" or "heuristic". Defaults to config.POST_MODE.
+        alt: "literal" or "llm" for the cover's alt text, False for none.
+            Defaults to config.POST_ALT_MODE.
         write: write post.txt and post.json. False plans everything and touches
             no disk.
         overwrite: replace an existing post.txt.
@@ -1204,6 +1548,31 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         )
         attribution_mode = "required"
 
+    # --- alt text mode ------------------------------------------------------
+    # Settled before the draft, because `llm` is one more field in the caption
+    # call rather than a request of its own - so it has to be known before that
+    # call is built.
+    if alt is False or not config.POST_ALT_ENABLED:
+        alt_mode = "off"
+    else:
+        alt_mode = str(alt or config.POST_ALT_MODE).strip().lower()
+        if alt_mode not in ("literal", "llm"):
+            warnings.append(f"unknown POST_ALT_MODE {alt_mode!r}; used 'literal'")
+            alt_mode = "literal"
+
+    cover = resolved.cover if isinstance(resolved.cover, dict) else {}
+    if alt_mode != "off" and not cover:
+        # Not a failure: this is what a bare script, or a run directory written
+        # before step 5 chose covers, looks like.
+        warnings.append(
+            "no cover frame in this run's assembly.json, so there is no image "
+            "to write alt text for - re-run step 5 to choose one"
+        )
+        alt_mode = "off"
+
+    alt_depicts = (str(cover.get("depicts") or "")
+                   if alt_mode == "llm" and mode == "llm" else "")
+
     count = int(config.POST_HASHTAG_COUNT if hashtag_count is None
                 else hashtag_count)
     if count < 0:
@@ -1237,7 +1606,7 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
     if mode == "llm":
         draft, llm_warnings = llm_draft(
             resolved.script, topic=resolved.topic, niche=niche_value,
-            count=count, rules=rules,
+            count=count, rules=rules, alt_depicts=alt_depicts,
         )
         warnings += llm_warnings
     if draft is None:
@@ -1256,6 +1625,7 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
             count=count,
             rules=rules + [f"The previous attempt used {', '.join(hits)}. "
                            f"Do not use those words in any form."],
+            alt_depicts=alt_depicts,
         )
         warnings += retry_warnings
         if retry is not None and not banned_hits(retry, config.POST_BANNED_WORDS):
@@ -1288,12 +1658,22 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
     draft.hook, draft.cta = fields[0], fields[-1]
     draft.body = fields[1:-1]
 
+    volumes: dict = {}
+    if config.TAG_VOLUME_ENABLED:
+        offered = [normalise_tag(raw) for tier, _ in HASHTAG_MIX
+                   for raw in (draft.hashtags.get(tier) or [])]
+        volumes, volume_warnings = tagvolume.lookup(
+            [tag for tag in offered if tag]
+        )
+        warnings += volume_warnings
+
     tags, tag_tiers, tag_warnings = select_hashtags(
         draft.hashtags, count=count,
         always=config.POST_HASHTAGS_ALWAYS,
         banned_tags=config.POST_HASHTAGS_BANNED,
         banned_words=config.POST_BANNED_WORDS,
         recent=recent,
+        volumes=volumes,
     )
     warnings += tag_warnings
 
@@ -1323,6 +1703,25 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
     first_comment = (" ".join("#" + tag for tag in tags)
                      if placement == "comment" and tags else None)
 
+    # --- alt text for the cover --------------------------------------------
+    alt_text, alt_report, alt_warnings = "", {
+        "mode": "off", "source": "none", "chars": 0,
+        "limit": config.POST_ALT_MAX_CHARS, "from_cover": "", "depicts": "",
+        "has_card_text": False,
+    }, []
+    if alt_mode != "off":
+        rewritten = draft.alt if alt_mode == "llm" else ""
+        if alt_mode == "llm" and not rewritten:
+            warnings.append(
+                "POST_ALT_MODE=llm but the model returned no alt text; wrote "
+                "it from step 5's own words instead"
+            )
+        alt_text, alt_report, alt_warnings = build_alt_text(
+            cover, limit=config.POST_ALT_MAX_CHARS, mode=alt_mode,
+            rewritten=rewritten,
+        )
+        warnings += alt_warnings
+
     mentions = _MENTION_RE.findall(caption + " " + (first_comment or ""))
     if len(mentions) > MENTION_LIMIT:
         warnings.append(
@@ -1344,8 +1743,17 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         "must_include": parts["must_include"],
         "hashtags": ["#" + tag for tag in tags],
         "hashtag_tiers": {"#" + tag: tag_tiers.get(tag, "?") for tag in tags},
+        "hashtag_volumes": {
+            "#" + tag: (volumes.get(tag) or volumes.get(tag.lower())).as_dict()
+            for tag in tags
+            if volumes.get(tag) or volumes.get(tag.lower())
+        },
         "hashtag_placement": placement,
         "first_comment": first_comment,
+        # Goes in Instagram's "Write alt text" field, not the caption. Empty
+        # when there is no cover to describe.
+        "alt_text": alt_text,
+        "alt": alt_report,
         "attribution": {
             "mode": attribution_mode,
             "assets": credits.assets,
@@ -1378,6 +1786,7 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         "post_text_path": None,
         "post_json_path": None,
         "post_comment_path": None,
+        "post_alt_path": None,
         "warnings": list(dict.fromkeys(warnings)),
     }
 
@@ -1411,6 +1820,15 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         # A leftover from a run with a different placement would be posted
         # as a duplicate tag block by step 7.
         comment_path.unlink(missing_ok=True)
+
+    alt_path = destination / POST_ALT_NAME
+    if alt_text:
+        alt_path.write_text(alt_text + "\n", encoding="utf-8")
+        post["post_alt_path"] = str(alt_path.resolve())
+    else:
+        # Same reasoning as the comment file: a leftover from an earlier run
+        # describes an earlier cover, and would be pasted against this one.
+        alt_path.unlink(missing_ok=True)
 
     json_path.write_text(json.dumps(post, indent=2, ensure_ascii=False),
                          encoding="utf-8")
@@ -1453,11 +1871,20 @@ def _print_result(post: dict) -> None:
     attribution = post["attribution"]
     print(f"CREDITS : {attribution['mode']} - {attribution['required']} required "
           f"of {attribution['assets']} asset(s)")
+    alt = post.get("alt") or {}
+    if post.get("alt_text"):
+        print(f"ALT     : {alt['chars']}/{alt['limit']} chars, "
+              f"{alt['mode']} from {alt['source']}")
+        print(f"          {post['alt_text']}")
+    elif alt.get("mode") not in (None, "off"):
+        print("ALT     : none")
     if post["post_text_path"]:
         print(f"WROTE   : {post['post_text_path']}")
         print(f"          {post['post_json_path']}")
         if post.get("post_comment_path"):
             print(f"          {post['post_comment_path']}")
+        if post.get("post_alt_path"):
+            print(f"          {post['post_alt_path']}")
     else:
         print("WROTE   : nothing (dry run)")
 
@@ -1471,9 +1898,15 @@ def _print_result(post: dict) -> None:
         print("FIRST COMMENT")
         print(post["first_comment"])
     print(rule)
-    print("TAGS BY TIER")
+    # With volume banding on the tier a tag is filed under is the band it
+    # measured at, so printing both would say the same thing twice.
+    sizes = post.get("hashtag_volumes") or {}
+    print("TAGS BY BAND" if sizes else "TAGS BY TIER")
     for tag, tier in post["hashtag_tiers"].items():
-        print(f"  {tier:<7} {tag}")
+        reading = sizes.get(tag)
+        measure = (f"~{reading['count']:>12,}  {reading['source']}"
+                   if reading else "")
+        print(f"  {tier:<11} {tag:<26}{measure}")
 
     if post["warnings"]:
         print(rule)
@@ -1517,6 +1950,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="shorthand for --attribution off")
     parser.add_argument("--mode", default=None, choices=("llm", "heuristic"),
                         help=f"how the copy is written (default: {config.POST_MODE})")
+    parser.add_argument("--alt", default=None, choices=("literal", "llm"),
+                        help=f"how the cover's alt text is written "
+                             f"(default: {config.POST_ALT_MODE})")
+    parser.add_argument("--no-alt", action="store_true",
+                        help="do not write alt text for the cover")
     parser.add_argument("--dry-run", action="store_true",
                         help="write nothing to disk")
     parser.add_argument("--json", action="store_true",
@@ -1535,6 +1973,7 @@ def main(argv: list[str] | None = None) -> int:
             placement=args.placement,
             attribution="off" if args.no_attribution else args.attribution,
             mode=args.mode,
+            alt=False if args.no_alt else args.alt,
             write=not args.dry_run,
         )
     except (CaptionError, config.MissingConfigError) as exc:

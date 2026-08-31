@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest  # noqa: E402
 
 import config  # noqa: E402
-from pipeline import caption  # noqa: E402
+from pipeline import caption, tagvolume  # noqa: E402
 from pipeline.caption import Draft  # noqa: E402
 
 
@@ -142,7 +142,8 @@ def test_the_mix_is_split_across_tiers_and_survives_a_changed_count():
     assert caption.tag_quota(0) == {"broad": 0, "mid": 0, "niche": 0}
 
 
-def test_tags_are_drawn_from_every_tier():
+def test_tags_are_drawn_from_every_tier(monkeypatch):
+    monkeypatch.setattr(config, "TAG_VOLUME_ENABLED", False)
     tiers = {
         "broad": ["ocean", "science", "nature"],
         "mid": ["bioluminescence", "deepsea", "anglerfish", "marinebiology"],
@@ -215,6 +216,145 @@ def test_running_short_of_tags_is_reported_rather_than_padded():
 
     assert tags == ["ocean"]
     assert any("only 1 of 8" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# Volume banding
+#
+# The generator's tiers are a guess about words. These cover what happens once
+# every tag is priced: see pipeline/tagvolume.py and tests/test_tagvolume.py.
+# ---------------------------------------------------------------------------
+
+def vol(tag: str, count: int, source: str = "measured"):
+    return tagvolume.Volume(tag, count, source, tagvolume.band_of(count))
+
+
+def test_a_tag_too_small_to_be_found_is_dropped():
+    tiers = {"broad": ["OceanLife"], "mid": ["DeepSeaFish"],
+             "niche": ["Piezophile"]}
+    volumes = {"OceanLife": vol("OceanLife", 4_000_000),
+               "DeepSeaFish": vol("DeepSeaFish", 200_000),
+               "Piezophile": vol("Piezophile", 180)}
+
+    tags, _, warnings = caption.select_hashtags(tiers, count=3,
+                                                volumes=volumes)
+
+    assert "Piezophile" not in tags
+    assert any("too few posts" in w for w in warnings)
+
+
+def test_a_tag_is_placed_by_what_it_measures_not_by_what_it_was_called():
+    # The model filed a four-million-post tag under "niche". It is not niche.
+    tiers = {"broad": [], "mid": [], "niche": ["Bioluminescence", "LavaTubes"]}
+    volumes = {"Bioluminescence": vol("Bioluminescence", 4_000_000),
+               "LavaTubes": vol("LavaTubes", 60_000)}
+
+    _, tier_of, _ = caption.select_hashtags(tiers, count=2, volumes=volumes)
+
+    assert tier_of["Bioluminescence"] == "broad"
+    assert tier_of["LavaTubes"] == "niche"
+
+
+def test_only_so_many_of_the_hugest_tags_get_in(monkeypatch):
+    monkeypatch.setattr(config, "TAG_VOLUME_MAX_SATURATED", 1)
+    tiers = {"broad": ["Ocean", "Nature", "Science"], "mid": ["DeepSeaFish"],
+             "niche": ["LavaTubes"]}
+    volumes = {"Ocean": vol("Ocean", 40_000_000),
+               "Nature": vol("Nature", 90_000_000),
+               "Science": vol("Science", 30_000_000),
+               "DeepSeaFish": vol("DeepSeaFish", 200_000),
+               "LavaTubes": vol("LavaTubes", 60_000)}
+
+    tags, tier_of, _ = caption.select_hashtags(tiers, count=5,
+                                               volumes=volumes)
+
+    huge = [t for t in tags if tier_of[t] == "saturated"]
+    assert len(huge) == 1
+    # and the slots it did not take went to tags that can actually be ranked in
+    assert "DeepSeaFish" in tags and "LavaTubes" in tags
+
+
+def test_an_always_on_tag_is_never_touched_by_the_band_filter():
+    # POST_HASHTAGS_ALWAYS is a series or brand tag. It is small by definition
+    # and that is not a mistake to be corrected.
+    tiers = {"broad": ["OceanLife"], "mid": [], "niche": []}
+    volumes = {"OceanLife": vol("OceanLife", 4_000_000)}
+
+    tags, tier_of, _ = caption.select_hashtags(
+        tiers, count=2, always=("MyTinySeriesTag",), volumes=volumes
+    )
+
+    assert tags[0] == "MyTinySeriesTag"
+    assert tier_of["MyTinySeriesTag"] == "always"
+
+
+def test_the_biggest_of_the_dead_come_back_before_the_block_runs_short(
+        monkeypatch):
+    monkeypatch.setattr(config, "TAG_VOLUME_FLOOR", 5_000)
+    monkeypatch.setattr(config, "TAG_VOLUME_RELAX", 0.2)   # down to 1,000
+    tiers = {"broad": ["OceanLife"], "mid": ["Nearly", "Hopeless"], "niche": []}
+    volumes = {"OceanLife": vol("OceanLife", 4_000_000),
+               "Nearly": vol("Nearly", 3_000),             # dead, but close
+               "Hopeless": vol("Hopeless", 12)}            # dead and staying so
+
+    tags, _, warnings = caption.select_hashtags(tiers, count=3,
+                                                volumes=volumes)
+
+    assert "Nearly" in tags
+    assert "Hopeless" not in tags
+    assert any("below the volume floor" in w for w in warnings)
+
+
+def test_nothing_is_put_back_when_relaxing_is_switched_off(monkeypatch):
+    monkeypatch.setattr(config, "TAG_VOLUME_RELAX", 1.0)
+    tiers = {"broad": ["OceanLife"], "mid": ["Nearly"], "niche": []}
+    volumes = {"OceanLife": vol("OceanLife", 4_000_000),
+               "Nearly": vol("Nearly", 3_000)}
+
+    tags, _, warnings = caption.select_hashtags(tiers, count=3,
+                                                volumes=volumes)
+
+    assert tags == ["OceanLife"]                 # short, and said so
+    assert any("only 1 of 3" in w for w in warnings)
+
+
+def test_a_tag_with_no_reading_keeps_the_tier_it_came_in_with():
+    # No measurement is not evidence against a tag.
+    tiers = {"broad": [], "mid": ["Unmeasured"], "niche": []}
+
+    tags, tier_of, _ = caption.select_hashtags(tiers, count=1, volumes={})
+
+    assert tags == ["Unmeasured"]
+    assert tier_of["Unmeasured"] == "mid"
+
+
+def test_banding_off_leaves_the_generator_s_tiers_alone(monkeypatch):
+    monkeypatch.setattr(config, "TAG_VOLUME_ENABLED", False)
+    tiers = {"broad": [], "mid": [], "niche": ["Piezophile"]}
+
+    tags, tier_of, warnings = caption.select_hashtags(tiers, count=1)
+
+    assert tags == ["Piezophile"]
+    assert tier_of["Piezophile"] == "niche"
+    assert not any("too few posts" in w for w in warnings)
+
+
+def test_the_post_records_what_every_tag_measured_at(monkeypatch, tmp_path):
+    stub_draft(monkeypatch, Draft(
+        hook="Hook.", body=["Body."],
+        hashtags={"broad": ["OceanLife"], "mid": ["DeepSeaFish"],
+                  "niche": ["Piezophile"]},
+    ))
+
+    post = caption.generate_caption(SCRIPT, run_dir=tmp_path, write=False,
+                                    hashtag_count=3)
+
+    readings = post["hashtag_volumes"]
+    assert readings                                  # one per surviving tag
+    assert set(readings) == set(post["hashtags"])
+    assert all(r["band"] in tagvolume.USABLE for r in readings.values())
+    assert all(r["source"] == "estimate" for r in readings.values())
+    assert "#Piezophile" not in post["hashtags"]
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +678,9 @@ def test_a_failed_model_call_still_produces_a_caption(monkeypatch, tmp_path):
 
 
 def test_the_hard_limits_are_the_platform_s_not_ours(monkeypatch, tmp_path):
+    # About Instagram's cap of 30, not about volume banding - tag0..tag39 are
+    # coinages and the band filter is quite right to refuse every one of them.
+    monkeypatch.setattr(config, "TAG_VOLUME_ENABLED", False)
     stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
                                   hashtags={"mid": [f"tag{n}" for n in range(40)]}))
 
@@ -563,3 +706,278 @@ def test_long_tail_tags_are_phrases_that_actually_occur_together():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Alt text for step 5's cover frame
+# ---------------------------------------------------------------------------
+
+def make_cover(**overrides) -> dict:
+    """Step 5's cover record, shaped exactly like the real one."""
+    cover = {
+        "path": "/nowhere/cover.jpg",
+        "filename": "cover.jpg",
+        "written": True,
+        "source": "hook_card",
+        "mode": "auto",
+        "reason": "the reel opens on a hook card",
+        "time": 0.84,
+        "source_time": 2.52,
+        "shot_index": 0,
+        "beat_index": 0,
+        "asset_index": 0,
+        "file": "beat00_0_pexels_1.mp4",
+        "kind": "video",
+        "hook_card_text": "Snailfish: extreme pressure",
+        "depicts": "medusa blue ocean",
+        "depicts_source": "source_url",
+        "safe_aspect": "4:5",
+        "card_in_safe_band": True,
+        "score": 6.1,
+        "width": 1080,
+        "height": 1920,
+        "bytes": 97035,
+    }
+    cover.update(overrides)
+    return cover
+
+
+def alt_for(cover: dict, limit: int = 100, **kwargs) -> str:
+    return caption.build_alt_text(cover, limit=limit, **kwargs)[0]
+
+
+def test_alt_text_says_what_the_picture_is_and_what_it_says():
+    text = alt_for(make_cover())
+    assert "Medusa blue ocean" in text
+    assert "Snailfish: extreme pressure" in text
+
+
+def test_the_text_burned_into_the_cover_is_quoted_exactly():
+    """A screen reader user gets the headline from nowhere else."""
+    text = alt_for(make_cover(hook_card_text='Snailfish: "extreme" pressure'))
+    assert 'Snailfish: "extreme" pressure' in text
+
+
+def test_a_footage_cover_is_described_without_inventing_a_headline():
+    text = alt_for(make_cover(hook_card_text="", source="footage"))
+    assert text == "Medusa blue ocean."
+    assert "Text on the image" not in text
+
+
+def test_a_cover_with_nothing_but_a_headline_still_reports_the_headline():
+    text = alt_for(make_cover(depicts=""))
+    assert text == 'Text on the image: "Snailfish: extreme pressure".'
+
+
+def test_no_cover_means_no_alt_text_rather_than_a_guess():
+    text, report, warnings = caption.build_alt_text({}, limit=100)
+    assert text == ""
+    assert report["source"] == "none"
+    assert warnings == []
+
+
+def test_a_cover_that_describes_nothing_is_reported():
+    text, _, warnings = caption.build_alt_text(
+        make_cover(depicts="", hook_card_text=""), limit=100
+    )
+    assert text == ""
+    assert any("cannot reach" in w for w in warnings)
+
+
+def test_the_description_and_the_headline_stay_separate_sentences():
+    """There is no join that reads correctly for both casings it arrives in.
+
+    A provider slug is lower case ("medusa blue ocean"); the model returns a
+    capitalised sentence. "... over A jellyfish drifts" is the result of
+    gluing them together.
+    """
+    literal = alt_for(make_cover())
+    rewritten = alt_for(make_cover(), mode="llm",
+                        rewritten="A jellyfish drifts in dark blue water")
+    for text in (literal, rewritten):
+        assert " over " not in text
+        assert text.endswith('.')
+    assert rewritten.startswith("A jellyfish drifts in dark blue water.")
+
+
+def test_the_model_rephrases_the_picture_but_never_the_quoted_headline():
+    text, report, _ = caption.build_alt_text(
+        make_cover(), limit=100, mode="llm",
+        rewritten="A jellyfish drifts in dark blue water",
+    )
+    assert "medusa" not in text.lower()
+    assert "Snailfish: extreme pressure" in text
+    assert report["source"] == "llm"
+
+
+def test_an_empty_rewrite_falls_back_to_step_fives_own_words():
+    text, report, _ = caption.build_alt_text(
+        make_cover(), limit=100, mode="llm", rewritten="",
+    )
+    assert "Medusa blue ocean" in text
+    assert report["source"] == "source_url"
+
+
+def test_alt_text_is_held_to_the_limit():
+    text = alt_for(make_cover(depicts="a " + "very " * 40 + "long description"))
+    assert len(text) <= 100
+
+
+def test_the_headline_survives_the_trim_and_the_description_gives_way():
+    cover = make_cover(depicts="a " + "very " * 40 + "long description")
+    text, _, warnings = caption.build_alt_text(cover, limit=100)
+    assert "Snailfish: extreme pressure" in text
+    assert len(text) <= 100
+    assert any("kept ahead of" in w for w in warnings)
+
+
+def test_a_trim_never_cuts_a_word_in_half():
+    text = alt_for(make_cover(depicts="jellyfish " * 30))
+    assert not text.replace(".", "").endswith("jellyf")
+
+
+def test_a_headline_too_long_for_the_field_is_cut_inside_its_quotes():
+    """Trimming the sentence instead says there are words without saying which."""
+    text = alt_for(make_cover(hook_card_text="word " * 40, depicts="blue ocean"))
+    assert text.startswith('Text on the image: "Word')
+    assert len(text) <= 100
+
+
+def test_the_first_letter_is_raised_without_flattening_the_rest():
+    # .capitalize() would turn a provider's own "Blue Ocean Medusa" into
+    # "Blue ocean medusa", which reads as though it had been retyped badly.
+    assert caption._sentence_case("blue Ocean Medusa") == "Blue Ocean Medusa"
+
+
+# --- how it reaches post.json ----------------------------------------------
+
+def test_step_five_s_cover_is_read_out_of_the_assembly():
+    resolved = caption.resolve_source({
+        "script": SCRIPT, "topic": "the deep ocean",
+        "assembly_version": 2, "cover": make_cover(),
+    })
+    assert resolved.cover["depicts"] == "medusa blue ocean"
+
+
+def test_an_assembly_from_before_covers_existed_reads_as_no_cover():
+    resolved = caption.resolve_source({"script": SCRIPT, "assembly_version": 1})
+    assert resolved.cover == {}
+
+
+def test_the_post_carries_the_alt_text_and_its_own_file(monkeypatch, tmp_path):
+    stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
+                                  hashtags={"mid": ["ocean"]}))
+    monkeypatch.setattr(config, "POST_HASHTAG_USAGE_FILE", tmp_path / "usage.json")
+
+    post = caption.generate_caption(
+        {"script": SCRIPT, "topic": "the deep ocean", "cover": make_cover()},
+        run_dir=tmp_path, run_id="r-1",
+    )
+
+    assert "Snailfish: extreme pressure" in post["alt_text"]
+    assert post["alt"]["chars"] == len(post["alt_text"])
+    assert post["alt"]["from_cover"] == "cover.jpg"
+    assert (tmp_path / caption.POST_ALT_NAME).read_text(
+        encoding="utf-8").strip() == post["alt_text"]
+
+
+def test_alt_text_stays_out_of_the_caption_itself(monkeypatch, tmp_path):
+    """It goes in a different Instagram field, so post.txt must not carry it."""
+    stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
+                                  hashtags={"mid": ["ocean"]}))
+    monkeypatch.setattr(config, "POST_HASHTAG_USAGE_FILE", tmp_path / "usage.json")
+
+    post = caption.generate_caption(
+        {"script": SCRIPT, "cover": make_cover()}, run_dir=tmp_path, run_id="r-1",
+    )
+
+    assert post["alt_text"] not in post["caption"]
+    assert "Text on the image" not in (
+        tmp_path / caption.POST_TEXT_NAME).read_text(encoding="utf-8")
+
+
+def test_a_run_with_no_cover_says_so_instead_of_describing_nothing(
+        monkeypatch, tmp_path):
+    stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
+                                  hashtags={"mid": ["ocean"]}))
+
+    post = caption.generate_caption({"script": SCRIPT}, run_dir=tmp_path,
+                                    write=False)
+
+    assert post["alt_text"] == ""
+    assert post["alt"]["mode"] == "off"
+    assert any("no cover frame" in w for w in post["warnings"])
+
+
+def test_alt_text_can_be_switched_off(monkeypatch, tmp_path):
+    stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
+                                  hashtags={"mid": ["ocean"]}))
+    monkeypatch.setattr(config, "POST_HASHTAG_USAGE_FILE", tmp_path / "usage.json")
+
+    post = caption.generate_caption(
+        {"script": SCRIPT, "cover": make_cover()},
+        run_dir=tmp_path, run_id="r-1", alt=False,
+    )
+
+    assert post["alt_text"] == ""
+    assert not (tmp_path / caption.POST_ALT_NAME).exists()
+
+
+def test_a_stale_alt_file_from_an_earlier_cover_is_cleared(monkeypatch, tmp_path):
+    """It would otherwise be pasted against a cover it does not describe."""
+    stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
+                                  hashtags={"mid": ["ocean"]}))
+    monkeypatch.setattr(config, "POST_HASHTAG_USAGE_FILE", tmp_path / "usage.json")
+    stale = tmp_path / caption.POST_ALT_NAME
+    stale.write_text("An older cover entirely.\n", encoding="utf-8")
+
+    caption.generate_caption({"script": SCRIPT}, run_dir=tmp_path, run_id="r-1")
+
+    assert not stale.exists()
+
+
+def test_a_dry_run_writes_no_alt_file(monkeypatch, tmp_path):
+    stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
+                                  hashtags={"mid": ["ocean"]}))
+
+    post = caption.generate_caption(
+        {"script": SCRIPT, "cover": make_cover()}, run_dir=tmp_path, write=False,
+    )
+
+    assert post["alt_text"]
+    assert post["post_alt_path"] is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unknown_alt_mode_is_reported_and_treated_as_literal(
+        monkeypatch, tmp_path):
+    stub_draft(monkeypatch, Draft(hook="Hook.", body=["Body."],
+                                  hashtags={"mid": ["ocean"]}))
+
+    post = caption.generate_caption(
+        {"script": SCRIPT, "cover": make_cover()}, run_dir=tmp_path,
+        write=False, alt="sideways",
+    )
+
+    assert post["alt"]["mode"] == "literal"
+    assert any("unknown POST_ALT_MODE" in w for w in post["warnings"])
+
+
+def test_the_alt_field_is_only_asked_of_the_model_when_it_is_wanted():
+    """A literal run must not pay for the extra instruction in the prompt."""
+    plain = caption.build_prompt(SCRIPT, topic="t", niche="n", hook_max=125,
+                                 count=8, tone="plain", cta="", rules=[])
+    asking = caption.build_prompt(SCRIPT, topic="t", niche="n", hook_max=125,
+                                  count=8, tone="plain", cta="", rules=[],
+                                  alt_depicts="medusa blue ocean")
+    assert '"alt"' not in plain
+    assert '"alt"' in asking
+    assert "medusa blue ocean" in asking
+
+
+def test_the_model_is_told_not_to_add_what_it_cannot_see():
+    asking = caption.build_prompt(SCRIPT, topic="t", niche="n", hook_max=125,
+                                  count=8, tone="plain", cta="", rules=[],
+                                  alt_depicts="medusa blue ocean")
+    assert "Rewrite ONLY those words" in asking
+    assert "do not guess" in asking
