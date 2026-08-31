@@ -1,0 +1,84 @@
+# Evergreen backlog - the floor under a thin board.
+#
+# One topic per line; blank lines and `#` comments ignored. Read by the
+# `evergreen` source in pipeline/topics.py, which scores these exactly like a
+# scouted candidate and then subtracts EVERGREEN_PENALTY, so a genuinely
+# moving on-niche find still outranks anything here.
+#
+# What makes a good line, and why each rule is a scoring rule and not taste:
+#   - open with why/how/what      - EXPLAINER_BONUS, +1.2
+#   - 4 to 16 words               - outside that is TITLE_SHORT/LONG_PENALTY
+#   - no proper nouns             - PROPER_NOUN_PENALTY, -0.8 each
+#   - a thing stock footage holds - the probe scores it, up to +1.5
+#   - no hype adjectives          - HYPE_PENALTY, -0.6
+#
+# A line taken is marked in the ledger and never returns. Keep this topped up:
+# on a daily run this file is the difference between shipping and skipping.
+
+# --- the ocean -------------------------------------------------------------
+why the ocean is blue but water is clear
+why the deep sea is dark below a thousand feet
+how waves keep moving when the water does not
+why the tide comes in twice a day
+how coral builds an island out of seawater
+why the deep ocean is colder than the poles
+what happens to a shipwreck on the seafloor
+how deep sea creatures survive the pressure
+why some fish glow in the dark water
+how a whale holds its breath for an hour
+why sea foam gathers on the shore
+how sand is made and where it goes
+why the sea is salty but rivers are not
+what lives at the bottom of an ocean trench
+how a tsunami crosses an ocean unnoticed
+why the ocean has rivers inside it
+how plankton makes most of the air we breathe
+why ice floats and what that does to the sea
+what the sound of the deep ocean actually is
+how a jellyfish survives without a brain
+
+# --- earth science ---------------------------------------------------------
+why mountains stop growing at a certain height
+how a river carves a canyon out of rock
+why earthquakes happen where two plates meet
+what happens inside a volcano before it erupts
+how a cave forms from nothing but water
+why some rocks are older than the continents
+how the ground remembers a magnetic field
+why deserts form where they do
+what makes a geyser erupt on a schedule
+how a glacier moves without melting
+why some lakes have no outlet to the sea
+how soil takes a thousand years to form
+why the sky is blue and sunsets are red
+what happens when lightning hits sand
+how a canyon records millions of years in its walls
+why the seasons are not caused by distance
+how a fault line stores energy for centuries
+what makes quicksand behave like a liquid
+why hot springs come in colours
+how a sinkhole opens without warning
+
+# --- the natural world -----------------------------------------------------
+how a tree moves water to its highest leaf
+why leaves change colour before they fall
+how a forest talks through its roots
+why some trees live for thousands of years
+how a seed knows which way is up
+why birds fly in a v formation
+how animals navigate without a map
+why some animals never seem to age
+how a spider builds a web across a gap
+why flowers are the colours they are
+how a bee tells the hive where to go
+what happens to a forest after a fire
+why some animals see colours we cannot
+how a chameleon actually changes colour
+why moss grows on one side of a tree
+how a mushroom is only the tip of the organism
+why some plants eat insects
+how animals know a storm is coming
+why a desert blooms after rain
+how a river delta builds new land
+what happens under the snow in winter
+why some islands have animals found nowhere else
