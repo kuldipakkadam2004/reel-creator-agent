@@ -1,5 +1,8 @@
 # Secrets
 .env
+# Backups of it are the same secrets under a different name.
+.env.bak*
+.env.*.bak
 
 # Generated media / artifacts
 output/
