@@ -875,6 +875,39 @@ SHOT_SNAP_TO_WORDS = get_env_bool("SHOT_SNAP_TO_WORDS", True)
 #: pause, near enough that the pacing curve still decides the rhythm.
 SHOT_SNAP_MAX_SECONDS = get_env_float("SHOT_SNAP_MAX_SECONDS", 0.35)
 
+#: Cut the opening of the reel on the music's beat instead of on the words.
+#:
+#: A cut that lands on a beat is not heard as a cut at all - it is heard as the
+#: track doing it, which is the whole trick behind an edit that feels scored
+#: rather than assembled. It only works where the bed is actually audible, so
+#: it is confined to the opening: MUSIC_FADE_IN_SECONDS has just finished, the
+#: narration has not yet built up, and the cutting is at its fastest.
+#:
+#: It needs a BPM, and nothing here can measure one. Write it beside the track,
+#: in the same .txt sidecar the credit line lives in:
+#:
+#:     "Autumn prelude" by zero-project (CC BY 3.0)
+#:     bpm: 92
+#:     offset: 0.21
+#:
+#: `bpm` is the tempo; `offset` is where the first downbeat sits inside the
+#: file, in seconds, for a track that does not start exactly on one. A sidecar
+#: without a bpm line is read exactly as before - a credit and nothing else -
+#: so this changes nothing until a tempo is written down. MUSIC_BPM below is
+#: the fallback when a track has no sidecar of its own.
+SHOT_SNAP_TO_BEAT = get_env_bool("SHOT_SNAP_TO_BEAT", True)
+
+#: How much of the reel's opening the beat grid governs. Past this the words
+#: take the cuts back - by then the narration is carrying the reel and the bed
+#: has settled under it, and cutting to a tempo nobody is listening for buys
+#: nothing.
+SHOT_BEAT_WINDOW_SECONDS = get_env_float("SHOT_BEAT_WINDOW_SECONDS", 8.0)
+
+#: How far a cut may be moved to reach a beat. Wider than SHOT_SNAP_MAX_SECONDS
+#: on purpose: beats are 0.67s apart at 90 BPM and a full second at 60, so a
+#: 0.35s reach would miss the grid outright on a slow track.
+SHOT_BEAT_MAX_SECONDS = get_env_float("SHOT_BEAT_MAX_SECONDS", 0.5)
+
 #: When a clip is much longer than the slot it fills, skip this fraction of it
 #: before cutting in — stock footage often opens on a fade or a static frame.
 SHOT_SKIP_HEAD_RATIO = get_env_float("SHOT_SKIP_HEAD_RATIO", 0.1)
@@ -999,6 +1032,19 @@ MUSIC_DUCK_RELEASE_MS = get_env_float("MUSIC_DUCK_RELEASE_MS", 350.0)
 MUSIC_FADE_IN_SECONDS = get_env_float("MUSIC_FADE_IN_SECONDS", 1.0)
 MUSIC_FADE_OUT_SECONDS = get_env_float("MUSIC_FADE_OUT_SECONDS", 1.5)
 
+#: Fallback tempo for a track with no `bpm:` line in its sidecar, in BPM, and
+#: where its first downbeat sits inside the file, in seconds. A track's own
+#: sidecar always wins. 0 means "no grid", which is what a library with no
+#: tempos written down gets - see SHOT_SNAP_TO_BEAT above.
+#:
+#: Anything outside 30-300 BPM is treated as a typo and dropped with a warning:
+#: a stray `bpm: 9000` would otherwise put a beat every 7ms and make the grid
+#: mean nothing at all.
+MUSIC_BPM = get_env_float("MUSIC_BPM", 0.0)
+MUSIC_BEAT_OFFSET = get_env_float("MUSIC_BEAT_OFFSET", 0.0)
+MUSIC_BPM_MIN = get_env_float("MUSIC_BPM_MIN", 30.0)
+MUSIC_BPM_MAX = get_env_float("MUSIC_BPM_MAX", 300.0)
+
 # --- sound design -----------------------------------------------------------
 # Cuts that are heard as well as seen. A whoosh across a cut is the cheapest
 # production value there is: it costs one small file and it turns a change of
@@ -1101,6 +1147,43 @@ CAPTION_MARGIN_V = get_env_int("CAPTION_MARGIN_V", 420)
 
 #: Left/right margin, so long cues wrap instead of running to the frame edge.
 CAPTION_MARGIN_H = get_env_int("CAPTION_MARGIN_H", 90)
+
+# --- caption pop ------------------------------------------------------------
+# The highlight already keeps up with the voice. What it does not do is arrive:
+# a cue cuts in at full size and sits there, so three words replacing three
+# other words in the same place at the same size reads as a slideshow. A cue
+# that lands a little oversized and settles is read as a new thing being said.
+#
+# Both knobs below are drawn by libass from the same subtitle file as
+# everything else - there is no extra pass and no measurable encode cost.
+
+#: Scale the cue starts at, as a percentage, before settling to 100 over
+#: CAPTION_POP_MS. 112 is a nudge you feel rather than watch; past about 125 it
+#: starts reading as a bounce, which is a different and much cheaper effect.
+#: Off restores cues to cutting in at full size, which is what every reel made
+#: before this setting existed looks like. It does not turn off the payoff
+#: colour below - that is a separate look, disabled separately.
+CAPTION_POP = get_env_bool("CAPTION_POP", True)
+CAPTION_POP_SCALE = get_env_int("CAPTION_POP_SCALE", 112)
+
+#: How long the settle takes. Short enough to be over before the first word is
+#: finished - a pop still running under the second word is an animation, and
+#: the eye follows it instead of reading.
+CAPTION_POP_MS = get_env_int("CAPTION_POP_MS", 90)
+
+#: The payoff word - the number the sentence was built to deliver - in its own
+#: colour, and with a harder pop of its own as it is spoken.
+#:
+#: Step 2 is told to "write numbers and symbols the way they should be said
+#: aloud", so the narration says "ninety-five percent" and the captions carry
+#: almost no digits at all. The detector therefore reads number *words*; see
+#: _PAYOFF_NUMBER_WORDS in pipeline/assemble.py.
+#:
+#: Highlight style only. "plain" means one colour for the whole cue, and a
+#: second colour in it would make that setting a lie. Set the colour equal to
+#: CAPTION_HIGHLIGHT_COLOR to keep the pop and drop the distinction.
+CAPTION_PAYOFF_COLOR = get_env("CAPTION_PAYOFF_COLOR", "#4DF0FF")
+CAPTION_PAYOFF_SCALE = get_env_int("CAPTION_PAYOFF_SCALE", 124)
 
 # --- the hook card ----------------------------------------------------------
 # The hook in big type, high in the frame, over the opening of the reel while
@@ -1701,6 +1784,12 @@ def _report() -> None:
         ("SHOT_SNAP_TO_WORDS",
          f"on, up to {SHOT_SNAP_MAX_SECONDS:g}s of nudge"
          if SHOT_SNAP_TO_WORDS else "off (cuts land on the arithmetic)"),
+        ("SHOT_SNAP_TO_BEAT",
+         (f"on, first {SHOT_BEAT_WINDOW_SECONDS:g}s, "
+          f"up to {SHOT_BEAT_MAX_SECONDS:g}s of nudge"
+          + (f", {MUSIC_BPM:g} BPM fallback" if MUSIC_BPM > 0
+             else " (needs a bpm: line in a track's .txt)"))
+         if SHOT_SNAP_TO_BEAT else "off (the words take every cut)"),
         ("TRANSITION", f"{TRANSITION} ({TRANSITION_SECONDS}s)"),
         ("SHOT_MOTION", f"{SHOT_MOTION}, {SHOT_MOTION_ZOOM:g}x "
                         f"({SHOT_MOTION_HOOK_ZOOM:g}x on the open)"
@@ -1713,6 +1802,10 @@ def _report() -> None:
                           f"{CAPTION_FONT_SIZE}px, "
                           f"<={CAPTION_MAX_WORDS} words/cue"),
         ("CAPTION_FONT_FILE", CAPTION_FONT_FILE or "(auto-resolved)"),
+        ("CAPTION_POP",
+         (f"{CAPTION_POP_SCALE}% settling over {CAPTION_POP_MS}ms, "
+          f"payoff words {CAPTION_PAYOFF_SCALE}% in {CAPTION_PAYOFF_COLOR}")
+         if CAPTION_POP else "off (cues cut in at full size)"),
         ("HOOK_MODE", f"{HOOK_MODE}"
                       + (f", best of {HOOK_VARIANTS} openings, "
                          f"<={HOOK_MAX_WORDS} words"
@@ -1737,7 +1830,8 @@ def _report() -> None:
         ("MUSIC", (f"{MUSIC_LOUDNESS_TARGET:g} LUFS"
                    + (", ducked" if MUSIC_DUCKING else ", flat")
                    + (f", pinned to {MUSIC_FILE}" if MUSIC_FILE
-                      else ", rotating over assets/music/"))
+                      else ", rotating over assets/music/")
+                   + (f", {MUSIC_BPM:g} BPM" if MUSIC_BPM > 0 else ""))
                   if MUSIC_ENABLED else "off"),
         ("SFX", (f"{SFX_PEAK_TARGET:g} dBFS peak"
                  + (", whoosh on cuts" if SFX_ON_CUTS else "")

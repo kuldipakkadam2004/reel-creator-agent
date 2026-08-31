@@ -726,6 +726,19 @@ a finished 9:16 .mp4 with captions burned in, written to
   reads as something that went wrong. This is why the alignment now runs
   **before** the timeline is planned — it decides where the cuts go, so it
   cannot be worked out afterwards;
+* **the opening cuts land on the beat instead.** A cut on a beat is not heard
+  as a cut at all — it is heard as the track doing it, which is the whole trick
+  behind an edit that feels scored rather than assembled. It is confined to the
+  first `SHOT_BEAT_WINDOW_SECONDS` (8s), where the music's fade-in has just
+  finished, the narration has not built up and the cutting is at its fastest;
+  past that the bed has settled under the voice and cutting to a tempo nobody
+  is listening for buys nothing. The grid claims its cuts **before** the word
+  pass runs, because the other order does not work — the words would find a
+  nearer pause for every cut the music had just placed. **A beat falling inside
+  a spoken word is refused**, and that boundary drops through to the word pass:
+  cutting mid-word is the defect the pass above exists to prevent, and the
+  music does not get to override it. Needs a tempo written beside the track —
+  see [the music bed](#the-music-bed);
 * clips are centre-cropped to 9:16, trimmed to their slot, and **looped** when
   they are too short. A clip with room to spare cuts in a little way past its
   start, where stock footage stops fading up;
@@ -733,6 +746,25 @@ a finished 9:16 .mp4 with captions burned in, written to
 * captions are timed by **ElevenLabs forced alignment** — the script is already
   known, so the words are exact rather than transcribed. `whisper` and a
   no-network `estimate` are the fallbacks, tried in that order;
+* **the cue pops as it arrives, and the payoff word is made.** The highlight
+  already keeps up with the voice; what it did not do is *arrive*, so three
+  words replacing three other words in the same place at the same size read as
+  a slideshow. Each cue now lands at `CAPTION_POP_SCALE` (112%) and settles
+  over `CAPTION_POP_MS` (90ms). A **payoff word** — the number the sentence was
+  built to deliver — gets its own colour and a harder 124% pop as it is spoken.
+  The detector reads number *words*, not digits: step 2 is told to write
+  numbers the way they should be said aloud, and across every script on disk
+  there are 39 digit characters in twelve reels against "quadrillion",
+  "ninety-five" and "thousand" spelled out. Two constraints keep it from
+  reading as an animation: **a pop never interrupts a pop** (two accents inside
+  one settle is a wobble, and "ninety-five percent" is two payoffs a breath
+  apart), and **a cue with no room left does not pop**. Scaling happens after
+  libass has chosen the line breaks, so popping a cue that already fills the
+  frame wraps it onto three rows and snaps it back inside 90ms — measured on
+  the salt reel, where "50 QUADRILLION TONS" did exactly that. Cues with room
+  pop the full amount; the rest pop less, or not at all, which costs nothing —
+  fitting every cue to its popped size instead would shrink every caption in
+  the reel permanently for the sake of 90 milliseconds;
 * the narration is **loudness-normalised to -14 LUFS**, Instagram's own
   working point, so two reels cut a week apart do not land at different
   volumes. ElevenLabs renders at whatever level the voice sits at — one real
@@ -939,7 +971,25 @@ nothing is generated, so whatever you put there is yours to have licensed.
   credit that has to be used — it goes into `attribution.txt` and step 6 puts
   it in the post text, because a credit that only lives next to the .mp4 is not
   a credit. No sidecar means no credit is claimed, and the licence is yours to
-  check.
+  check;
+* the same sidecar can carry the track's **tempo**, which is what the opening
+  cuts are snapped to:
+
+  ```
+  "Autumn prelude" by zero-project (CC BY 3.0)
+  bpm: 92
+  offset: 0.21
+  ```
+
+  `offset` is where the first downbeat sits inside the file, for a track that
+  does not open on one; any downbeat will do, since it is folded back inside a
+  single beat. **A settings line never reaches the credit** — that is the part
+  worth being careful about, because the credit is copied verbatim into
+  `attribution.txt` and from there into the public post text, so a stray `bpm:`
+  in it would be published as part of somebody's name. A sidecar with no
+  settings line is read exactly as it always was. `MUSIC_BPM` is the fallback
+  for a track with none of its own, and a tempo outside 30-300 is treated as a
+  typo and dropped with a warning rather than believed.
 
 A track that ffmpeg cannot read is dropped with a warning rather than failing
 the reel, like everything else here.

@@ -99,6 +99,34 @@ CUE_LINGER_SECONDS = 0.25
 #: Word endings that close a cue even when it is still under the word limit.
 _SENTENCE_END = re.compile(r"[.!?][\"')\]]*$")
 
+#: What makes a caption word a payoff rather than a connective. Numbers are
+#: the whole of it, and they are almost never digits: step 2's prompt says to
+#: "write numbers and symbols the way they should be said aloud", so the
+#: narration says "ninety-five percent" and the captions carry the words.
+#: Measured over every script in output/scripts/ - twelve reels, 39 digit
+#: characters in total, against "quadrillion", "ninety-five", "thousand",
+#: "eleven" and the rest spelled out. A digit-only test would fire on nothing.
+#:
+#: Deliberately a second, smaller copy of the vocabulary in script_gen.py
+#: rather than an import of it. That one folds number words onto their digits
+#: for the structure pass's restatement detector, where the folding is load
+#: bearing and was a real bug when it was missing; this one decides what colour
+#: a word is drawn in. Sharing them would mean a retune of the structure pass
+#: silently restyling the captions.
+_PAYOFF_NUMBER_WORDS = frozenset("""
+    zero one two three four five six seven eight nine ten
+    eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen
+    twenty thirty forty fifty sixty seventy eighty ninety
+    hundred thousand million billion trillion quadrillion quintillion
+    percent
+""".split())
+
+_PAYOFF_DIGIT_RE = re.compile(r"\d")
+
+#: Punctuation a word may be wearing when it reaches the caption. Stripped
+#: before the payoff test, so "quadrillion." is still a payoff.
+_PAYOFF_STRIP = "\"'“”‘’.,!?;:()[]"
+
 #: A cut may never leave a shot shorter than this, whatever snapping wants.
 #: Well under the pacing curve's fastest opening, so it only ever bites on a
 #: shot that was already too short to see.
@@ -108,6 +136,19 @@ _SNAP_MIN_SHOT_SECONDS = 0.5
 #: it, what looks like a gap between two words is the stop consonant inside one
 #: phrase, and cutting there is no better than cutting mid-word.
 _SNAP_MIN_GAP_SECONDS = 0.06
+
+#: How close to a beat a cut has to be to count as on it, when the finished
+#: timeline is measured back against the grid. One frame at 30fps, rounded up:
+#: the plan stores boundaries to the millisecond and the encode lands them on
+#: whole frames, so exact equality would report a grid nothing sits on.
+_BEAT_TOLERANCE_SECONDS = 0.035
+
+#: How far inside a spoken word a beat has to fall before it is refused as a
+#: landing. A beat on the attack of a word is the fallback `_snap_boundaries`
+#: already reaches for by choice; a beat in the middle of one is the mid-word
+#: cut that snapping exists to prevent, and the music does not get to override
+#: that.
+_BEAT_WORD_TOLERANCE = 0.04
 
 #: How much bigger than the output frame a moving shot is scaled before
 #: zoompan sees it. zoompan quantises its zoom to whole input pixels, so the
@@ -158,8 +199,13 @@ _COVER_SHOT_POSITION = 0.45
 _COVER_EDGE_SECONDS = 0.25
 
 #: Bumped to 2 when the cover frame was added - steps 6 and 9 read this file,
-#: and version 1 has no `cover` in it.
-ASSEMBLY_VERSION = 2
+#: and version 1 has no `cover` in it. Bumped to 3 for the beat grid and the
+#: caption pop: `music` gained `bpm`/`beat_offset`, `stats` gained
+#: `cuts_on_beat` and `captions` gained `pop`/`payoff_words`. Additive, so
+#: nothing downstream had to change - but step 9 correlates on these, and a
+#: version 2 file having none of them is the difference between "zero" and
+#: "not measured".
+ASSEMBLY_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -773,7 +819,75 @@ def _nearest_within(points: list[float], target: float,
     return best
 
 
-def _snap_boundaries(plan: list[dict], words: list[dict]) -> int:
+def _spoken_spans(words: list[dict]) -> list[tuple[float, float]]:
+    """When the voice is actually making a sound, as (start, end) pairs."""
+    spans = []
+    for word in words:
+        try:
+            spans.append((float(word["start"]), float(word["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return spans
+
+
+def _snap_to_beats(plan: list[dict], beats: list[float],
+                   words: list[dict]) -> list[int]:
+    """Put the opening cuts on the music's beat grid.
+
+    Returns the boundary indices it pinned. `_snap_boundaries` is given those
+    to leave alone: run afterwards without them, the word pass would pull every
+    cut straight back off the grid and whichever pass ran last would be the
+    only one that had done anything.
+
+    Only the opening is governed. MUSIC_FADE_IN_SECONDS has just finished, the
+    narration has not built up and the cutting is at its fastest, so the bed is
+    as audible as it will ever be; past SHOT_BEAT_WINDOW_SECONDS it has settled
+    under the voice and cutting to a tempo nobody is listening for buys nothing.
+
+    A beat that falls inside a spoken word is refused. A cut in the middle of a
+    word is the defect `_snap_boundaries` exists to prevent, and the music does
+    not get to override that - the boundary falls through to the word pass
+    instead, which is the same place it would have gone with no music at all.
+    """
+    if len(plan) < 2 or not beats:
+        return []
+
+    limit = max(0.0, config.SHOT_BEAT_MAX_SECONDS)
+    window = max(0.0, config.SHOT_BEAT_WINDOW_SECONDS)
+    if limit <= 0 or window <= 0:
+        return []
+
+    spans = _spoken_spans(words)
+    clear = [
+        beat for beat in beats
+        if not any(start + _BEAT_WORD_TOLERANCE < beat < end - _BEAT_WORD_TOLERANCE
+                   for start, end in spans)
+    ]
+    if not clear:
+        return []
+
+    pinned: list[int] = []
+    for index in range(1, len(plan)):
+        boundary = plan[index]["start"]
+        if boundary > window:
+            break
+        lower = max(plan[index - 1]["start"] + _SNAP_MIN_SHOT_SECONDS,
+                    boundary - limit)
+        upper = min(plan[index]["end"] - _SNAP_MIN_SHOT_SECONDS,
+                    boundary + limit)
+        if upper <= lower:
+            continue
+
+        landing = _nearest_within(clear, boundary, lower, upper)
+        if landing is None:
+            continue
+        plan[index - 1]["end"] = plan[index]["start"] = round(landing, 3)
+        pinned.append(index)
+    return pinned
+
+
+def _snap_boundaries(plan: list[dict], words: list[dict],
+                     skip: list[int] | tuple[int, ...] = ()) -> int:
     """Nudge each cut onto the nearest word boundary. Returns how many moved.
 
     Step 5 already knows when every word is spoken, because it aligns the
@@ -788,6 +902,10 @@ def _snap_boundaries(plan: list[dict], words: list[dict]) -> int:
     shots it separates at least _SNAP_MIN_SHOT_SECONDS long, so a nudge can
     never collapse a shot, and boundaries are walked in order so a moved cut
     becomes the floor for the next one.
+
+    `skip` is the boundaries `_snap_to_beats` has already placed on the music.
+    They are left exactly where they are - moving one onto a nearer pause is
+    the same as taking it off the beat.
     """
     if len(plan) < 2 or not words:
         return 0
@@ -800,8 +918,11 @@ def _snap_boundaries(plan: list[dict], words: list[dict]) -> int:
     if limit <= 0:
         return 0
 
+    pinned = set(skip)
     moved = 0
     for index in range(1, len(plan)):
+        if index in pinned:
+            continue            # the music has this one; see _snap_to_beats
         boundary = plan[index]["start"]
         lower = max(plan[index - 1]["start"] + _SNAP_MIN_SHOT_SECONDS,
                     boundary - limit)
@@ -824,7 +945,9 @@ def _snap_boundaries(plan: list[dict], words: list[dict]) -> int:
 
 def plan_timeline(manifest: dict, audio_duration: float,
                   probes: dict[int, dict],
-                  words: list[dict] | None = None) -> tuple[list[Shot], list[str]]:
+                  words: list[dict] | None = None,
+                  beats: list[float] | None = None,
+                  ) -> tuple[list[Shot], list[str]]:
     """Lay step 4's assets out across the narration.
 
     Beat order and beat timings are taken as given; the decisions made here are
@@ -841,6 +964,10 @@ def plan_timeline(manifest: dict, audio_duration: float,
         words: aligned narration, for snapping cuts to word boundaries. Without
             it the cuts fall where the arithmetic put them, which is what
             happens when captions are off and SHOT_SNAP_TO_WORDS is not set.
+        beats: the music bed's beat grid, from `beat_grid`, for putting the
+            opening cuts on the tempo. Empty or absent - a reel with no music,
+            or a track with no BPM written beside it - and the words take every
+            cut, which is what every reel before SHOT_SNAP_TO_BEAT did.
     """
     warnings: list[str] = []
     assets = manifest["assets"]
@@ -906,10 +1033,17 @@ def plan_timeline(manifest: dict, audio_duration: float,
                 "repeat": repeat,
             })
 
-    # --- pass 2: put the cuts on word boundaries ---------------------------
+    # --- pass 2: put the cuts where they will be heard ---------------------
+    # The beat grid claims the opening cuts first and the words take what is
+    # left. The other order does not work: the word pass would find a nearer
+    # pause for every cut the music had just placed, and the grid would end up
+    # having done nothing at all.
+    on_beat: list[int] = []
+    if beats and config.SHOT_SNAP_TO_BEAT:
+        on_beat = _snap_to_beats(plan, list(beats), words or [])
     snapped = 0
     if words and config.SHOT_SNAP_TO_WORDS:
-        snapped = _snap_boundaries(plan, words)
+        snapped = _snap_boundaries(plan, words, skip=on_beat)
 
     # --- pass 3: decide how each shot is played ----------------------------
     shots: list[Shot] = []
@@ -957,6 +1091,11 @@ def plan_timeline(manifest: dict, audio_duration: float,
         shots[-1].duration = round(total - shots[-1].start, 3)
     _plan_motion(shots)
 
+    if on_beat:
+        warnings.append(
+            f"{len(on_beat)} of the opening cuts were placed on the music's "
+            f"beat grid (the first {config.SHOT_BEAT_WINDOW_SECONDS:g}s)"
+        )
     if snapped:
         warnings.append(
             f"{snapped} of {len(plan) - 1} cuts were nudged onto a word "
@@ -1287,10 +1426,104 @@ def _ass_inline_colour(value: str) -> str:
     return "{\\c&H" + _ass_colour(value)[4:] + "&}"
 
 
+def _is_payoff_word(text: str) -> bool:
+    """Is this the word the sentence was built to deliver?
+
+    True for anything carrying a quantity - a digit, a number word, or a
+    hyphenated compound of them ("ninety-five"). Everything else is a
+    connective, and colouring connectives is how a highlight stops meaning
+    anything. See _PAYOFF_NUMBER_WORDS for why digits alone are not enough.
+    """
+    clean = (text or "").strip().lower().strip(_PAYOFF_STRIP)
+    if not clean:
+        return False
+    if _PAYOFF_DIGIT_RE.search(clean):
+        return True
+    parts = [part for part in clean.split("-") if part]
+    return bool(parts) and all(part in _PAYOFF_NUMBER_WORDS for part in parts)
+
+
+def _fit_pop_scale(text: str, font_file: Path | None, size: int,
+                   wanted: int) -> int:
+    """The largest pop `text` can take without reflowing onto another line.
+
+    Scaling happens after libass has decided where the line breaks go, so a cue
+    already filling the frame wraps for the length of the pop and snaps back.
+    Measured on the salt reel at 112%: "50 QUADRILLION TONS" measures 872px of
+    a 900px line at rest, goes to three rows at 1.30s and back to one at 1.40s,
+    which reads as a rendering fault rather than as emphasis.
+
+    Cues with room pop the full amount and the ones filling the frame pop less,
+    or not at all. Capping is the only fix that costs nothing: fitting every cue
+    to its popped size instead would shrink every caption in the reel by a
+    tenth, permanently, for the sake of 90 milliseconds.
+    """
+    if wanted <= 100:
+        return 100
+    ink = 2 * config.CAPTION_OUTLINE_WIDTH + config.CAPTION_SHADOW_DEPTH
+    usable = CAPTION_REFERENCE_WIDTH - 2 * config.CAPTION_MARGIN_H - ink
+    width = _text_width(text, font_file, size)
+    if width <= 0 or usable <= 0:
+        return wanted
+    return max(100, min(wanted, int(100 * usable / width)))
+
+
+def _pop_tag(scale: int) -> str:
+    """The transform that lands a cue oversized and settles it to 100%.
+
+    `\\t(0,ms,...)` is timed from the start of the dialogue line it sits on, and
+    every line here starts when its own segment does - so the pop rides the
+    moment the text appears without anything having to know the cue's clock.
+
+    Returns "" when there is nothing to draw, which is what keeps the ASS of a
+    reel with CAPTION_POP off byte-for-byte what it always was.
+    """
+    if not config.CAPTION_POP or config.CAPTION_POP_MS <= 0:
+        return ""
+    if scale <= 100:
+        return ""
+    return (f"\\fscx{scale}\\fscy{scale}"
+            f"\\t(0,{int(config.CAPTION_POP_MS)},\\fscx100\\fscy100)")
+
+
+def _ass_override(size: int, *tags: str) -> str:
+    """The single brace block a dialogue line opens with.
+
+    One block rather than several: libass reads `{\\fs90}{\\fscx112}` and
+    `{\\fs90\\fscx112}` the same way, but this file is read by people too and a
+    line opening with three separate overrides is harder to check by eye.
+
+    Empty when there is nothing to override - which is what keeps a reel with
+    CAPTION_POP off and no oversized cue byte-for-byte what it always was.
+    """
+    parts = [f"\\fs{size}"] if size != config.CAPTION_FONT_SIZE else []
+    parts += [tag for tag in tags if tag]
+    return "{" + "".join(parts) + "}" if parts else ""
+
+
 def _ass_escape(text: str) -> str:
     """Keep caption text from being read as ASS markup."""
     return (text.replace("\\", "").replace("{", "(").replace("}", ")")
                 .replace("\n", " ").strip())
+
+
+def _text_width(text: str, font_file: Path | None, size: int) -> float:
+    """How wide `text` renders at `size`, in 1080x1920 caption pixels."""
+    if font_file is not None:
+        try:
+            from PIL import ImageFont
+
+            face = ImageFont.truetype(str(font_file), size)
+            ascent, descent = face.getmetrics()
+            # libass asks FreeType for a *real dimension* size: the number it is
+            # given is ascender-to-descender, not the em square Pillow measures
+            # against. Without this correction a heavy face like Arial Black
+            # measures ~40% wider than it renders, and every cue would shrink
+            # itself away from a frame edge it was never going to touch.
+            return face.getlength(text) * size / max(1, ascent + descent)
+        except Exception:
+            pass
+    return len(text) * size * 0.55   # no readable font file: assume a wide face
 
 
 def _fit_font_size(text: str, font_file: Path | None, *, base: int,
@@ -1309,24 +1542,7 @@ def _fit_font_size(text: str, font_file: Path | None, *, base: int,
     if usable <= 0 or not text:
         return base
 
-    width = 0.0
-    if font_file is not None:
-        try:
-            from PIL import ImageFont
-
-            face = ImageFont.truetype(str(font_file), base)
-            ascent, descent = face.getmetrics()
-            # libass asks FreeType for a *real dimension* size: the number it is
-            # given is ascender-to-descender, not the em square Pillow measures
-            # against. Without this correction a heavy face like Arial Black
-            # measures ~40% wider than it renders, and every cue would shrink
-            # itself away from a frame edge it was never going to touch.
-            width = face.getlength(text) * base / max(1, ascent + descent)
-        except Exception:
-            width = 0.0
-    if not width:  # no readable font file: assume a wide display face
-        width = len(text) * base * 0.55
-
+    width = _text_width(text, font_file, base)
     if width <= usable:
         return base
     return max(24, int(base * usable / width))
@@ -1421,6 +1637,7 @@ def build_ass(cues: list[Cue], font_name: str, font_file: Path | None, *,
     outline = _ass_colour(config.CAPTION_OUTLINE_COLOR)
     primary_inline = _ass_inline_colour(config.CAPTION_PRIMARY_COLOR)
     highlight_inline = _ass_inline_colour(config.CAPTION_HIGHLIGHT_COLOR)
+    payoff_inline = _ass_inline_colour(config.CAPTION_PAYOFF_COLOR)
 
     header = [
         "[Script Info]",
@@ -1467,14 +1684,27 @@ def build_ass(cues: list[Cue], font_name: str, font_file: Path | None, *,
 
         joined = " ".join(spoken)
         size = _cue_font_size(joined, font_file)
-        prefix = f"{{\\fs{size}}}" if size != config.CAPTION_FONT_SIZE else ""
+        payoff = [_is_payoff_word(word) for word in spoken]
+        # Capped per cue: how much room a pop has is a property of this line's
+        # text at this line's size, not of the reel.
+        entry_pop = _pop_tag(_fit_pop_scale(joined, font_file, size,
+                                            config.CAPTION_POP_SCALE))
+        payoff_pop = _pop_tag(_fit_pop_scale(joined, font_file, size,
+                                             config.CAPTION_PAYOFF_SCALE))
 
         if config.CAPTION_STYLE != "highlight" or len(spoken) == 1:
-            body = joined if config.CAPTION_STYLE != "highlight" else (
-                f"{highlight_inline}{joined}{primary_inline}"
-            )
+            if config.CAPTION_STYLE != "highlight":
+                # "plain" means one colour for the whole cue, so the payoff
+                # word gets the pop and not the tint - a second colour here
+                # would make that setting a lie.
+                body, pop = joined, entry_pop
+            else:
+                tint = payoff_inline if payoff[0] else highlight_inline
+                body = f"{tint}{joined}{primary_inline}"
+                pop = payoff_pop if payoff[0] else entry_pop
             lines.append(f"Dialogue: 0,{_ass_time(cue.start)},"
-                         f"{_ass_time(cue.end)},Reel,,0,0,0,,{prefix}{body}")
+                         f"{_ass_time(cue.end)},Reel,,0,0,0,,"
+                         f"{_ass_override(size, pop)}{body}")
             continue
 
         # Segment boundaries: the cue opens on its first word, and each later
@@ -1488,15 +1718,32 @@ def build_ass(cues: list[Cue], font_name: str, font_file: Path | None, *,
             points = [cue.start + span * i / len(spoken)
                       for i in range(len(spoken) + 1)]
 
+        # A pop never interrupts a pop. Two accents inside one settle read as
+        # a wobble rather than as two words being made, and "ninety-five
+        # percent" - two payoff words in a row, often under 200ms apart - is
+        # exactly the case that produces it. Same reasoning as
+        # SFX_MIN_GAP_SECONDS: the effect is cheap and easy to overdo.
+        settled = -1.0
         for position, _word in enumerate(spoken):
             tinted = " ".join(
-                f"{highlight_inline}{token}{primary_inline}"
+                f"{payoff_inline if payoff[index] else highlight_inline}"
+                f"{token}{primary_inline}"
                 if index == position else token
                 for index, token in enumerate(spoken)
             )
+            # The cue pops as it lands, and a payoff word pops again - harder -
+            # as it is spoken. Both can be true of the first word; the payoff is
+            # the louder claim, so it takes the line.
+            pop = (payoff_pop if payoff[position]
+                   else entry_pop if position == 0 else "")
+            if pop and points[position] < settled:
+                pop = ""
+            elif pop:
+                settled = points[position] + config.CAPTION_POP_MS / 1000.0
             lines.append(
                 f"Dialogue: 0,{_ass_time(points[position])},"
-                f"{_ass_time(points[position + 1])},Reel,,0,0,0,,{prefix}{tinted}"
+                f"{_ass_time(points[position + 1])},Reel,,0,0,0,,"
+                f"{_ass_override(size, pop)}{tinted}"
             )
 
     return "\n".join(header + lines) + "\n"
@@ -2215,6 +2462,8 @@ class Track:
     credit: str = ""
     credit_required: bool = False
     duration: float = 0.0
+    bpm: float = 0.0
+    beat_offset: float = 0.0
 
     @property
     def name(self) -> str:
@@ -2229,25 +2478,76 @@ class Track:
             "credit_required": self.credit_required,
             "loudness_target": config.MUSIC_LOUDNESS_TARGET,
             "ducking": bool(config.MUSIC_DUCKING),
+            "bpm": self.bpm,
+            "beat_offset": self.beat_offset,
         }
 
 
-def _music_credit(path: Path) -> tuple[str, bool]:
+#: A sidecar line that is a setting rather than a credit. Matched against the
+#: line with its whitespace collapsed, so "bpm: 92", "bpm:92" and "BPM = 92"
+#: are all the same thing and a tab does not defeat it.
+_SIDECAR_META_RE = re.compile(
+    r"^(bpm|beat_offset|offset) ?[:=] ?([0-9]+(?:[.][0-9]+)?)$", re.I
+)
+
+
+def _read_sidecar(path: Path) -> tuple[str, dict[str, float]]:
     """Read `track.txt` beside `track.mp3`, if it is there.
+
+    Returns the credit line and whatever settings were written under it. A
+    sidecar is a credit by default and a settings file only where a line says
+    so, which is what keeps every sidecar written before SHOT_SNAP_TO_BEAT
+    existed reading exactly as it did.
+
+    A `bpm:` line must never reach the credit, and that is the load-bearing
+    half of this function: the credit is copied verbatim into attribution.txt
+    and from there into the public post text by step 6, so a stray setting in
+    it is published as part of somebody's name.
+    """
+    sidecar = path.with_suffix(".txt")
+    if not sidecar.is_file():
+        return "", {}
+    try:
+        text = sidecar.read_text(encoding="utf-8")
+    except OSError:
+        return "", {}
+
+    credit: list[str] = []
+    meta: dict[str, float] = {}
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        if not line:
+            continue
+        found = _SIDECAR_META_RE.match(line)
+        if not found:
+            credit.append(line)
+            continue
+        key = found.group(1).lower()
+        meta["bpm" if key == "bpm" else "beat_offset"] = float(found.group(2))
+    return " ".join(credit), meta
+
+
+def _music_credit(path: Path) -> tuple[str, bool]:
+    """The credit line for a track, and whether it has to be used.
 
     Writing a credit down is taken as saying it has to be used: over-crediting
     costs a line of caption, under-crediting breaches a licence. Same .txt/.json
     sidecar idea step 2 uses for its scripts, one file simpler.
     """
-    sidecar = path.with_suffix(".txt")
-    if not sidecar.is_file():
-        return "", False
-    try:
-        text = sidecar.read_text(encoding="utf-8").strip()
-    except OSError:
-        return "", False
-    line = " ".join(text.split())
-    return line, bool(line)
+    credit, _meta = _read_sidecar(path)
+    return credit, bool(credit)
+
+
+def _music_track(path: Path) -> Track:
+    """A Track built from one file and its sidecar, settings and all."""
+    credit, meta = _read_sidecar(path)
+    return Track(
+        path=path,
+        credit=credit,
+        credit_required=bool(credit),
+        bpm=meta.get("bpm", 0.0),
+        beat_offset=meta.get("beat_offset", 0.0),
+    )
 
 
 def available_tracks() -> list[Track]:
@@ -2260,11 +2560,7 @@ def available_tracks() -> list[Track]:
         entry for entry in sorted(directory.iterdir())
         if entry.is_file() and entry.suffix.lower() in wanted
     ]
-    tracks = []
-    for entry in found:
-        credit, required = _music_credit(entry)
-        tracks.append(Track(path=entry, credit=credit, credit_required=required))
-    return tracks
+    return [_music_track(entry) for entry in found]
 
 
 class MusicLedger:
@@ -2326,8 +2622,7 @@ def _named_track(name: str) -> Track | None:
         path = config.MUSIC_DIR / path
     if not path.is_file():
         return None
-    credit, required = _music_credit(path)
-    return Track(path=path, credit=credit, credit_required=required)
+    return _music_track(path)
 
 
 def resolve_track(music, warnings: list[str]) -> tuple[Track | None,
@@ -2388,7 +2683,59 @@ def prepare_track(track: Track | None, warnings: list[str]) -> Track | None:
         )
         return None
     track.duration = duration
+
+    # The tempo is settled here rather than where the grid is built, so the
+    # track carries the one that was actually used and assembly.json records
+    # it. A track states its own; MUSIC_BPM stands in for one that does not.
+    if not track.bpm and config.MUSIC_BPM:
+        track.bpm = config.MUSIC_BPM
+        track.beat_offset = track.beat_offset or config.MUSIC_BEAT_OFFSET
+
+    # A tempo is typed by hand into a text file, so it is checked like one. A
+    # stray "bpm: 9000" would put a beat every 7ms, which is not a grid - every
+    # cut would find one within a frame and SHOT_SNAP_TO_BEAT would silently
+    # become a no-op that still claimed to have fired.
+    if track.bpm and not (config.MUSIC_BPM_MIN <= track.bpm <= config.MUSIC_BPM_MAX):
+        warnings.append(
+            f"music track {track.name!r} states {track.bpm:g} BPM, outside "
+            f"{config.MUSIC_BPM_MIN:g}-{config.MUSIC_BPM_MAX:g} - the beat grid "
+            f"was left off for this reel"
+        )
+        track.bpm = 0.0
     return track
+
+
+def beat_grid(track: Track | None, total: float) -> list[float]:
+    """Every beat of the bed, in reel time. Empty when there is none to have.
+
+    The track's clock and the reel's are the same one: `_music_chains` feeds
+    the bed in with -stream_loop and trims it from 0, so the file's first
+    sample is the reel's first frame and a beat is just `offset + n / bps`.
+    That is the only reason this can be computed without decoding anything.
+
+    `beat_offset` is where the first downbeat sits inside the file, for a track
+    that does not open on one. It is folded back inside a single beat, so
+    writing the second or the fiftieth downbeat down works as well as the first.
+
+    The tempo is read off the track and nowhere else - `prepare_track` has
+    already settled it, MUSIC_BPM fallback included - so what this builds a
+    grid from is exactly what assembly.json says it did.
+    """
+    if track is None or total <= 0:
+        return []
+    bpm = track.bpm
+    if bpm <= 0 or not (config.MUSIC_BPM_MIN <= bpm <= config.MUSIC_BPM_MAX):
+        return []
+
+    step = 60.0 / bpm
+    offset = track.beat_offset % step
+    count = int((total - offset) / step) + 1
+    return [round(offset + index * step, 4) for index in range(max(0, count))]
+
+
+def _on_grid(beats: list[float], at: float) -> bool:
+    """Did this cut land on a beat, measured back against the grid?"""
+    return any(abs(beat - at) <= _BEAT_TOLERANCE_SECONDS for beat in beats)
 
 
 # ---------------------------------------------------------------------------
@@ -2795,13 +3142,19 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         )
         warnings += align_warnings
 
-    shots, plan_warnings = plan_timeline(manifest, narration, probes, words)
-    warnings += plan_warnings
-    total = round(shots[-1].end, 3)
-
-    # --- the music bed -----------------------------------------------------
+    # --- the music bed, ahead of the edit ----------------------------------
+    # Resolved before the timeline for the same reason the word timings are:
+    # SHOT_SNAP_TO_BEAT puts the opening cuts on the bed's beat grid, and which
+    # track is playing is what decides where those beats fall. Nothing is
+    # written to the ledger here - that still waits for a finished encode.
     track, ledger = resolve_track(music, warnings)
     track = prepare_track(track, warnings)
+    beats = beat_grid(track, narration + max(0.0, config.VIDEO_TAIL_SECONDS))
+
+    shots, plan_warnings = plan_timeline(manifest, narration, probes, words,
+                                         beats)
+    warnings += plan_warnings
+    total = round(shots[-1].end, 3)
 
     # --- sound design ------------------------------------------------------
     sfx_library = resolve_sfx(sfx, warnings)
@@ -2823,6 +3176,9 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         "enabled": bool(use_captions), "backend": None, "cues": 0, "words": 0,
         "loss": None, "font": None, "style": config.CAPTION_STYLE,
         "ass_path": None, "srt_path": None, "alignment_path": None,
+        "pop": (f"{config.CAPTION_POP_SCALE}% over {config.CAPTION_POP_MS}ms"
+                if config.CAPTION_POP else None),
+        "payoff_words": 0,
     }
     ass_path: Path | None = None
     fonts_dir: Path | None = None
@@ -2866,6 +3222,12 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             "loss": round(loss, 4) if loss else loss,
             "srt_path": str(srt_path.resolve()),
             "alignment_path": str(alignment_path.resolve()),
+            # Counted rather than styled-and-forgotten: how often a reel has a
+            # number to make is the only thing that says whether the payoff
+            # colour is doing anything, and step 9 can only correlate what got
+            # written down.
+            "payoff_words": sum(1 for cue in cues for word in cue.words
+                                if _is_payoff_word(word["text"])),
         })
 
     # --- the cover frame ---------------------------------------------------
@@ -2975,6 +3337,8 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             "mean_shot_seconds": round(total / len(shots), 2) if shots else 0.0,
             "first_shot_seconds": shots[0].duration if shots else 0.0,
             "sfx_cues": len(sfx_cues),
+            "cuts_on_beat": sum(1 for shot in shots[1:]
+                                if _on_grid(beats, shot.start)),
             "file_bytes": video_path.stat().st_size if video_path.is_file() else 0,
         },
     }
@@ -3011,10 +3375,15 @@ def _print_result(assembly: dict) -> None:
         print(f"HOOK    : \"{card['text']}\" for {card['seconds']:g}s "
               f"(from {card['source']})")
     if captions["enabled"]:
+        payoffs = captions.get("payoff_words") or 0
         print(f"CAPTIONS: {captions['cues']} cues from {captions['words']} words "
               f"via {captions['backend']}"
               + (f" (loss {captions['loss']})" if captions["loss"] else "")
               + f", {captions['font']} {captions['style']}")
+        if captions.get("pop") or payoffs:
+            print(f"          pop {captions.get('pop') or 'off'}"
+                  + (f", {payoffs} payoff word(s) in "
+                     f"{config.CAPTION_PAYOFF_COLOR}" if payoffs else ""))
     else:
         print("CAPTIONS: off")
     music = assembly.get("music")
@@ -3023,6 +3392,15 @@ def _print_result(assembly: dict) -> None:
         print(f"MUSIC   : {music['file']} "
               f"@ {music['loudness_target']:g} LUFS, {duck}"
               + ("  [CREDIT REQUIRED]" if music["credit_required"] else ""))
+        on_beat = stats.get("cuts_on_beat") or 0
+        if music.get("bpm"):
+            print(f"          {music['bpm']:g} BPM"
+                  + (f" (first beat {music['beat_offset']:g}s)"
+                     if music.get("beat_offset") else "")
+                  + f", {on_beat} of {max(0, stats['shots'] - 1)} cuts on the grid")
+        elif config.SHOT_SNAP_TO_BEAT:
+            print(f"          no tempo - add \"bpm: <n>\" to "
+                  f"{Path(music['file']).stem}.txt to cut on the beat")
     else:
         # Only suggest the fix when it is the problem - a run told --no-music
         # does not need to be advised to add music.

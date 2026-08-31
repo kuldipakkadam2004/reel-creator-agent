@@ -16,6 +16,7 @@ The encode itself is checked by running it:
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -116,8 +117,9 @@ def probes_for(manifest: dict, ok: set[int] | None = None) -> dict[int, dict]:
 
 
 def plan(manifest: dict, ok: set[int] | None = None, narration: float = NARRATION,
-         words: list[dict] | None = None):
-    return assemble.plan_timeline(manifest, narration, probes_for(manifest, ok), words)
+         words: list[dict] | None = None, beats: list[float] | None = None):
+    return assemble.plan_timeline(manifest, narration, probes_for(manifest, ok),
+                                  words, beats)
 
 
 def words_from(pairs) -> list[dict]:
@@ -476,13 +478,19 @@ def test_braces_and_backslashes_cannot_escape_into_ass_markup():
     assert "(" in events[0]
 
 
+#: A font-size override and nothing else - "\\fs" on its own also matches
+#: the "\\fscx" of the caption pop, which is a different tag.
+FONT_SIZE_TAG = re.compile(r"\\fs\d")
+
+
 def test_a_cue_too_wide_for_the_frame_is_scaled_down():
     wide = Cue(words_from([("SUPERCALIFRAGILISTICEXPIALIDOCIOUS", 0.0, 1.0)]),
                0.0, 1.0)
-    assert "\\fs" in assemble.build_ass([wide], "Arial Black", None)
+    assert FONT_SIZE_TAG.search(assemble.build_ass([wide], "Arial Black", None))
 
     narrow = Cue(words_from([("SHORT", 0.0, 1.0)]), 0.0, 1.0)
-    assert "\\fs" not in assemble.build_ass([narrow], "Arial Black", None)
+    assert not FONT_SIZE_TAG.search(
+        assemble.build_ass([narrow], "Arial Black", None))
 
 
 def test_colours_convert_to_ass_bgr_order():
@@ -495,6 +503,111 @@ def test_colours_convert_to_ass_bgr_order():
 def test_a_bad_colour_is_rejected_by_name():
     with pytest.raises(assemble.AssemblyError, match="not a #RRGGBB"):
         assemble._ass_colour("cornflower")
+
+
+# ---------------------------------------------------------------------------
+# Caption pop: a cue arrives, and a payoff word is made
+# ---------------------------------------------------------------------------
+
+def pop_of(line: str) -> str:
+    """The override block a dialogue line opens with, or "" if it has none."""
+    body = line.split(",,0,0,0,,", 1)[1]
+    return body.split("}", 1)[0] + "}" if body.startswith("{") else ""
+
+
+def test_a_cue_lands_oversized_and_settles_to_full_size():
+    cue = Cue(words_from([("salt", 0.0, 0.4), ("water", 0.4, 0.9)]), 0.0, 0.9)
+    first = ass_events(assemble.build_ass([cue], "Arial Black", None))[0]
+
+    assert f"\\fscx{config.CAPTION_POP_SCALE}" in pop_of(first)
+    assert f"\\t(0,{config.CAPTION_POP_MS},\\fscx100\\fscy100)" in pop_of(first)
+
+
+def test_only_the_opening_word_of_a_cue_pops():
+    """The pop marks the cue arriving. Popping on every word is an animation."""
+    cue = Cue(words_from([("deep", 0.0, 0.4), ("dark", 0.4, 0.8),
+                          ("cold", 0.8, 1.2)]), 0.0, 1.2)
+    events = ass_events(assemble.build_ass([cue], "Arial Black", None))
+
+    assert "\\fscx" in pop_of(events[0])
+    assert all("\\fscx" not in pop_of(line) for line in events[1:])
+
+
+def test_the_payoff_word_gets_its_own_colour_and_a_harder_pop():
+    cue = Cue(words_from([("it", 0.0, 0.4), ("is", 0.6, 1.2),
+                          ("fifty", 1.4, 1.9)]), 0.0, 1.9)
+    events = ass_events(assemble.build_ass([cue], "Arial Black", None))
+    payoff_tint = assemble._ass_inline_colour(config.CAPTION_PAYOFF_COLOR)
+    highlight_tint = assemble._ass_inline_colour(config.CAPTION_HIGHLIGHT_COLOR)
+
+    assert highlight_tint in events[0], "a connective keeps the ordinary tint"
+    assert payoff_tint in events[2], "a spelled-out number is a payoff"
+    assert f"\\fscx{config.CAPTION_PAYOFF_SCALE}" in pop_of(events[2])
+    assert f"\\fscx{config.CAPTION_POP_SCALE}" in pop_of(events[0])
+
+
+def test_a_cue_that_already_fills_the_line_is_not_popped():
+    """Scaling happens after the line breaks are decided, so popping a cue with
+    no room left wraps it for 90ms and snaps it back - a rendering fault, not
+    emphasis. Measured on the salt reel: "50 QUADRILLION TONS" went to three
+    rows at 1.30s and back to one at 1.40s."""
+    full = Cue(words_from([("about", 0.0, 0.4), ("ninety-five", 0.6, 1.2),
+                           ("percent", 1.4, 1.9)]), 0.0, 1.9)
+    events = ass_events(assemble.build_ass([full], "Arial Black", None))
+
+    assert all("\\fscx" not in pop_of(line) for line in events)
+
+
+def test_the_cap_is_taken_from_the_room_the_cue_actually_has():
+    """A short cue keeps the full pop; a wide one gets whatever is left."""
+    assert assemble._fit_pop_scale("NO", None, 96, 112) == 112
+    assert assemble._fit_pop_scale("W" * 40, None, 96, 112) == 100
+    # ...and never below 100, which would shrink the text instead of popping it.
+    assert assemble._fit_pop_scale("W" * 200, None, 96, 124) == 100
+
+
+def test_a_payoff_pop_never_interrupts_the_one_before_it(monkeypatch):
+    """"Ninety-five percent" is two payoffs a breath apart, and two accents
+    inside one settle read as a wobble rather than as two words being made."""
+    monkeypatch.setattr(config, "CAPTION_POP_MS", 90)
+    cue = Cue(words_from([("ninety-five", 0.0, 0.05), ("percent", 0.05, 0.4),
+                          ("unexplored", 0.4, 1.1)]), 0.0, 1.1)
+    events = ass_events(assemble.build_ass([cue], "Arial Black", None))
+    payoff_tint = assemble._ass_inline_colour(config.CAPTION_PAYOFF_COLOR)
+
+    assert "\\fscx" in pop_of(events[0])
+    assert "\\fscx" not in pop_of(events[1]), "0.05s in, the first pop is still running"
+    assert payoff_tint in events[1], "but it is still the payoff colour"
+
+
+def test_digits_are_a_payoff_and_ordinary_words_are_not():
+    """Step 2 is told to write numbers as they are said, so the captions carry
+    words far more often than digits - but both have to count."""
+    for word in ("95%", "200", "ninety-five", "Quadrillion", "percent."):
+        assert assemble._is_payoff_word(word), word
+    for word in ("ocean", "the", "half", "deep-sea", ""):
+        assert not assemble._is_payoff_word(word), word
+
+
+def test_plain_style_pops_the_cue_and_tints_nothing(monkeypatch):
+    """One colour for the whole cue is what "plain" means; a payoff tint in it
+    would make the setting a lie."""
+    monkeypatch.setattr(config, "CAPTION_STYLE", "plain")
+    cue = Cue(words_from([("fifty", 0.0, 0.4), ("tons", 0.4, 0.9)]), 0.0, 0.9)
+    events = ass_events(assemble.build_ass([cue], "Arial Black", None))
+
+    assert len(events) == 1
+    assert "\\fscx" in pop_of(events[0])
+    assert "{\\c&H" not in events[0]
+
+
+def test_pop_off_leaves_no_transform_in_the_file(monkeypatch):
+    monkeypatch.setattr(config, "CAPTION_POP", False)
+    cue = Cue(words_from([("fifty", 0.0, 0.4), ("tons", 0.4, 0.9)]), 0.0, 0.9)
+    body = assemble.build_ass([cue], "Arial Black", None)
+
+    assert "\\fscx" not in body and "\\t(" not in body
+    assert assemble._ass_inline_colour(config.CAPTION_PAYOFF_COLOR) in body,         "the payoff colour is a separate look, disabled separately"
 
 
 def test_srt_is_written_in_srt_time_format():
@@ -1215,6 +1328,189 @@ def test_a_snapped_shot_still_decides_looping_from_its_final_length():
     for shot_ in shots:
         if not shot_.looped:
             assert shot_.source_start + shot_.duration <= 7.0 + 0.05
+
+
+# ---------------------------------------------------------------------------
+# The beat grid: the opening cuts belong to the music
+# ---------------------------------------------------------------------------
+
+def test_a_bpm_line_is_read_as_a_setting_and_never_as_a_credit(music_dir):
+    """The load-bearing half. The credit is copied verbatim into
+    attribution.txt and from there into the public post text by step 6, so a
+    setting left in it is published as part of somebody's name."""
+    track_file(music_dir, "a.mp3",
+               credit='"Autumn prelude" by zero-project (CC BY 3.0)\nbpm: 92\n')
+    track = assemble.available_tracks()[0]
+
+    assert track.credit == '"Autumn prelude" by zero-project (CC BY 3.0)'
+    assert "bpm" not in track.credit.lower()
+    assert track.bpm == 92.0
+    assert track.credit_required is True
+
+
+def test_a_sidecar_with_no_settings_reads_exactly_as_it_did(music_dir):
+    track_file(music_dir, "a.mp3", credit='"Night Drive" by A. Composer, CC BY 4.0')
+    track = assemble.available_tracks()[0]
+
+    assert track.credit == '"Night Drive" by A. Composer, CC BY 4.0'
+    assert track.bpm == 0.0 and track.beat_offset == 0.0
+
+
+def test_the_settings_syntax_is_forgiving_about_spacing(music_dir):
+    track_file(music_dir, "a.mp3", credit="Someone\nBPM=128\n  offset : 0.25  \n")
+    track = assemble.available_tracks()[0]
+
+    assert (track.bpm, track.beat_offset) == (128.0, 0.25)
+    assert track.credit == "Someone"
+
+
+def test_the_grid_runs_from_the_reels_first_frame():
+    """The bed is fed in with -stream_loop and trimmed from 0, so the track's
+    first sample is the reel's first frame and beat one is t=0."""
+    track = assemble.Track(path=Path("a.mp3"), bpm=120.0)
+    assert assemble.beat_grid(track, 2.0) == [0.0, 0.5, 1.0, 1.5, 2.0]
+
+
+def test_a_first_downbeat_inside_the_file_shifts_the_whole_grid():
+    track = assemble.Track(path=Path("a.mp3"), bpm=120.0, beat_offset=0.2)
+    assert assemble.beat_grid(track, 1.5) == [0.2, 0.7, 1.2]
+
+
+def test_any_downbeat_will_do_not_only_the_first():
+    """0.2 and 1.7 are the same downbeat three beats apart at 120 BPM."""
+    early = assemble.Track(path=Path("a.mp3"), bpm=120.0, beat_offset=0.2)
+    late = assemble.Track(path=Path("a.mp3"), bpm=120.0, beat_offset=1.7)
+    assert assemble.beat_grid(early, 3.0) == assemble.beat_grid(late, 3.0)
+
+
+def test_a_track_with_no_tempo_written_down_has_no_grid():
+    assert assemble.beat_grid(assemble.Track(path=Path("a.mp3")), 30.0) == []
+    assert assemble.beat_grid(None, 30.0) == []
+
+
+def test_music_bpm_stands_in_for_a_track_with_no_sidecar(music_dir, monkeypatch):
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 60.0)
+    monkeypatch.setattr(config, "MUSIC_BPM", 120.0)
+    track_file(music_dir, "a.mp3")
+    track = assemble.prepare_track(assemble.available_tracks()[0], [])
+
+    assert track.bpm == 120.0, "the track carries the tempo that was used"
+    assert assemble.beat_grid(track, 1.0) == [0.0, 0.5, 1.0]
+
+
+def test_a_track_states_its_own_tempo_over_the_fallback(music_dir, monkeypatch):
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 60.0)
+    monkeypatch.setattr(config, "MUSIC_BPM", 120.0)
+    track_file(music_dir, "a.mp3", credit="Someone\nbpm: 60\n")
+    track = assemble.prepare_track(assemble.available_tracks()[0], [])
+
+    assert track.bpm == 60.0
+    assert assemble.beat_grid(track, 1.0) == [0.0, 1.0]
+
+
+def test_an_implausible_tempo_is_refused_with_a_warning(music_dir, monkeypatch):
+    """A tempo is typed by hand into a text file, so it is checked like one."""
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 60.0)
+    track_file(music_dir, "a.mp3", credit="Someone\nbpm: 9000\n")
+    warnings = []
+    track = assemble.prepare_track(assemble.available_tracks()[0], warnings)
+
+    assert track is not None, "a bad tempo must not cost the reel its music"
+    assert track.bpm == 0.0
+    assert any("9000 BPM" in warning for warning in warnings)
+    assert assemble.beat_grid(track, 10.0) == []
+
+
+def test_an_opening_cut_is_placed_on_the_beat():
+    plan_rows = [{"start": 0.0, "end": 3.2}, {"start": 3.2, "end": 7.0}]
+    beats = assemble.beat_grid(assemble.Track(path=Path("a.mp3"), bpm=120.0), 8.0)
+
+    assert assemble._snap_to_beats(plan_rows, beats, []) == [1]
+    assert plan_rows[0]["end"] == pytest.approx(3.0, abs=0.001)
+    assert plan_rows[1]["start"] == plan_rows[0]["end"]
+
+
+def test_a_beat_in_the_middle_of_a_word_is_refused(monkeypatch):
+    """Cutting mid-word is the defect snapping exists to prevent, and the music
+    does not get to override it - the boundary falls through to the words."""
+    monkeypatch.setattr(config, "SHOT_BEAT_MAX_SECONDS", 0.25)
+    words = words_from([("darkness", 2.9, 3.1)])
+    plan_rows = [{"start": 0.0, "end": 3.2}, {"start": 3.2, "end": 7.0}]
+    beats = assemble.beat_grid(assemble.Track(path=Path("a.mp3"), bpm=120.0), 8.0)
+
+    assert assemble._snap_to_beats(plan_rows, beats, words) == []
+    assert plan_rows[0]["end"] == 3.2, "left exactly where it was"
+
+
+def test_a_beat_on_the_attack_of_a_word_is_a_fine_landing(monkeypatch):
+    """A cut on the first frame of a word is the fallback `_snap_boundaries`
+    already reaches for by choice; only the middle of one is out."""
+    monkeypatch.setattr(config, "SHOT_BEAT_MAX_SECONDS", 0.25)
+    words = words_from([("darkness", 3.0, 3.6)])
+    plan_rows = [{"start": 0.0, "end": 3.2}, {"start": 3.2, "end": 7.0}]
+    beats = assemble.beat_grid(assemble.Track(path=Path("a.mp3"), bpm=120.0), 8.0)
+
+    assert assemble._snap_to_beats(plan_rows, beats, words) == [1]
+    assert plan_rows[0]["end"] == pytest.approx(3.0, abs=0.001)
+
+
+def test_cuts_past_the_window_are_left_to_the_words(monkeypatch):
+    monkeypatch.setattr(config, "SHOT_BEAT_WINDOW_SECONDS", 8.0)
+    plan_rows = [{"start": 0.0, "end": 12.2}, {"start": 12.2, "end": 16.0}]
+    beats = assemble.beat_grid(assemble.Track(path=Path("a.mp3"), bpm=120.0), 20.0)
+
+    assert assemble._snap_to_beats(plan_rows, beats, []) == []
+    assert plan_rows[0]["end"] == 12.2
+
+
+def test_the_word_pass_leaves_a_beat_snapped_cut_alone():
+    """Moving it onto a nearer pause is the same as taking it off the beat."""
+    words = words_from([("total", 2.0, 2.6), ("darkness", 2.8, 3.4)])
+    plan_rows = [{"start": 0.0, "end": 3.0}, {"start": 3.0, "end": 6.0}]
+
+    assert assemble._snap_boundaries(plan_rows, words, skip=[1]) == 0
+    assert plan_rows[0]["end"] == 3.0
+
+
+def test_no_grid_plans_the_timeline_exactly_as_it_always_did():
+    manifest = make_manifest()
+    words = words_from([(f"w{i}", i * 0.4, i * 0.4 + 0.25) for i in range(110)])
+
+    without = [(s.start, s.duration) for s in plan(manifest, words=words)[0]]
+    empty = [(s.start, s.duration)
+             for s in plan(manifest, words=words, beats=[])[0]]
+    assert without == empty
+
+
+def test_the_beat_pass_runs_before_the_words_and_wins():
+    """Both passes want the same boundaries. Run the other way round, the word
+    pass finds a nearer pause for every cut the music just placed and the grid
+    ends up having done nothing at all."""
+    manifest = make_manifest()
+    words = words_from([(f"w{i}", i * 0.4, i * 0.4 + 0.25) for i in range(110)])
+    beats = assemble.beat_grid(assemble.Track(path=Path("a.mp3"), bpm=120.0),
+                               NARRATION)
+
+    shots, notes = plan(manifest, words=words, beats=beats)
+    opening = [s.start for s in shots[1:]
+               if s.start <= config.SHOT_BEAT_WINDOW_SECONDS]
+
+    assert opening, "the fixture has to cut inside the window for this to mean anything"
+    assert any(assemble._on_grid(beats, start) for start in opening)
+    assert any("beat grid" in note for note in notes)
+
+
+def test_the_grid_is_ignored_when_the_setting_is_off(monkeypatch):
+    manifest = make_manifest()
+    words = words_from([(f"w{i}", i * 0.4, i * 0.4 + 0.25) for i in range(110)])
+    beats = assemble.beat_grid(assemble.Track(path=Path("a.mp3"), bpm=120.0),
+                               NARRATION)
+    without = [(s.start, s.duration) for s in plan(manifest, words=words)[0]]
+
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_BEAT", False)
+    off = [(s.start, s.duration)
+           for s in plan(manifest, words=words, beats=beats)[0]]
+    assert off == without
 
 
 # ---------------------------------------------------------------------------
