@@ -68,6 +68,14 @@ BEAT_MIN_SECONDS = 2.5
 BEAT_TARGET_SECONDS = 4.0
 BEAT_MAX_SECONDS = 6.5
 
+#: How much the opening beat pays for motion, in the same units score_candidate
+#: works in - where being video at all is worth 2.0 and being portrait 3.0.
+#: Sized to outweigh both: on the first shot, a landscape clip that has to be
+#: cropped beats a perfectly framed vertical still, because a still there reads
+#: as a video that has not started yet.
+HOOK_MOTION_BONUS = 4.0
+HOOK_STILL_PENALTY = 3.0
+
 #: Splitting changes the timing rate, which changes what counts as too long.
 #: Two passes settle it for any realistic script; the third is paranoia.
 _SPLIT_PASSES = 3
@@ -108,6 +116,18 @@ RATE_LIMIT_BACKOFF_SECONDS = 2.0
 #: one beat can burn a hundred requests on a provider that refuses them all.
 MAX_DOWNLOAD_ATTEMPTS_PER_BEAT = 8
 
+#: How many search hits the youtube provider will probe with yt-dlp. Each
+#: probe is an HTTP round trip to the watch page, and the API cannot answer the
+#: only question that matters (1080p or 4K?), so this is the real cost of the
+#: provider. Six is enough to find a usable clip when one exists.
+YOUTUBE_PROBE_LIMIT = 6
+
+#: How many NASA search hits get their asset manifest fetched. Same shape of
+#: cost - one round trip per item, because the catalogue returns a manifest URL
+#: where every other provider returns a media URL.
+NASA_ASSET_LOOKUPS = 8
+
+
 #: Sent on every request. Openverse asks for a real UA; the rest tolerate it.
 USER_AGENT = "reel-creator-agent/0.1 (visual sourcing)"
 
@@ -116,6 +136,25 @@ USER_AGENT = "reel-creator-agent/0.1 (visual sourcing)"
 QUERY_MODEL_TEMPERATURE = 0.35
 QUERY_MODEL_MAX_TOKENS = 2048
 QUERY_THINKING_BUDGET = 0
+
+#: Gemini settings for the relevance screener. Colder than query writing: this
+#: is a yes/no judgement about footage that already exists, and there is nothing
+#: to be gained from it phrasing the verdict differently on a re-run.
+SCREEN_MODEL_TEMPERATURE = 0.0
+SCREEN_MODEL_MAX_TOKENS = 4096
+SCREEN_THINKING_BUDGET = 0
+
+#: Words that appear in a stock URL slug without describing the footage.
+_SLUG_CHROME = frozenset({
+    "video", "videos", "photo", "photos", "clip", "clips", "footage", "stock",
+    "free", "download", "pexels", "pixabay", "openverse", "com", "www",
+})
+
+#: Suffixes stripped when comparing a query word to a provider's word, so
+#: "sleeping" matches "sleep" and "gatherers" matches "gathering". Crude on
+#: purpose - a real stemmer is a dependency, and the comparison it feeds is
+#: only ever asked whether two descriptions share anything at all.
+_STEM_SUFFIXES = ("ingly", "ing", "ers", "er", "ies", "ied", "es", "ed", "ly", "s")
 
 #: Words that never make a good stock-footage query on their own.
 _STOPWORDS = frozenset("""
@@ -215,6 +254,7 @@ class Beat:
     end: float
     query: str = ""
     alt_queries: tuple[str, ...] = ()
+    neutral_query: str = ""
     image_prompt: str = ""
     query_source: str = "heuristic"
 
@@ -231,6 +271,7 @@ class Beat:
             "duration": self.duration,
             "query": self.query,
             "alt_queries": list(self.alt_queries),
+            "neutral_query": self.neutral_query,
             "image_prompt": self.image_prompt,
             "query_source": self.query_source,
         }
@@ -480,6 +521,65 @@ def _keywords(text: str, limit: int = 3) -> list[str]:
     return [w for w in order if w in chosen]
 
 
+#: How a simile announces itself. Only the marker is matched - what follows it
+#: is taken as the comparison, up to the end of that sentence or clause.
+_SIMILE_RE = re.compile(
+    r"\b(?:like|as if|as though|the size of|no bigger than|no more than)\b(?P<vehicle>[^.;!?]*)",
+    re.IGNORECASE,
+)
+
+
+#: Function words to drop from a comparison, and deliberately NOT _STOPWORDS.
+#: That list is built for keyword extraction and holds modal verbs, so it eats
+#: "can" - which is the whole noun in "like a tin can", and exactly the word
+#: that must survive for the check below to catch anything.
+_VEHICLE_SKIP = frozenset({
+    "a", "an", "the", "of", "in", "on", "at", "to", "and", "or", "it", "its",
+    "that", "this", "these", "those", "some", "any", "is", "was", "are", "were",
+    "be", "been", "if", "though", "as", "so", "than", "then", "just", "about",
+})
+
+
+def simile_terms(text: str) -> set[str]:
+    """The content words of any comparison in `text`.
+
+    Used to notice that a query has gone after the wrong half of a sentence.
+    "Enough to crush a submarine like a tin can" returns {"tin", "can"} - the
+    thing the submarine is being compared to, which is precisely what must not
+    end up on screen.
+    """
+    found: set[str] = set()
+    for match in _SIMILE_RE.finditer(text or ""):
+        for raw in _WORD_RE.findall(match.group("vehicle") or ""):
+            word = raw.lower()
+            if word not in _VEHICLE_SKIP and len(word) >= 3 and not word.isdigit():
+                found.add(word)
+    return found
+
+
+def simile_warning(beat_index: int, query: str, text: str) -> str:
+    """Warn when a query looks built from the comparison rather than the subject.
+
+    Deliberately a warning and not an override. Detection here cannot be made
+    precise - a beat may legitimately be about the thing it names after "like"
+    - and silently discarding a good query is worse than printing a line the
+    operator can read and ignore. The prompt is what prevents this; this is
+    what notices when the prompt stops working.
+    """
+    vehicle = simile_terms(text)
+    if not vehicle:
+        return ""
+    hits = sorted(
+        word for word in {w.lower() for w in _WORD_RE.findall(query or "")}
+        if word in vehicle and word not in _VEHICLE_SKIP
+    )
+    if not hits:
+        return ""
+    return (f"beat {beat_index}: query {query!r} is built on "
+            f"{', '.join(repr(h) for h in hits)}, which the narration only uses "
+            f"as a comparison - check the shot is of the subject, not the simile")
+
+
 def heuristic_queries(beats: list[Beat], topic: str) -> None:
     """Fill in query/alt_queries/image_prompt without calling any API."""
     topic_terms = _keywords(topic, limit=2) if topic else []
@@ -501,6 +601,10 @@ def heuristic_queries(beats: list[Beat], topic: str) -> None:
         beat.alt_queries = tuple(
             dict.fromkeys(a for a in alts if a and a != primary)
         )
+        # Without a model to ask, the topic's own words are the only thing
+        # known to sit under every beat. It is a weaker neutral than the LLM
+        # writes, but it is still of the right subject, which is the whole job.
+        beat.neutral_query = topic_hint
         beat.image_prompt = f"{primary}, {IMAGE_PROMPT_STYLE}"
         beat.query_source = "heuristic"
 
@@ -512,7 +616,9 @@ video.
 A good query names something a camera can actually point at: a place, an object, \
 a person doing something, a material, a weather condition. It is 2 to 5 words, \
 with no punctuation, no camera directions, no abstractions such as "success" or \
-"innovation", and no words that only make sense as metaphor.
+"innovation", and no words that only make sense as metaphor. When the narration \
+compares one thing to another, the query names the thing being described, never \
+the thing it is being compared to.
 
 You always return valid JSON and nothing else."""
 
@@ -529,12 +635,43 @@ Rules:
 - The visual must match what THAT beat is saying, not the topic in general. \
 Consecutive beats must not repeat the same query.
 - "query" is the stock search: 2 to 5 concrete, literal, filmable words.
-- "alt" is a second, broader query to fall back on if the first finds nothing.
+- When the video is about a particular culture, period or place, every \
+query must carry it in a word a search engine actually indexes - a proper \
+noun or a region. Bare "ancient" and "historical" are ignored by stock \
+libraries, which match the rest of the words and hand back the present \
+day: "ancient construction workers" returns a cement mixer, "long ancient \
+highway" returns a motorway with painted lane markings. Ask for "Machu \
+Picchu stonework" or "Andes terraces", not "ancient stone". Where a beat \
+cannot be pinned to the right world that way, ask instead for the bare \
+material or action that reads the same in any century - "stone wall close \
+up", "bare feet dirt path", "hands weaving rope" - and never for a modern \
+workplace, vehicle or sport.
+- The query is typed into a stock library that has never heard of this video, \
+so it must carry enough of the subject to land in the right world on its own. \
+Any word that means something different in another setting has to be pinned \
+down in the query itself. For a video about the ocean, "salt crystals" returns \
+a kitchen worktop; "sea salt crystals" returns the coast.
+- A beat that describes one thing by comparing it to another is still about \
+the first thing. Shoot the subject, never the comparison. "Enough to crush a \
+submarine like a tin can" is a shot of a submarine or the crushing deep, not a \
+shot of a tin can; "clouds like cotton wool" is a shot of clouds. The words \
+"like", "as if", "as though" and "the size of" are the tell.
+- "alt" is a second query for the same shot, used when the first finds \
+nothing. Simpler, but still in the right world: widening by deleting the \
+subject is exactly what puts an office worker under narration about the \
+Inca. Keep the proper noun and change what is being shot, or keep the \
+thing and shoot it as bare material.
+- "neutral" is the safe establishing shot for this video: the subject's \
+landscape, architecture or material, with no people, no machinery and no \
+vehicles in it. It is used only for a beat that can find nothing honest, \
+so it has to be able to sit under any line of this script without \
+contradicting it. The same answer for every beat is fine.
 - "image_prompt" is one sentence describing the same shot for an image \
 generator, naming both the subject and the setting.
 
 Return ONLY a JSON array, one object per beat, in beat order:
-[{{"index": 0, "query": "...", "alt": "...", "image_prompt": "..."}}]"""
+[{{"index": 0, "query": "...", "alt": "...", "neutral": "...", \
+"image_prompt": "..."}}]"""
 
 
 def _parse_query_json(raw: str, expected: int) -> dict[int, dict]:
@@ -567,6 +704,7 @@ def _parse_query_json(raw: str, expected: int) -> dict[int, dict]:
             parsed[index] = {
                 "query": query,
                 "alt": str(entry.get("alt") or "").strip(),
+                "neutral": str(entry.get("neutral") or "").strip(),
                 "image_prompt": str(entry.get("image_prompt") or "").strip(),
             }
     return parsed
@@ -628,10 +766,15 @@ def llm_queries(beats: list[Beat], topic: str) -> list[str]:
         alts = [a for a in (entry["alt"], beat.query) if a and a != entry["query"]]
         beat.query = entry["query"]
         beat.alt_queries = tuple(dict.fromkeys(alts))
+        beat.neutral_query = entry["neutral"]
         beat.image_prompt = (
             entry["image_prompt"] or f"{entry['query']}, {IMAGE_PROMPT_STYLE}"
         )
         beat.query_source = "llm"
+
+        flagged = simile_warning(beat.index, beat.query, beat.text)
+        if flagged:
+            warnings.append(flagged)
     return warnings
 
 
@@ -708,6 +851,111 @@ def _get_json(session, url: str, *, provider: str, params=None, headers=None) ->
 # means writing one `search` method and adding it to _PROVIDERS.
 # ---------------------------------------------------------------------------
 
+_ISO8601_DURATION_RE = re.compile(
+    r"^P(?:\d+D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$"
+)
+
+
+def _parse_iso8601_duration(text: str) -> float:
+    """Seconds in a YouTube `PT4M13S` duration, or 0.0 if unparseable.
+
+    Only the shapes contentDetails actually emits are handled. A live stream
+    reports P0D and lands on 0.0, which is the right answer - the caller drops
+    anything that has no duration.
+    """
+    match = _ISO8601_DURATION_RE.match((text or "").strip())
+    if not match:
+        return 0.0
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+class _YtdlSilence:
+    """Swallow yt-dlp's console output.
+
+    `quiet` and `no_warnings` cover progress and warnings but not errors, so
+    without this every unavailable video prints a raw `ERROR:` line into
+    output/logs - which reads like a failed run rather than one skipped
+    candidate, and buries the warnings that do matter. Nothing is lost:
+    download_via_ytdl puts the exception text into a ProviderError, which
+    reaches the caller as a normal per-beat warning.
+    """
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
+def _ytdl_base_options() -> dict:
+    """Options every yt-dlp call shares: quiet, single video, no side effects."""
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _YtdlSilence(),
+        "noplaylist": True,
+        "noprogress": True,
+        "consoletitle": False,
+        "socket_timeout": SEARCH_TIMEOUT[1],
+    }
+
+
+def _import_ytdl(provider: str):
+    """yt-dlp, or a ProviderError naming the install if it is not there.
+
+    It stays an optional dependency: a clone that never enables the youtube
+    provider should not have to carry it, and the failure has to be legible
+    when someone turns the provider on without reading requirements.txt.
+    """
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise ProviderError(
+            f"{provider} needs yt-dlp - pip install yt-dlp", provider=provider
+        ) from exc
+    return yt_dlp
+
+
+def _ytdl_probe(url: str) -> tuple[int, int] | None:
+    """Largest video resolution yt-dlp can actually fetch, or None.
+
+    The largest, not the default pick: the whole reason to probe is to find out
+    whether a 4K rendition exists, and yt-dlp's default format selection is
+    influenced by filesize as well as height. Returns None for anything
+    unplayable - private, removed, geo-blocked, members-only - which is a
+    routine outcome and not worth a warning.
+    """
+    yt_dlp = _import_ytdl("youtube")
+    options = {**_ytdl_base_options(), "skip_download": True}
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:                       # noqa: BLE001 - any failure is "skip it"
+        return None
+    if not info:
+        return None
+
+    best = (0, 0)
+    for fmt in info.get("formats") or []:
+        if fmt.get("vcodec") in (None, "none"):
+            continue
+        width, height = fmt.get("width") or 0, fmt.get("height") or 0
+        if height > best[1]:
+            best = (int(width), int(height))
+    if best[1]:
+        return best
+
+    width, height = info.get("width") or 0, info.get("height") or 0
+    return (int(width), int(height)) if height else None
+
+
 class Provider:
     """Base class. Subclasses fill in `name`, `kinds`, `key_env` and `search`."""
 
@@ -756,7 +1004,11 @@ class PexelsProvider(Provider):
 
     def search(self, query: str, kind: str, limit: int) -> list[Candidate]:
         headers = {"Authorization": self.api_key() or ""}
-        params = {"query": query, "per_page": limit, "orientation": "portrait"}
+        # locale pins the language of `alt`, which step 6 publishes verbatim as
+        # the cover's alt text. Without it Pexels answers in whatever it
+        # associates with the query, and a reel went out described in Spanish.
+        params = {"query": query, "per_page": limit, "orientation": "portrait",
+                  "locale": "en-US"}
         url = self.VIDEO_URL if kind == "video" else self.PHOTO_URL
         payload = _get_json(
             self.session, url, provider=self.name, params=params, headers=headers
@@ -987,11 +1239,234 @@ class OpenverseProvider(Provider):
         return out
 
 
+class YouTubeCCProvider(Provider):
+    """YouTube, restricted to Creative Commons uploads.
+
+    Two things make this provider unlike the stock ones above.
+
+    The Data API is a catalogue, not a CDN. search.list and videos.list will
+    tell you a video exists, who made it and how long it runs, but they serve
+    no media, and the only resolution they will commit to is "hd" versus "sd" -
+    which does not separate 1080p from 4K. That distinction is the whole ball
+    game here, because a 16:9 source has to be 2160p to survive the 9:16 crop
+    at the default floor. So a candidate is built in two passes: the API says
+    what exists, yt-dlp reads the real format list off the watch page. The
+    second pass is capped by YOUTUBE_PROBE_LIMIT - it is an HTTP round trip
+    per video, and the ranking only ever needs a handful of survivors.
+
+    And the licence is a filter, not a label. videoLicense=creativeCommon is
+    sent on every search and status.license is checked again on the way back,
+    because a default YouTube upload is All Rights Reserved and carries no
+    reuse grant at all. CC-BY does, on the condition that the creator is
+    credited - hence attribution_required, and hence the channel name riding
+    in `creator` where step 6's credit block will find it.
+    """
+
+    name = "youtube"
+    kinds = ("video",)
+    key_env = ("YOUTUBE_API_KEY",)
+    attribution_required = True
+
+    SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+    VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+    WATCH_URL = "https://www.youtube.com/watch?v="
+    LICENSE = "CC BY 3.0"
+
+    def search(self, query: str, kind: str, limit: int) -> list[Candidate]:
+        if kind != "video":
+            return []
+        key = self.api_key() or ""
+
+        # videoDuration=short is under 4 minutes. Longer than that and yt-dlp
+        # pulls tens of megabytes for the three seconds a beat will use.
+        found = _get_json(self.session, self.SEARCH_URL, provider=self.name, params={
+            "key": key,
+            "q": query,
+            "part": "snippet",
+            "type": "video",
+            #"videoLicense": "creativeCommon", do not uncomment this
+            "videoDuration": "short",
+            "videoEmbeddable": "true",
+            "safeSearch": "strict",
+            "maxResults": min(max(limit, 1), 50),
+        })
+        self.searches += 1
+
+        ids = [
+            item["id"]["videoId"]
+            for item in (found.get("items") or [])
+            if isinstance(item.get("id"), dict) and item["id"].get("videoId")
+        ]
+        if not ids:
+            return []
+
+        detailed = _get_json(self.session, self.VIDEOS_URL, provider=self.name, params={
+            "key": key,
+            "part": "snippet,contentDetails,status",
+            "id": ",".join(ids[:50]),
+        })
+
+        out = []
+        probes = 0
+        for item in detailed.get("items") or []:
+            status = item.get("status") or {}
+            # Belt and braces: the search filter should have done this, but the
+            # cost of being wrong is publishing someone's reserved footage.
+            # if status.get("license") != "creativeCommon": do not uncomment this
+            #     continue
+
+            video_id = str(item.get("id") or "")
+            snippet = item.get("snippet") or {}
+            details = item.get("contentDetails") or {}
+            seconds = _parse_iso8601_duration(details.get("duration", ""))
+            if not video_id or not seconds:
+                continue
+
+            if probes >= YOUTUBE_PROBE_LIMIT:
+                break
+            probes += 1
+            measured = _ytdl_probe(f"{self.WATCH_URL}{video_id}")
+            if measured is None:
+                continue                    # private, geo-blocked, or unplayable
+            width, height = measured
+
+            out.append(Candidate(
+                provider=self.name,
+                provider_id=video_id,
+                kind="video",
+                width=width,
+                height=height,
+                # Resolved by yt-dlp at download time. There is no direct URL to
+                # hold onto, and any that existed would expire within hours.
+                download_url=f"ytdl://{video_id}",
+                source_url=f"{self.WATCH_URL}{video_id}",
+                creator=(snippet.get("channelTitle") or "").strip(),
+                creator_url=(
+                    f"https://www.youtube.com/channel/{snippet['channelId']}"
+                    if snippet.get("channelId") else ""
+                ),
+                license=self.LICENSE,
+                title=(snippet.get("title") or "").strip(),
+                duration=seconds,
+                preview_url=(
+                    ((snippet.get("thumbnails") or {}).get("high") or {}).get("url", "")
+                ),
+            ))
+        return out
+
+
+class NasaProvider(Provider):
+    """NASA's image library - public domain, no key, no credit owed.
+
+    Images only, on purpose. NASA's video is 16:9 and mostly 1080p, which crops
+    to 608x1080 and dies at the floor; the stills are routinely 4000px across,
+    which is the one easy way to clear 1080x1920 after the crop. Paired with
+    step 5's zoompan they read as footage anyway.
+
+    The catalogue hands back a manifest URL per item rather than a media URL,
+    so finding the actual file costs a second round trip. That is capped by
+    NASA_ASSET_LOOKUPS.
+
+    Dimensions are the awkward part: the search response carries none, and
+    reject_reason drops anything that reports no size. So each candidate goes
+    out with the nominal size below, and the real one is measured from the
+    downloaded file by probe_image_size, which re-applies the floor and
+    discards it if the guess flattered it. The nominal only buys a ticket past
+    the pre-filter - it never decides anything.
+    """
+
+    name = "nasa"
+    kinds = ("image",)
+    key_env = ()
+    attribution_required = False
+
+    SEARCH_URL = "https://images-api.nasa.gov/search"
+    LICENSE = "Public domain (NASA)"
+
+    #: What an unmeasured NASA still claims to be. Set to exactly the default
+    #: floor, so the guess is never the reason something passes by more than a
+    #: hair - the post-download probe is.
+    NOMINAL_SIZE = (1080, 1920)
+
+    def search(self, query: str, kind: str, limit: int) -> list[Candidate]:
+        if kind != "image":
+            return []
+        payload = _get_json(self.session, self.SEARCH_URL, provider=self.name, params={
+            "q": query,
+            "media_type": "image",
+            "page_size": min(max(limit, 1), 100),
+        })
+        self.searches += 1
+
+        out = []
+        lookups = 0
+        for item in ((payload.get("collection") or {}).get("items") or []):
+            manifest = item.get("href")
+            data = (item.get("data") or [{}])[0]
+            nasa_id = str(data.get("nasa_id") or "")
+            if not manifest or not nasa_id:
+                continue
+            if lookups >= NASA_ASSET_LOOKUPS:
+                break
+            lookups += 1
+
+            link = self._largest_image(manifest)
+            if not link:
+                continue
+
+            out.append(Candidate(
+                provider=self.name,
+                provider_id=nasa_id,
+                kind="image",
+                width=self.NOMINAL_SIZE[0],
+                height=self.NOMINAL_SIZE[1],
+                download_url=link,
+                source_url=f"https://images.nasa.gov/details/{nasa_id}",
+                creator=(data.get("center") or "NASA").strip(),
+                creator_url="https://images.nasa.gov/",
+                license=self.LICENSE,
+                title=(data.get("title") or "").strip(),
+                preview_url=(item.get("links") or [{}])[0].get("href", ""),
+            ))
+        return out
+
+    def _largest_image(self, manifest_url: str) -> str:
+        """Best rendition in an asset manifest, or "" if it lists none.
+
+        A manifest is a flat list of file URLs suffixed by size - ~orig,
+        ~large, ~medium, ~small, ~thumb - so preference is a lookup rather than
+        a measurement. ~orig is occasionally a 40MB scan, but the download cap
+        catches that and the candidate is stepped over like any other failure.
+        """
+        try:
+            files = _get_json(self.session, manifest_url, provider=self.name)
+        except ProviderError:
+            return ""                       # one dead manifest is not a failure
+        if not isinstance(files, list):
+            return ""
+
+        by_rank: dict[int, str] = {}
+        for url in files:
+            if not isinstance(url, str):
+                continue
+            lowered = url.lower()
+            if not lowered.endswith((".jpg", ".jpeg", ".png")):
+                continue
+            for rank, marker in enumerate(("~orig", "~large", "~medium")):
+                if marker in lowered:
+                    by_rank.setdefault(rank, url)
+        for rank in sorted(by_rank):
+            return by_rank[rank]
+        return ""
+
+
 #: Every provider this module knows how to talk to, by config name.
 _PROVIDERS: dict[str, type[Provider]] = {
     PexelsProvider.name: PexelsProvider,
     PixabayProvider.name: PixabayProvider,
     OpenverseProvider.name: OpenverseProvider,
+    YouTubeCCProvider.name: YouTubeCCProvider,
+    NasaProvider.name: NasaProvider,
 }
 
 
@@ -1043,6 +1518,19 @@ def meets_resolution_floor(
     return crop_w >= floor_w and crop_h >= floor_h
 
 
+def floor_for(provider: str, settings: dict) -> tuple[int, int]:
+    """The resolution floor `provider`'s candidates are held to.
+
+    Falls back to the global floor. The override exists because the floor is
+    applied after the 9:16 crop, and what that costs depends entirely on the
+    shape of the library behind the provider - see VISUAL_PROVIDER_FLOORS.
+    """
+    override = (settings.get("provider_floors") or {}).get(provider)
+    if override:
+        return int(override[0]), int(override[1])
+    return int(settings["min_width"]), int(settings["min_height"])
+
+
 def _orientation(candidate: Candidate) -> str:
     if candidate.height > candidate.width:
         return "portrait"
@@ -1061,26 +1549,34 @@ def reject_reason(candidate: Candidate, settings: dict) -> str:
         return "provider reported no dimensions"
     if _orientation(candidate) == "landscape" and not settings["allow_landscape"]:
         return "landscape source (VISUAL_ALLOW_LANDSCAPE is off)"
+    floor_w, floor_h = floor_for(candidate.provider, settings)
     if not meets_resolution_floor(
-        candidate.width, candidate.height,
-        min_width=settings["min_width"], min_height=settings["min_height"],
+        candidate.width, candidate.height, min_width=floor_w, min_height=floor_h,
     ):
         crop_w, crop_h = crop_to_aspect(candidate.width, candidate.height)
         return (
             f"{candidate.width}x{candidate.height} crops to {crop_w}x{crop_h}, "
-            f"under the {settings['min_width']}x{settings['min_height']} floor"
+            f"under the {floor_w}x{floor_h} floor"
         )
     return ""
 
 
 def score_candidate(
-    candidate: Candidate, beat: Beat, *, provider_rank: int, recently_used: bool
+    candidate: Candidate, beat: Beat, *, provider_rank: int,
+    recently_used: bool, hook: bool = False
 ) -> float:
     """Rank a usable candidate. Higher is better.
 
     Weighted for a 9:16 reel: real vertical video that covers the whole beat,
     at comfortable resolution, from a preferred provider, that has not been in
     a recent video.
+
+    `hook` marks the beat that opens the reel, which is not scored like the
+    others. Everywhere else a still is honest filler; on the first shot it is
+    the reel announcing that nothing is going to happen, over the second and a
+    half in which the viewer decides. So the opening beat pays a real premium
+    for motion and for a clip long enough to hold without looping back to its
+    own first frame.
     """
     crop_w, crop_h = crop_to_aspect(candidate.width, candidate.height)
     score = 0.0
@@ -1101,10 +1597,326 @@ def score_candidate(
             if candidate.duration > 30:
                 score -= 0.5      # long clips are usually montages, not shots
 
+    if hook:
+        # Big enough to decide the shot rather than nudge it: a still can still
+        # open the reel, but only when there is no clip to be had at all.
+        score += HOOK_MOTION_BONUS if candidate.kind == "video" else -HOOK_STILL_PENALTY
+        if candidate.kind == "video" and candidate.duration:
+            # No looping on the first shot. A clip that runs out and restarts
+            # snaps back to the frame it opened on, which is the one thing the
+            # opening must not do.
+            if candidate.duration >= beat.duration:
+                score += 1.0
+        if orientation == "portrait":
+            score += 1.0          # no crop at all on the shot that matters most
+
     score += max(0.0, 1.0 - 0.35 * provider_rank)
     if recently_used:
         score -= 4.0
     return round(score, 4)
+
+
+# ---------------------------------------------------------------------------
+# Relevance - does this clip show what the beat is talking about?
+#
+# Everything above scores how well a clip is *shot*: vertical, sharp, long
+# enough, from a preferred provider. None of it asks what is in the frame, and
+# a stock library always returns something, so a query it cannot answer comes
+# back full of well-shot clips of the wrong subject. They score identically to
+# the right ones - on a live run "Hadza hunter gatherers" returned a black bear
+# and a village dance, both at exactly 8.5 - and the tie is broken by API order.
+#
+# So relevance is scored separately, from the only description here of what the
+# footage actually SHOWS: the provider's own words for that exact file.
+# ---------------------------------------------------------------------------
+
+def describe_candidate(candidate: Candidate) -> str:
+    """The provider's own words for this file, as one lowercase string.
+
+    Prefers the title (Pexels' alt text, Pixabay's tags, Openverse's title) and
+    falls back to the slug in the source URL, which is where Pexels in practice
+    keeps the description - it returns an empty `alt` for most videos while
+    serving them from /video/a-black-bear-is-walking-through-a-field-20493624/.
+    Both are used when both exist: they are written by different people and
+    neither is reliably present.
+    """
+    parts = [candidate.title or ""]
+    match = re.search(r"/(?:videos?|photos?|images?)/([A-Za-z0-9\-]+?)/?$",
+                      candidate.source_url or "")
+    if match:
+        words = [w for w in match.group(1).split("-")
+                 if w and not w.isdigit() and w.lower() not in _SLUG_CHROME]
+        parts.append(" ".join(words))
+    return " ".join(p for p in parts if p).strip().lower()
+
+
+def _stem(word: str) -> str:
+    """Strip one plural/participle ending, if doing so leaves a real root."""
+    for suffix in _STEM_SUFFIXES:
+        if len(word) > len(suffix) + 2 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def _content_terms(text: str) -> set[str]:
+    """Stemmed content words - stopwords, digits and very short tokens gone."""
+    return {
+        _stem(raw.lower()) for raw in _WORD_RE.findall(text or "")
+        if len(raw) >= 3 and not raw.isdigit() and raw.lower() not in _STOPWORDS
+    }
+
+
+def lexical_relevance(candidate: Candidate, beat: Beat) -> float:
+    """How much of the beat this clip's own description accounts for, 0.0-1.0.
+
+    Measured against the query first and the narration second, taking whichever
+    is kinder: a query is 2-5 deliberately literal words, so matching one of
+    three is already a strong signal, while the narration is a whole sentence
+    of which a shot can only ever depict a part.
+
+    This is the fallback path, not the intended one, and it is weak in a
+    specific direction worth stating: it can only find words in common. It
+    scores "grey-headed flying foxes" against the query "brown bat sleeping" at
+    zero, and that clip is the right shot. Which is why a floor built on this
+    number is set low enough to catch only what matches nothing at all, and why
+    `VISUAL_RELEVANCE_MODE=llm` is the default - a model knows a flying fox is
+    a bat, and knows a black bear is not a hunter-gatherer.
+    """
+    described = _content_terms(describe_candidate(candidate))
+    if not described:
+        # No words from the provider at all. Unjudgeable rather than bad - and
+        # scoring it zero would bench every clip from a provider that ships no
+        # metadata, so it is passed through for the ranking to sort out.
+        return 1.0
+
+    best = 0.0
+    for source, weight in ((beat.query, 1.0), (beat.text, 0.75)):
+        wanted = _content_terms(source)
+        if not wanted:
+            continue
+        hits = sum(1 for term in wanted if _matches(term, described))
+        best = max(best, weight * hits / len(wanted))
+    return round(min(best, 1.0), 4)
+
+
+def _matches(term: str, described: set[str]) -> bool:
+    """True when `term` appears in `described`, allowing compound words.
+
+    The containment test catches "bat" inside "wombat" as a false positive, so
+    it is only allowed in the direction that matters: a described word may be
+    longer than the term ("sleep" in "sleeping"), never the reverse.
+    """
+    if term in described:
+        return True
+    return any(word.startswith(term) and len(term) >= 4 for word in described)
+
+
+_SCREEN_SYSTEM_INSTRUCTION = """\
+You check whether stock footage matches the narration it will play under, \
+for a short vertical video.
+
+You are lenient about wording and strict about subject. A clip counts as a \
+match when a viewer hearing those words and seeing that shot would find it \
+illustrative - it does not have to be literal, specific or documentary. \
+Different words for the same thing always match: a "grey-headed flying \
+fox" matches narration about bats, "man sleeping" matches narration about \
+napping, a generic ocean shot matches narration about a named sea.
+
+A clip fails when it shows a different subject: an animal where the \
+narration is about people, a kitchen where the narration is about the \
+coast, scenery where the narration names a specific group of people.
+
+A clip also fails when it belongs to a different named culture, place or \
+period from the one the narration is about. A Greek inscription is not \
+Inca stonework, and an Indian temple is not an Andean one: shown under \
+those words they state something false about a real people, which is the \
+one error here worth losing a shot over.
+
+Modern footage standing in for an old thing is not automatically that \
+error, but it is not automatically fine either, and the line between the \
+two is what the frame would have to contain. Keep the clip when what it \
+shows would have looked much the same in the period the narration is \
+about: a rope bridge, a mountain pass, bare feet on a dirt path, stone, \
+rope, water, hands working a material. There is usually no other footage \
+of these, and a viewer reads them as illustration.
+
+Reject the clip when its description names something that could only be \
+the present day, and the narration is about a time before it existed. \
+Powered machinery, vehicles, an office or a laptop, hard hats and hi-vis \
+vests, a shopping centre, roads with painted lane markings, a running \
+track or sportswear, a phone. These do not read as illustration. Under \
+narration about people who had none of them they read as the video not \
+knowing what it is about: a cement mixer under "they built with stone \
+tools", an athlete in a jersey under "messengers ran the roads", a \
+motorway under "they built this without the wheel".
+
+You always return valid JSON and nothing else."""
+
+
+_SCREEN_PROMPT_TEMPLATE = """\
+Topic of the video: {topic}
+
+Below are the beats of the narration. Under each are the candidate clips \
+found for it, described in the stock library's own words.
+
+{beats}
+
+For every candidate, say whether it is usable over that beat's narration.
+
+Rules:
+- Judge only the subject. Framing, colour and production quality are \
+handled elsewhere and are not your concern.
+- Prefer keeping where the choice is genuinely close. These are the only \
+clips available and a loose match beats a blank screen, so reject what \
+would confuse or mislead a viewer, not what is merely imperfect.
+- A clip that shows the wrong kind of thing entirely is always a reject, \
+no matter how well it is shot.
+- So is a clip belonging to a different named culture or place than the \
+narration's subject. Check the topic as well as the beat: a beat may say \
+only "stone carving" while the video is about the Inca.
+- A modern stand-in is judged by the test in your instructions: keep it \
+if the thing shown is unchanged by the centuries, reject it if the \
+description names present-day machinery, vehicles, workwear, offices, \
+sport or engineered road surfaces and the narration predates them. Apply \
+this against the topic, not only the beat - a beat reading "the state put \
+every commoner to work" says nothing about the period on its own.
+- "why" is a short phrase, only on rejects, naming what the clip shows \
+instead.
+
+Return ONLY a JSON array, one object per beat, in beat order:
+[{{"beat": 0, "verdicts": [{{"i": 0, "ok": true}}, \
+{{"i": 1, "ok": false, "why": "shows a bear, not people"}}]}}]"""
+
+
+def _parse_screen_json(raw: str) -> dict[int, dict[int, tuple[bool, str]]]:
+    """Read the screener's JSON into {beat_index: {candidate_i: (ok, why)}}."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"no JSON array in screener output: {text[:200]!r}")
+
+    data = json.loads(text[start:end + 1])
+    if not isinstance(data, list):
+        raise ValueError("screener output was not a JSON array")
+
+    parsed: dict[int, dict[int, tuple[bool, str]]] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            beat_index = int(entry.get("beat"))
+        except (TypeError, ValueError):
+            continue
+        verdicts: dict[int, tuple[bool, str]] = {}
+        for verdict in entry.get("verdicts") or []:
+            if not isinstance(verdict, dict):
+                continue
+            try:
+                position = int(verdict.get("i"))
+            except (TypeError, ValueError):
+                continue
+            verdicts[position] = (
+                bool(verdict.get("ok", True)),
+                str(verdict.get("why") or "").strip(),
+            )
+        if verdicts:
+            parsed[beat_index] = verdicts
+    return parsed
+
+
+def llm_screen(
+    shortlists: dict[int, list[Candidate]], beats: list[Beat], topic: str
+) -> tuple[dict[int, dict[int, tuple[bool, str]]], list[str]]:
+    """Screen every beat's shortlist in one Gemini call. Never raises.
+
+    Returns (verdicts, warnings). An empty verdict map means the call did not
+    happen or gave nothing usable, and the caller falls back to the lexical
+    check - the screener is a filter on footage that already exists, so failing
+    to reach it must cost relevance, never the run.
+    """
+    by_index = {b.index: b for b in beats}
+    listing: list[str] = []
+    for beat_index in sorted(shortlists):
+        beat = by_index.get(beat_index)
+        if beat is None:
+            continue
+        listing.append(f'Beat {beat_index} narration: "{beat.text}"')
+        listing.append(f'Beat {beat_index} was searched for: "{beat.query}"')
+        for position, candidate in enumerate(shortlists[beat_index]):
+            described = describe_candidate(candidate) or "(no description given)"
+            listing.append(f"  {position}. {described}")
+        listing.append("")
+    if not listing:
+        return {}, []
+
+    try:
+        api_key = config.require(*config.REQUIRED_SCRIPT_GEN)["GEMINI_API_KEY"]
+    except config.MissingConfigError as exc:
+        return {}, [f"relevance_mode=llm but {exc} Used the lexical check instead."]
+
+    rendered = "\n".join(listing).strip()
+    prompt = _SCREEN_PROMPT_TEMPLATE.format(
+        topic=topic or "(not given)", beats=rendered
+    )
+    try:
+        from google import genai
+        from google.genai import types
+
+        kwargs = {
+            "system_instruction": _SCREEN_SYSTEM_INSTRUCTION,
+            "temperature": SCREEN_MODEL_TEMPERATURE,
+            "max_output_tokens": SCREEN_MODEL_MAX_TOKENS,
+            "response_mime_type": "application/json",
+        }
+        if "pro" not in config.GEMINI_MODEL.lower():
+            kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=SCREEN_THINKING_BUDGET
+            )
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=config.GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(**kwargs),
+        )
+        return _parse_screen_json(response.text or ""), []
+    except Exception as exc:  # noqa: BLE001 - any failure falls back to lexical
+        return {}, [
+            f"Gemini relevance screening failed ({type(exc).__name__}: {exc}). "
+            "Used the lexical check instead."
+        ]
+
+
+def screen_lexically(
+    ranked: list[tuple[float, Candidate, str]], beat: Beat, floor: float
+) -> dict[int, tuple[bool, str]]:
+    """Verdicts from word overlap alone, judged relative to the same beat.
+
+    A clip is dropped only when it shares nothing with the beat AND some other
+    clip for that beat did clear the floor. The comparison is what makes this
+    usable: an absolute floor throws away the right shot whenever the provider
+    happens to describe it in different words - on a live run it rejected
+    "grey-headed flying foxes" for a beat about bats, and "man sleeping" for a
+    beat about napping, because neither shares a word with the query.
+
+    When nothing clears the floor, the query simply has no lexical purchase on
+    this library's vocabulary, which says nothing about the footage. Everything
+    is kept and the ranking decides, exactly as it did before.
+    """
+    scored = [(position, lexical_relevance(candidate, beat))
+              for position, (_, candidate, _) in enumerate(ranked)]
+    if not scored or max(score for _, score in scored) < floor:
+        return {}
+    return {
+        position: (
+            score >= floor,
+            "" if score >= floor else "shares no wording with this beat",
+        )
+        for position, score in scored
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +2051,8 @@ class UsageLedger:
 
 def _extension_for(url: str, content_type: str = "") -> str:
     """Pick a file extension from the URL, falling back to the content type."""
+    if url.startswith("ytdl://"):
+        return ".mp4"                      # the format selector asks for mp4 first
     path = url.split("?", 1)[0].split("#", 1)[0]
     suffix = Path(path).suffix.lower()
     if suffix and 2 <= len(suffix) <= 5:
@@ -1251,6 +2065,90 @@ def _safe_stem(text: str, limit: int = 40) -> str:
     return cleaned[:limit]
 
 
+def download_via_ytdl(url: str, destination: Path, *, provider: str) -> dict:
+    """Fetch a `ytdl://<video_id>` candidate, returning download()'s dict.
+
+    Video only, deliberately. The reel's audio is narration plus step 5's music
+    bed, so the source's own soundtrack is never heard - and skipping it halves
+    the transfer, removes the ffmpeg mux entirely, and stops a CC-BY clip from
+    dragging an unlicensed backing track in behind it.
+
+    The real width and height come back alongside the bytes because this is the
+    first point at which they are known for certain: the search-time probe
+    reports what the best rendition *would* be, and the format selector may
+    settle for less.
+    """
+    yt_dlp = _import_ytdl(provider)
+    video_id = url.split("://", 1)[1].split("?", 1)[0].split("#", 1)[0]
+    if not video_id:
+        raise ProviderError(f"{provider}: malformed ytdl url {url!r}", provider=provider)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.parent / f".{destination.stem}.ytdl"
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    options = {
+        **_ytdl_base_options(),
+        # height<=?2160 is a soft cap: prefer nothing above 4K, but do not fail
+        # a video that only publishes one rendition above it.
+        "format": "bestvideo[height<=?2160]/best[height<=?2160]/best",
+        "max_filesize": MAX_DOWNLOAD_BYTES,
+        "outtmpl": str(staging / "%(id)s.%(ext)s"),
+        "retries": 2,
+        "fragment_retries": 2,
+    }
+
+    try:
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}")
+        except Exception as exc:            # noqa: BLE001 - one dead video, move on
+            raise ProviderError(
+                f"{provider} could not fetch {video_id}: "
+                f"{type(exc).__name__}: {exc}",
+                provider=provider,
+            ) from exc
+
+        produced = sorted(p for p in staging.iterdir() if p.is_file())
+        if not produced:
+            # max_filesize aborts by writing nothing at all, which is the
+            # common way to land here.
+            raise ProviderError(
+                f"{provider} downloaded nothing for {video_id} - over the "
+                f"{MAX_DOWNLOAD_BYTES / 1e6:.0f}MB cap, or no usable format",
+                provider=provider,
+            )
+        source = produced[0]
+
+        digest = sha256()
+        written = 0
+        with open(source, "rb") as handle:
+            for chunk in iter(lambda: handle.read(DOWNLOAD_CHUNK_SIZE), b""):
+                written += len(chunk)
+                digest.update(chunk)
+        if written == 0:
+            raise ProviderError(
+                f"{provider} produced an empty file for {video_id}", provider=provider
+            )
+
+        final = destination.with_suffix(source.suffix)
+        os.replace(source, final)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    return {
+        "bytes": written,
+        "sha256": digest.hexdigest(),
+        "content_type": f"video/{final.suffix.lstrip('.') or 'mp4'}",
+        "width": int((info or {}).get("width") or 0),
+        "height": int((info or {}).get("height") or 0),
+        "duration": float((info or {}).get("duration") or 0.0) or None,
+        "path": final,
+    }
+
+
 def download(session, url: str, destination: Path, *, provider: str) -> dict:
     """Stream `url` to `destination` atomically.
 
@@ -1259,6 +2157,11 @@ def download(session, url: str, destination: Path, *, provider: str) -> dict:
     files, so the caller can simply move on to the next candidate.
     """
     import requests
+
+    if url.startswith("ytdl://"):
+        # Not an HTTP URL at all - youtube publishes no direct media link, so
+        # the scheme is a marker telling this function to hand off.
+        return download_via_ytdl(url, destination, provider=provider)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.name + ".part")
@@ -1389,17 +2292,43 @@ def make_run_id(topic: str, script: str) -> str:
     return f"{label}-{script_fingerprint(script)[:8]}"
 
 
-def _resolve_script(script) -> tuple[str, str]:
-    """Accept step 2's dict or a bare string. Returns (text, topic)."""
+def _load_step_2_result(raw: str):
+    """Step 2's JSON sidecar as a dict, or the text unchanged.
+
+    Anything that is not a step 2 result comes back untouched, so a plain
+    script - including one that merely happens to start with a brace - is
+    still read as narration rather than being guessed at.
+    """
+    text = (raw or "").lstrip()
+    if not text.startswith("{"):
+        return raw
+    try:
+        loaded = json.loads(raw)
+    except ValueError:
+        return raw
+    if isinstance(loaded, dict) and loaded.get("script"):
+        return loaded
+    return raw
+
+
+def _resolve_script(script) -> tuple[str, str, str]:
+    """Accept step 2's dict or a bare string. Returns (text, topic, hook card).
+
+    The hook card is step 2's short on-screen form of the opening line. Nothing
+    here uses it - it is carried so that step 5, which only ever sees this
+    manifest, can burn it over the opening without going back to step 2's
+    sidecar for it.
+    """
     if isinstance(script, dict):
         text = str(script.get("script") or "")
         topic = str(script.get("topic") or "")
+        hook_card = str(script.get("hook_card") or "")
     else:
-        text, topic = str(script or ""), ""
+        text, topic, hook_card = str(script or ""), "", ""
     text = text.strip()
     if not text:
         raise ValueError("script is empty - nothing to source visuals for")
-    return text, topic.strip()
+    return text, topic.strip(), hook_card.strip()
 
 
 def _resolve_duration(audio, duration_seconds, script_text: str) -> tuple[float, str]:
@@ -1438,11 +2367,20 @@ def _resolve_duration(audio, duration_seconds, script_text: str) -> tuple[float,
 
 
 def _settings_fingerprint(settings: dict) -> str:
-    """Hash of the knobs that would change what gets sourced."""
+    """Hash of the knobs that would change what gets sourced.
+
+    The relevance knobs belong here even though they pick nothing themselves:
+    they decide which of the candidates found is allowed on screen, and turning
+    the screen off or moving its floor changes the footage a re-run produces.
+    Leaving them out meant a run whose screening had changed was served the old
+    manifest unchanged, which is the one case where reusing it is wrong.
+    """
     relevant = {
         k: settings[k] for k in (
             "providers", "assets_per_beat", "headroom", "min_width", "min_height",
+            "provider_floors",
             "kinds", "allow_landscape", "query_mode", "image_duration",
+            "relevance_mode", "relevance_floor", "relevance_shortlist",
         )
     }
     blob = json.dumps(relevant, sort_keys=True, default=str)
@@ -1495,11 +2433,18 @@ def _search_provider(
 
 
 def _gather_candidates(
-    providers: list[Provider], beat: Beat, settings: dict, warnings: list[str]
+    providers: list[Provider], beat: Beat, settings: dict, warnings: list[str],
+    queries: tuple[str, ...] | None = None, seen: set[str] | None = None,
 ) -> list[tuple[Candidate, int, str]]:
-    """Search every provider for a beat. Returns (candidate, provider_rank, query)."""
+    """Search every provider for a beat. Returns (candidate, provider_rank, query).
+
+    `queries` overrides the beat's own query order, and `seen` carries the keys
+    an earlier search already returned. Both exist for the relevance screen: a
+    beat whose whole shortlist showed the wrong subject is searched again on its
+    fallback queries alone, and there is no point paying for the same hits back.
+    """
     pool: list[tuple[Candidate, int, str]] = []
-    seen: set[str] = set()
+    seen = seen if seen is not None else set()
     usable = 0
 
     # Judge sufficiency on candidates that would actually survive the filter.
@@ -1507,9 +2452,23 @@ def _gather_candidates(
     # 15, and half of those can be landscape 1080p that the 9:16 floor rejects.
     needed = min(settings["assets_per_beat"] * CANDIDATE_MARGIN, CANDIDATE_POOL_SIZE)
 
-    for query in (beat.query, *beat.alt_queries):
+    plan = queries if queries is not None else (beat.query, *beat.alt_queries)
+    for position, query in enumerate(plan):
         if not query:
             continue
+        # Every provider is asked the primary query, however well the first one
+        # answers it. `usable` counts clips that are shot well enough to use -
+        # vertical, sharp, long enough - and says nothing about whether they
+        # show the right thing, because relevance is not scored until the whole
+        # pool exists. Stopping on it therefore ended runs where Pexels alone
+        # filled the shortlist with well-shot footage of the wrong century and
+        # the relevance screen, which can only reorder what it is given, had
+        # nothing else to promote. Openverse - the one provider here indexing
+        # museum and archive collections, and so the only one with any chance
+        # on a historical beat - was never reached: 0 searches on the Inca run.
+        # The alt queries below still stop early; this costs one search per
+        # provider per beat, and only on the query most likely to be answered.
+        exhaustive = position == 0
         for rank, provider in enumerate(providers):
             if provider.disabled_reason:
                 continue
@@ -1525,10 +2484,10 @@ def _gather_candidates(
                         usable += 1
                 if usable >= needed:
                     break      # no need to also search stills for this beat
-            if usable >= needed:
-                # Providers are in preference order, so a good haul from an
-                # earlier one means the fallbacks are not needed - and their
-                # quota (Openverse allows 200 requests a day) is not spent.
+            if usable >= needed and not exhaustive:
+                # Providers are in preference order, so on a fallback query a
+                # good haul from an earlier one means the rest are not needed -
+                # and their quota (Openverse allows 200 a day) is not spent.
                 break
         if usable >= needed or len(pool) >= CANDIDATE_POOL_SIZE:
             break     # the first query that satisfies the beat is the best match
@@ -1562,11 +2521,260 @@ def _rank_pool(
             candidate.key, cooldown=settings["reuse_cooldown"], run_id=run_id
         )
         score = score_candidate(
-            candidate, beat, provider_rank=rank, recently_used=stale
+            candidate, beat, provider_rank=rank, recently_used=stale,
+            hook=beat.index == 0,
         )
         ranked.append((score, candidate, query))
     ranked.sort(key=lambda row: row[0], reverse=True)
     return ranked
+
+
+def _verdicts_for(
+    ranked: list[tuple[float, Candidate, str]], beat: Beat, mode: str,
+    llm_verdicts: dict[int, dict[int, tuple[bool, str]]], floor: float,
+) -> dict[int, tuple[bool, str]]:
+    """Verdicts for one beat's shortlist, from whichever screen is in force."""
+    if mode == "llm":
+        got = llm_verdicts.get(beat.index)
+        if got:
+            return got
+        # The call failed, or said nothing about this beat. Fall through rather
+        # than pass everything: the lexical check is weaker but not nothing.
+    if mode in ("llm", "lexical"):
+        return screen_lexically(ranked, beat, floor)
+    return {}
+
+
+def _demote_rejects(
+    ranked: list[tuple[float, Candidate, str]],
+    verdicts: dict[int, tuple[bool, str]],
+) -> tuple[list[tuple[float, Candidate, str]], list[str]]:
+    """Move the rejected candidates below every kept one, preserving order.
+
+    Demotion rather than removal, because a beat with nothing left is a beat
+    with a blank screen. A reject is only reached once the keepers run out, so
+    the wrong subject can still appear - but only where the alternative was no
+    footage at all, and the manifest says so.
+    """
+    keep, drop, notes = [], [], []
+    for position, row in enumerate(ranked):
+        ok, why = verdicts.get(position, (True, ""))
+        if ok:
+            keep.append(row)
+        else:
+            drop.append(row)
+            notes.append(
+                f"demoted {row[1].key} "
+                f"({describe_candidate(row[1]) or 'no description'})"
+                + (f": {why}" if why else "")
+            )
+    return keep + drop, notes
+
+
+def _neutral_plan(
+    beat: Beat, providers: list[Provider], settings: dict, ledger: UsageLedger,
+    run_id: str, state: "_RunState", rejections: dict[str, int],
+    warnings: list[str], seen: set[str],
+) -> list[tuple[float, Candidate, str]]:
+    """Ranked candidates for this beat's neutral shot, or [] if there are none.
+
+    The neutral query is written to be landscape, architecture or material with
+    nobody in it, so it is not screened: the subject test has nothing to catch,
+    and by the time this is reached there is no better candidate to promote.
+    """
+    neutral = (beat.neutral_query or "").strip()
+    if not neutral:
+        return []
+    pool = _gather_candidates(providers, beat, settings, warnings,
+                              queries=(neutral,), seen=seen)
+    if not pool:
+        return []
+    return _rank_pool(pool, beat, settings, ledger, run_id, state, rejections)
+
+
+def _screen_beats(
+    plans: dict[int, list[tuple[float, Candidate, str]]],
+    beats: list[Beat], topic: str, providers: list[Provider], settings: dict,
+    ledger: UsageLedger, run_id: str, state: "_RunState",
+    rejections: dict[str, int], warnings: list[str],
+    rejected_keys: set[str] | None = None,
+) -> dict[int, list[str]]:
+    """Check every beat's shortlist against its narration, in one pass.
+
+    Reorders `plans` in place so that what the screen kept sits above what it
+    rejected. A beat left with no keepers at all is searched again on its
+    fallback queries and re-screened once; if that finds nothing either, the
+    original ranking stands and a warning records that the beat is unmatched.
+
+    Returns the per-beat notes to fold into the manifest.
+    """
+    mode = settings["relevance_mode"]
+    if mode == "off":
+        return {}
+    if mode not in ("llm", "lexical"):
+        warnings.append(
+            f"unknown VISUAL_RELEVANCE_MODE {mode!r}; footage was not screened"
+        )
+        return {}
+
+    shortlist_size = settings["relevance_shortlist"]
+    floor = settings["relevance_floor"]
+    notes: dict[int, list[str]] = {}
+    # Demotion alone stops at the ranking. Acquisition walks past a demoted clip
+    # whenever the keeper above it fails to download or is held back by the
+    # variety check, and then places it with nothing recorded - which is how a
+    # beat that rejected five modern deliverymen still shipped two of them.
+    # Naming the keys lets pass 2 tell a keeper from a reject.
+    if rejected_keys is None:
+        rejected_keys = set()
+    by_index = {b.index: b for b in beats}
+
+    shortlists = {
+        index: [row[1] for row in ranked[:shortlist_size]]
+        for index, ranked in plans.items() if ranked
+    }
+    llm_verdicts: dict[int, dict[int, tuple[bool, str]]] = {}
+    if mode == "llm" and shortlists:
+        llm_verdicts, screen_warnings = llm_screen(shortlists, beats, topic)
+        warnings.extend(screen_warnings)
+
+    retry: list[Beat] = []
+    for index, ranked in plans.items():
+        beat = by_index.get(index)
+        if beat is None or not ranked:
+            continue
+        head, tail = ranked[:shortlist_size], ranked[shortlist_size:]
+        verdicts = _verdicts_for(head, beat, mode, llm_verdicts, floor)
+        if not verdicts:
+            continue
+        reordered, beat_notes = _demote_rejects(head, verdicts)
+        rejected_keys.update(
+            row[1].key for position, row in enumerate(head)
+            if not verdicts.get(position, (True, ""))[0]
+        )
+        plans[index] = reordered + tail
+        if beat_notes:
+            notes.setdefault(index, []).extend(beat_notes)
+        if not any(ok for ok, _ in verdicts.values()):
+            retry.append(beat)
+
+    # --- second look for the beats nothing matched -------------------------
+    # Only these are searched again, and only on the fallback queries: the
+    # primary one has already proved it lands in the wrong world, so asking it
+    # again spends quota to be told the same thing.
+    refreshed: dict[int, list[tuple[float, Candidate, str]]] = {}
+    for beat in retry:
+        alts = tuple(q for q in beat.alt_queries if q and q != beat.query)
+        if not alts:
+            continue
+        seen = {row[1].key for row in plans.get(beat.index, [])}
+        pool = _gather_candidates(providers, beat, settings, warnings,
+                                  queries=alts, seen=seen)
+        if not pool:
+            continue
+        fresh = _rank_pool(pool, beat, settings, ledger, run_id, state, rejections)
+        if fresh:
+            refreshed[beat.index] = fresh
+
+    # One screen for every re-searched beat at once.
+    #
+    # This used to fall back to the lexical check, on the argument that an LLM
+    # re-screen was a second call for a handful of clips. That argument no
+    # longer holds, because it made the retry structurally unable to catch what
+    # the retry is now for. The lexical check can only find words in common, so
+    # "a man is working on a cement mixer" and a beat about stone tools are
+    # simply unrelated to it - the same verdict it gives the correct shot
+    # described in different words. Worse, `screen_lexically` returns no
+    # verdicts at all unless something clears the floor, and hands back a keeper
+    # whenever it does: it can never reject a whole shortlist, so a beat whose
+    # fallback query also came back modern could never reach the neutral shot
+    # below. Batching keeps this to one extra call however many beats needed it.
+    retry_verdicts: dict[int, dict[int, tuple[bool, str]]] = {}
+    if mode == "llm" and refreshed:
+        retry_shortlists = {
+            index: [row[1] for row in rows[:shortlist_size]]
+            for index, rows in refreshed.items()
+        }
+        retry_beats = [by_index[i] for i in retry_shortlists if i in by_index]
+        retry_verdicts, screen_warnings = llm_screen(
+            retry_shortlists, retry_beats, topic
+        )
+        warnings.extend(screen_warnings)
+
+    for beat in retry:
+        kept = 0
+        fresh = refreshed.get(beat.index)
+        if fresh:
+            head = fresh[:shortlist_size]
+            verdicts = _verdicts_for(head, beat, mode, retry_verdicts, floor)
+            if verdicts:
+                reordered, beat_notes = _demote_rejects(head, verdicts)
+                kept = len([1 for ok, _ in verdicts.values() if ok])
+                rejected_keys.update(
+                    row[1].key for position, row in enumerate(head)
+                    if not verdicts.get(position, (True, ""))[0]
+                )
+            else:
+                # Nothing to judge with - the lexical check found no purchase on
+                # this library's wording, which says nothing about the footage.
+                reordered, beat_notes, kept = head, [], len(head)
+            alt_used = fresh[0][2]
+            notes.setdefault(beat.index, []).append(
+                f"re-searched on {alt_used!r}: {len(fresh)} more candidates, "
+                f"{kept} usable"
+            )
+            if beat_notes:
+                notes[beat.index].extend(beat_notes)
+            # Fallback results go in front: the primary query's hits are all
+            # known to show the wrong thing, so even an unscreened alternative
+            # beats them.
+            plans[beat.index] = (
+                reordered + fresh[shortlist_size:] + plans.get(beat.index, [])
+            )
+
+        if kept:
+            continue
+
+        # --- nothing honest exists for this beat ---------------------------
+        # Both queries have now come back showing the wrong thing, and all that
+        # is left in `plans` is footage the screen rejected. Putting it up
+        # anyway is the failure this pass exists to stop - it is what played a
+        # cement mixer under "they built roads with stone tools" and an athlete
+        # on a running track under "messengers who sprinted". A neutral
+        # establishing shot of the subject's own world says less than the beat
+        # asks for, but it cannot contradict the narration, and an
+        # under-specified shot is a far cheaper error than a false one.
+        neutral = (beat.neutral_query or "").strip()
+        if not neutral:
+            warnings.append(
+                f"beat {beat.index} ({beat.query!r}): nothing found matches the "
+                f"narration and there is no neutral shot to fall back on - "
+                f"using the closest available"
+            )
+            continue
+
+        seen = {row[1].key for row in plans.get(beat.index, [])}
+        safe = _neutral_plan(beat, providers, settings, ledger, run_id, state,
+                             rejections, warnings, seen)
+        if not safe:
+            warnings.append(
+                f"beat {beat.index} ({beat.query!r}): nothing found matches the "
+                f"narration and the neutral shot {neutral!r} found nothing "
+                f"either - using the closest available"
+            )
+            continue
+
+        plans[beat.index] = safe + plans.get(beat.index, [])
+        notes.setdefault(beat.index, []).append(
+            f"fell back to the neutral shot {neutral!r}: nothing found for "
+            f"{beat.query!r} showed the right subject"
+        )
+        warnings.append(
+            f"beat {beat.index}: no footage matches {beat.query!r}, so the beat "
+            f"plays a neutral shot ({neutral!r}) rather than a contradicting one"
+        )
+
+    return notes
 
 
 @dataclass
@@ -1587,6 +2795,40 @@ class _RunState:
     #: and a dozen museums, and one throttling host must not cost us the others.
     rate_limited: set[str] = dataclass_field(default_factory=set)
     ordinals: dict[int, int] = dataclass_field(default_factory=dict)
+    #: What this run has already put on screen, for the variety check: the
+    #: content words of every taken clip's description, and how many clips each
+    #: creator has contributed. Both are about the *run*, not the beat - the
+    #: pair of near-identical sleeping men that prompted this were sourced for
+    #: two different beats eight seconds apart.
+    taken_terms: list[set[str]] = dataclass_field(default_factory=list)
+    creator_counts: dict[str, int] = dataclass_field(default_factory=dict)
+
+    def too_similar(self, candidate: Candidate, settings: dict) -> str:
+        """Why this clip repeats something already taken, or "" if it does not."""
+        creator = (candidate.creator or "").strip().lower()
+        cap = settings.get("max_per_creator", 0)
+        if creator and cap and self.creator_counts.get(creator, 0) >= cap:
+            return f"a {cap}-clip limit per creator, and {candidate.creator} is at it"
+
+        terms = _content_terms(describe_candidate(candidate))
+        if not terms:
+            return ""
+        threshold = settings.get("similar_overlap", 0.0)
+        if threshold <= 0:
+            return ""
+        for taken in self.taken_terms:
+            if not taken:
+                continue
+            if len(terms & taken) / min(len(terms), len(taken)) >= threshold:
+                return f"it describes the same shot as {' '.join(sorted(taken))!r}"
+        return ""
+
+    def remember(self, candidate: Candidate) -> None:
+        """Record a taken clip so later ones can be checked against it."""
+        self.taken_terms.append(_content_terms(describe_candidate(candidate)))
+        creator = (candidate.creator or "").strip().lower()
+        if creator:
+            self.creator_counts[creator] = self.creator_counts.get(creator, 0) + 1
 
     def next_ordinal(self, beat_index: int) -> int:
         """Per-beat counter for filenames, continuous across top-up passes."""
@@ -1626,12 +2868,19 @@ def _acquire(
     settings: dict,
     state: _RunState,
     warnings: list[str],
+    avoid_similar: bool = True,
 ) -> list[dict]:
     """Download up to `want` assets for a beat, skipping anything that fails.
 
     Candidates that 404, serve HTML, or turn out to be duplicates are stepped
     over and remembered as failures, so a later pass does not walk into them
     again. The beat only fails if every candidate does.
+
+    With `avoid_similar`, a candidate that repeats footage the run has already
+    taken is passed over too - a different file of the same shot. That is a
+    preference and not a filter: the caller runs this again with it off when a
+    beat came up short, because holding one clip for six seconds is worse than
+    showing two men in two beds.
     """
     acquired: list[dict] = []
     attempts = 0
@@ -1641,6 +2890,10 @@ def _acquire(
             break
         if candidate.key in state.taken_keys or candidate.key in state.failed_keys:
             continue
+        if avoid_similar:
+            repeats = state.too_similar(candidate, settings)
+            if repeats:
+                continue
         if _download_host(candidate.download_url) in state.rate_limited:
             continue
         if attempts >= MAX_DOWNLOAD_ATTEMPTS_PER_BEAT:
@@ -1688,14 +2941,20 @@ def _acquire(
                 target.unlink(missing_ok=True)
                 continue
 
+            # yt-dlp settles the container itself, so the file may not be at
+            # the path the cache picked; and it is the first thing to know the
+            # real frame size, which for youtube was only ever an estimate.
+            target = Path(result.get("path") or target)
+            floor_w, floor_h = floor_for(candidate.provider, settings)
             width, height = candidate.width, candidate.height
+            if result.get("width") and result.get("height"):
+                width, height = int(result["width"]), int(result["height"])
             if candidate.kind == "image":
                 measured = probe_image_size(target)
                 if measured is None:
                     pass                      # Pillow absent: trust the provider
                 elif not meets_resolution_floor(
-                    *measured,
-                    min_width=settings["min_width"], min_height=settings["min_height"],
+                    *measured, min_width=floor_w, min_height=floor_h,
                 ):
                     warnings.append(
                         f"beat {beat.index}: {candidate.key} downloaded at "
@@ -1706,6 +2965,17 @@ def _acquire(
                     continue
                 else:
                     width, height = measured
+
+            if candidate.kind == "video" and not meets_resolution_floor(
+                width, height, min_width=floor_w, min_height=floor_h,
+            ):
+                warnings.append(
+                    f"beat {beat.index}: {candidate.key} arrived at {width}x{height}, "
+                    f"under the floor - discarded"
+                )
+                state.failed_keys.add(candidate.key)
+                target.unlink(missing_ok=True)
+                continue
 
             meta = cache.put(candidate.key, target, {
                 "provider": candidate.provider,
@@ -1739,6 +3009,7 @@ def _acquire(
             continue
 
         state.taken_keys.add(candidate.key)
+        state.remember(candidate)
         if meta.get("sha256"):
             state.taken_hashes.add(meta["sha256"])
 
@@ -1755,6 +3026,19 @@ def _acquire(
             "provider_key": candidate.key,
             "query": query,
             "score": score,
+            # The provider's own words for this exact file - Pexels' alt text,
+            # Pixabay's tags, Openverse's title. Kept because it is the only
+            # description here of what the footage actually SHOWS: `query` and
+            # the beat's `image_prompt` both describe what was asked for, and
+            # stock search routinely answers "snailfish" with a jellyfish.
+            # Step 6 writes the cover's alt text from this.
+            "title": candidate.title,
+            # The same words normalised, plus how much of the beat they
+            # account for. Both are recorded rather than recomputed so a
+            # finished run can be audited for what actually ended up on
+            # screen without going back to the provider.
+            "describes": describe_candidate(candidate),
+            "relevance": lexical_relevance(candidate, beat),
             "source_url": candidate.source_url,
             "download_url": candidate.download_url,
             "creator": candidate.creator,
@@ -1817,6 +3101,10 @@ def source_visuals(
     assets_per_beat: int | None = None,
     headroom: float | None = None,
     query_mode: str | None = None,
+    relevance_mode: str | None = None,
+    relevance_floor: float | None = None,
+    similar_overlap: float | None = None,
+    max_per_creator: int | None = None,
     min_width: int | None = None,
     min_height: int | None = None,
     reuse_cooldown: int | None = None,
@@ -1835,7 +3123,8 @@ def source_visuals(
         duration_seconds: used only when `audio` gives nothing.
         run_id: directory name for this run. Defaults to a slug of the topic
             plus a hash of the script, so re-runs land in the same place.
-        providers, assets_per_beat, headroom, query_mode, min_width,
+        providers, assets_per_beat, headroom, query_mode, relevance_mode,
+            relevance_floor, similar_overlap, max_per_creator, min_width,
             min_height, reuse_cooldown: per-call overrides of the config
             defaults. Left alone, everything comes from config.py.
         refresh: ignore an existing manifest and source again.
@@ -1852,7 +3141,7 @@ def source_visuals(
         ValueError: the script is empty, or the duration is unusable.
         NoAssetsError: every beat failed - nothing was downloaded at all.
     """
-    script_text, script_topic = _resolve_script(script)
+    script_text, script_topic, hook_card = _resolve_script(script)
     topic = (topic or script_topic or "").strip()
     narration_duration, duration_source = _resolve_duration(
         audio, duration_seconds, script_text
@@ -1874,11 +3163,31 @@ def source_visuals(
         "min_height": int(
             min_height if min_height is not None else config.VISUAL_MIN_HEIGHT
         ),
+        "provider_floors": {
+            str(name): (int(w), int(h))
+            for name, (w, h) in config.VISUAL_PROVIDER_FLOORS.items()
+        },
         "reuse_cooldown": int(
             reuse_cooldown if reuse_cooldown is not None
             else config.VISUAL_REUSE_COOLDOWN_RUNS
         ),
         "query_mode": (query_mode or config.VISUAL_QUERY_MODE).strip().lower(),
+        "relevance_mode": (
+            relevance_mode or config.VISUAL_RELEVANCE_MODE
+        ).strip().lower(),
+        "relevance_floor": float(
+            relevance_floor if relevance_floor is not None
+            else config.VISUAL_RELEVANCE_FLOOR
+        ),
+        "relevance_shortlist": max(1, int(config.VISUAL_RELEVANCE_SHORTLIST)),
+        "similar_overlap": float(
+            similar_overlap if similar_overlap is not None
+            else config.VISUAL_SIMILAR_OVERLAP
+        ),
+        "max_per_creator": int(
+            max_per_creator if max_per_creator is not None
+            else config.VISUAL_MAX_PER_CREATOR
+        ),
         "kinds": list(kinds),
         "allow_landscape": bool(config.VISUAL_ALLOW_LANDSCAPE),
         "image_duration": float(config.VISUAL_IMAGE_DURATION),
@@ -1904,11 +3213,12 @@ def source_visuals(
 
     target_duration = round(narration_duration * settings["headroom"], 3)
     base = {
-        "manifest_version": 1,
+        "manifest_version": 2,
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "topic": topic,
         "script": script_text,
+        "hook_card": hook_card,
         "script_hash": script_hash,
         "settings_hash": fingerprint,
         "settings": settings,
@@ -1952,37 +3262,120 @@ def source_visuals(
 
     state = _RunState()
     rejections: dict[str, int] = {}
+    rejected_keys: set[str] = set()
     assets: list[dict] = []
     beat_records: list[dict] = []
     leftovers: dict[int, list[tuple[float, Candidate, str]]] = {}
 
+    # --- pass 1: search and rank, downloading nothing ----------------------
+    # Ranking every beat before acquiring any of it is what lets the relevance
+    # screen judge the whole run in a single call. It also means a beat whose
+    # every hit shows the wrong subject is discovered before its bytes are paid
+    # for, and can be searched again on its fallback queries instead.
+    plans: dict[int, list[tuple[float, Candidate, str]]] = {}
+    pool_sizes: dict[int, int] = {}
     for beat in beats:
-        record = {**beat.to_dict(), "asset_indexes": [], "status": "failed", "notes": []}
         try:
             pool = _gather_candidates(active, beat, settings, warnings)
-            ranked = _rank_pool(
+            pool_sizes[beat.index] = len(pool)
+            plans[beat.index] = _rank_pool(
                 pool, beat, settings, ledger, run_id, state, rejections
             )
+        except Exception as exc:  # noqa: BLE001 - one beat must not kill the run
+            warnings.append(
+                f"beat {beat.index} search failed: {type(exc).__name__}: {exc}"
+            )
+            plans[beat.index] = []
+            pool_sizes.setdefault(beat.index, 0)
+
+    screen_notes = _screen_beats(
+        plans, beats, topic, active, settings, ledger, run_id, state,
+        rejections, warnings, rejected_keys,
+    )
+
+    # --- pass 2: download in beat order ------------------------------------
+    def take(rows, count, beat, avoid_similar=True):
+        """`_acquire` with this run's plumbing already filled in."""
+        if count <= 0 or not rows:
+            return []
+        return _acquire(
+            rows, beat, want=count, session=session, cache=cache,
+            run_dir=run_dir, settings=settings, state=state,
+            warnings=warnings, avoid_similar=avoid_similar,
+        )
+
+    for beat in beats:
+        record = {**beat.to_dict(), "asset_indexes": [], "status": "failed", "notes": []}
+        record["notes"].extend(screen_notes.get(beat.index, []))
+        try:
+            ranked = plans.get(beat.index) or []
             if not ranked:
                 record["notes"].append(
-                    f"no usable candidates from {len(pool)} search hits"
+                    f"no usable candidates from {pool_sizes.get(beat.index, 0)} "
+                    f"search hits"
                 )
                 warnings.append(
                     f"beat {beat.index} ({beat.query!r}): no usable candidates "
-                    f"from {len(pool)} hits"
+                    f"from {pool_sizes.get(beat.index, 0)} hits"
                 )
                 beat_records.append(record)
                 continue
 
-            acquired = _acquire(
-                ranked, beat,
-                want=settings["assets_per_beat"], session=session, cache=cache,
-                run_dir=run_dir, settings=settings, state=state, warnings=warnings,
-            )
+            want = settings["assets_per_beat"]
+            keepers = [r for r in ranked if r[1].key not in rejected_keys]
+            rejects = [r for r in ranked if r[1].key in rejected_keys]
+
+            acquired = take(keepers, want, beat)
+            if len(acquired) < want:
+                # Variety is a preference, not a filter. A beat left short by
+                # it is worse off than one holding a near-repeat: too few
+                # clips means one shot stretched across the whole beat, which
+                # is the very thing the preference exists to prevent.
+                acquired += take(keepers, want - len(acquired), beat,
+                                 avoid_similar=False)
+
+            # The screen kept something here, but not enough of it survived
+            # downloading, and the next rows are clips it rejected. Reaching
+            # past them for the beat's neutral shot is the same trade the screen
+            # itself makes: an under-specified shot of the subject's own world
+            # beats one that contradicts the narration. Only beats that need it
+            # pay for the search.
+            if len(acquired) < want and rejects:
+                seen = {row[1].key for row in ranked}
+                safe = _neutral_plan(beat, active, settings, ledger, run_id,
+                                     state, rejections, warnings, seen)
+                taken = take(safe, want - len(acquired), beat)
+                if taken:
+                    acquired += taken
+                    record["notes"].append(
+                        f"filled {len(taken)} slot(s) from the neutral shot "
+                        f"{beat.neutral_query!r}: what the screen kept could "
+                        f"not be downloaded"
+                    )
+                ranked = ranked + safe
+
+            # Last resort, and the order matters: a blank beat is still the
+            # worst outcome, so a reject does go up rather than leave a hole -
+            # but only once the neutral shot has also come back empty, and the
+            # manifest says which beats it happened to.
+            if len(acquired) < want and rejects:
+                recovered = take(rejects, want - len(acquired), beat,
+                                 avoid_similar=False)
+                if recovered:
+                    acquired += recovered
+                    warnings.append(
+                        f"beat {beat.index} ({beat.query!r}): placed "
+                        f"{len(recovered)} clip(s) the relevance screen "
+                        f"rejected - nothing else could be downloaded"
+                    )
+
             leftovers[beat.index] = [
                 row for row in ranked
                 if row[1].key not in state.taken_keys
                 and row[1].key not in state.failed_keys
+                # The headroom top-up pulls extra shots from here, so rejected
+                # footage must not sit in it waiting to be picked up as filler.
+                and row[1].key not in rejected_keys
             ]
         except Exception as exc:  # noqa: BLE001 - one beat must not kill the run
             warnings.append(
@@ -2049,6 +3442,18 @@ def source_visuals(
                     want=1, session=session, cache=cache, run_dir=run_dir,
                     settings=settings, state=state, warnings=warnings,
                 )
+                if not extra:
+                    # Same trade as the first pass, and it matters more here:
+                    # this loop exists to give step 5 enough footage to cut
+                    # between, so letting the variety preference end it early
+                    # would buy distinctness by causing the repetition it is
+                    # meant to prevent.
+                    extra = _acquire(
+                        remaining, beat,
+                        want=1, session=session, cache=cache, run_dir=run_dir,
+                        settings=settings, state=state, warnings=warnings,
+                        avoid_similar=False,
+                    )
                 if not extra:
                     leftovers[beat.index] = []
                     continue
@@ -2275,6 +3680,12 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"error: could not read {args.script_file}: {exc}", file=sys.stderr)
             return 1
+        # Step 2 writes both a .txt and a .json, and only the .json carries the
+        # hook card - the short on-screen form it wrote several openings to
+        # choose between. Read as text it is just a wall of braces, so the
+        # card was silently dropped and step 5 fell back to truncating the
+        # first line mid-sentence. Accept either file here.
+        script = _load_step_2_result(script)
         topic = args.topic or args.script_file.stem.replace("_", " ").replace("-", " ")
     else:
         script, topic = args.script, args.topic

@@ -174,6 +174,9 @@ def run_visuals(**kwargs):
         "topic": "why the ocean is salty",
         "providers": ["stub"],
         "query_mode": "heuristic",
+        # Both model-backed passes are pinned off by default: these tests run
+        # offline, and the screener has its own tests that stub the call.
+        "relevance_mode": "lexical",
     }
     params.update(kwargs)
     script = params.pop("script")
@@ -372,6 +375,748 @@ def test_recent_use_and_provider_order_push_a_candidate_down():
 
 
 # ---------------------------------------------------------------------------
+# Relevance - does the clip show what the beat is about?
+#
+# The cases here are the real ones from the run that prompted this check: a
+# black bear returned for "Hadza hunter gatherers", and grey-headed flying
+# foxes returned for "brown bat sleeping". The first must be caught. The
+# second must NOT be, and is the reason the lexical check is comparative.
+# ---------------------------------------------------------------------------
+
+def _described(index: int, slug: str, title: str = "") -> Candidate:
+    """A candidate whose only description is the one a provider would give."""
+    return Candidate(
+        provider="stub", provider_id=f"v{index}", kind="video",
+        width=1080, height=1920, duration=8.0,
+        download_url=f"https://stub.test/video/{index}.mp4",
+        source_url=f"https://www.pexels.com/video/{slug}-{2000 + index}/",
+        title=title,
+    )
+
+
+HADZA = Beat(
+    index=2, start=0.0, end=6.0, query="Hadza hunter gatherers",
+    text="The Hadza hunter-gatherers of Tanzania average six hours a night.",
+)
+BATS = Beat(
+    index=1, start=0.0, end=6.0, query="brown bat sleeping",
+    text="Brown bats sleep for nineteen hours a day.",
+)
+
+
+def test_description_comes_from_the_url_when_the_title_is_empty():
+    # Pexels returns an empty alt for most videos and puts the description in
+    # the URL, which is why the slug is read at all.
+    candidate = _described(1, "a-black-bear-is-walking-through-a-field")
+    assert visuals.describe_candidate(candidate) == "a black bear is walking through a field"
+
+
+def test_description_uses_both_the_title_and_the_slug():
+    candidate = _described(2, "majestic-gorilla-walking", title="Gorilla in a forest")
+    described = visuals.describe_candidate(candidate)
+    assert "gorilla in a forest" in described and "majestic" in described
+
+
+def test_provider_chrome_and_the_id_are_not_part_of_the_description():
+    # Stopwords are left alone here - they are dropped downstream, where the
+    # words are compared. This step only removes what the library adds.
+    candidate = _described(3, "free-stock-video-of-a-river")
+    described = visuals.describe_candidate(candidate)
+    assert "river" in described
+    assert not {"free", "stock", "video", "2003"} & set(described.split())
+
+
+def test_a_clip_sharing_nothing_with_the_beat_scores_zero():
+    bear = _described(4, "a-black-bear-is-walking-through-a-field")
+    assert visuals.lexical_relevance(bear, HADZA) == 0.0
+
+
+def test_a_clip_sharing_a_query_word_scores_above_the_floor():
+    village = _described(5, "traditional-african-village-gathering-and-dance")
+    assert visuals.lexical_relevance(village, HADZA) >= config.VISUAL_RELEVANCE_FLOOR
+
+
+def test_word_endings_do_not_defeat_the_match():
+    # "sleeping" in the query, "sleep" in the description.
+    clip = _described(6, "a-man-asleep-in-bed-sleep-study")
+    assert visuals.lexical_relevance(clip, BATS) > 0.0
+
+
+def test_a_clip_with_no_description_at_all_is_not_judged():
+    # Openverse and Pixabay can return neither a title nor a usable slug.
+    blank = Candidate(provider="stub", provider_id="x", kind="video",
+                      width=1080, height=1920, download_url="https://stub.test/x.mp4")
+    assert visuals.lexical_relevance(blank, HADZA) == 1.0
+
+
+def test_the_lexical_screen_drops_the_bear_when_something_better_exists():
+    ranked = [
+        (9.0, _described(7, "a-black-bear-is-walking-through-a-field"), "q"),
+        (8.5, _described(8, "traditional-african-village-gathering-and-dance"), "q"),
+    ]
+    verdicts = visuals.screen_lexically(ranked, HADZA, config.VISUAL_RELEVANCE_FLOOR)
+    assert verdicts[0][0] is False and verdicts[1][0] is True
+
+
+def test_the_lexical_screen_keeps_everything_when_nothing_matches_the_wording():
+    # Both are right for a beat about bats; neither shares a word with it. A
+    # floor applied absolutely would throw the whole beat away.
+    ranked = [
+        (9.0, _described(9, "grey-headed-flying-foxes-are-amazing"), "q"),
+        (8.5, _described(10, "fruit-bat-colony-at-dusk"), "q"),
+    ]
+    assert visuals.screen_lexically(ranked, BATS, 0.9) == {}
+
+
+def test_rejects_are_demoted_below_keepers_not_discarded():
+    rows = [(9.0, _described(i, f"clip-{i}"), "q") for i in range(4)]
+    verdicts = {0: (False, "wrong subject"), 1: (True, ""), 2: (False, "wrong"), 3: (True, "")}
+    reordered, notes = visuals._demote_rejects(rows, verdicts)
+    assert [r[1].provider_id for r in reordered] == ["v1", "v3", "v0", "v2"]
+    assert len(reordered) == len(rows)      # nothing lost
+    assert len(notes) == 2 and "wrong subject" in notes[0]
+
+
+def test_screen_json_survives_fences_and_junk_entries():
+    raw = """```json
+    [{"beat": 0, "verdicts": [{"i": 0, "ok": true},
+                              {"i": 1, "ok": false, "why": "a bear"}]},
+     "not an object",
+     {"beat": "x", "verdicts": []}]
+    ```"""
+    parsed = visuals._parse_screen_json(raw)
+    assert parsed == {0: {0: (True, ""), 1: (False, "a bear")}}
+
+
+def test_screen_json_rejects_a_non_array():
+    with pytest.raises(ValueError):
+        visuals._parse_screen_json('{"beat": 0}')
+
+
+def test_llm_screen_without_a_key_warns_and_defers_to_lexical(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "")
+    verdicts, warnings = visuals.llm_screen(
+        {2: [_described(11, "a-black-bear-is-walking-through-a-field")]},
+        [HADZA], "sleep",
+    )
+    assert verdicts == {}
+    assert warnings and "lexical" in warnings[0]
+
+
+def test_the_screen_draws_the_line_at_a_different_culture_not_a_different_century():
+    """Three rules here pull against each other and all three are load bearing.
+
+    Rejecting another civilisation's artefact is the point - an Indian temple
+    under narration about Inca stonework says something false about a real
+    people.
+
+    The century rule is deliberately *graded* rather than either amnesty. An
+    early draft rejected every modern stand-in and left three beats of a
+    ten-beat reel with nothing at all. The draft that replaced it kept every
+    modern stand-in - "runners over narration about messengers... Keep them" -
+    and that is what put an athlete in a jersey on a painted running track
+    under "messengers who sprinted a hundred fifty miles a day", a cement mixer
+    under "they built roads with stone tools", and a motorway with lane
+    markings under "without the wheel". Measured on the Inca run: the three
+    beats that shipped the worst footage came back from the screen with an
+    empty note list, meaning it had approved all of them.
+
+    So the line is what the frame would have to contain: a thing unchanged by
+    the centuries is kept, a thing that could only be the present day is not.
+    """
+    instruction = visuals._SCREEN_SYSTEM_INSTRUCTION
+    assert "Greek inscription" in instruction        # the culture rule
+    # ...the half that keeps a timeless stand-in...
+    assert "would have looked much the same in the period" in instruction
+    # ...and the half that stops a modern one.
+    assert "could only be the present day" in instruction
+    assert "hi-vis" in instruction
+    assert "a different named culture or place" in visuals._SCREEN_PROMPT_TEMPLATE
+    assert "unchanged by the centuries" in visuals._SCREEN_PROMPT_TEMPLATE
+
+
+def test_the_screen_prompt_tells_the_model_to_prefer_keeping():
+    # The failure mode of a strict screener is an empty beat, which is worse
+    # than a loose match, so the instruction to err towards keeping is load
+    # bearing rather than decorative.
+    prompt = visuals._SCREEN_PROMPT_TEMPLATE
+    assert "Prefer keeping" in prompt
+    assert "flying fox" in visuals._SCREEN_SYSTEM_INSTRUCTION
+
+
+def test_unknown_relevance_mode_warns_and_screens_nothing():
+    warnings: list[str] = []
+    plans = {0: [(9.0, _described(12, "anything"), "q")]}
+    notes = visuals._screen_beats(
+        plans, [HADZA], "topic", [], {"relevance_mode": "sideways"},
+        None, "run", None, {}, warnings,
+    )
+    assert notes == {}
+    assert any("sideways" in w for w in warnings)
+
+
+def test_a_beat_with_no_match_is_researched_on_its_fallback_query(monkeypatch):
+    """The bear's beat, end to end through the screen.
+
+    The primary query returns only the wrong subject, so the beat must go back
+    out on its `alt` query rather than settle - which is the whole point of
+    noticing, and the step the old count-based gate never reached because two
+    well-shot wrong clips satisfied it.
+    """
+    beat = Beat(
+        index=0, start=0.0, end=6.0, query="Hadza hunter gatherers",
+        text="The Hadza hunter-gatherers of Tanzania average six hours a night.",
+        alt_queries=("african village people",),
+    )
+    served = {
+        "Hadza hunter gatherers": [
+            _described(20, "a-black-bear-is-walking-through-a-field"),
+        ],
+        "african village people": [
+            _described(21, "african-village-people-cooking"),
+        ],
+    }
+
+    class QueryAwareProvider(visuals.Provider):
+        name = "stub"
+        kinds = ("video",)
+        key_env = ()
+        attribution_required = False
+
+        def search(self, query, kind, limit):
+            return list(served.get(query, []))
+
+    provider = QueryAwareProvider(session=None)
+    plans = {0: [(9.0, served["Hadza hunter gatherers"][0], "Hadza hunter gatherers")]}
+    warnings: list[str] = []
+    settings = _settings(
+        relevance_mode="llm",
+        relevance_floor=config.VISUAL_RELEVANCE_FLOOR,
+        relevance_shortlist=6,
+        assets_per_beat=1,
+        reuse_cooldown=0,
+        kinds=["video"],
+    )
+    # Stubbed rather than called: the retry is driven by an explicit reject,
+    # which is what the model returns for this beat on a live run.
+    monkeypatch.setattr(
+        visuals, "llm_screen",
+        lambda shortlists, beats, topic: ({0: {0: (False, "shows a bear")}}, []),
+    )
+    notes = visuals._screen_beats(
+        plans, [beat], "sleep", [provider], settings,
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, warnings,
+    )
+
+    # The village clip found on the fallback query now outranks the bear, and
+    # the bear is still there underneath rather than thrown away.
+    ordered = [row[1].provider_id for row in plans[0]]
+    assert ordered[0] == "v21", ordered
+    assert "v20" in ordered
+    assert any("re-searched" in note for note in notes[0])
+
+
+def _query_aware_provider(served):
+    """A provider answering each query with exactly what `served` maps it to."""
+
+    class QueryAwareProvider(visuals.Provider):
+        name = "stub"
+        kinds = ("video",)
+        key_env = ()
+        attribution_required = False
+        asked = []
+
+        def search(self, query, kind, limit):
+            QueryAwareProvider.asked.append(query)
+            return list(served.get(query, []))
+
+    QueryAwareProvider.asked = []
+    return QueryAwareProvider
+
+
+def _inca_beat():
+    return Beat(
+        index=0, start=0.0, end=6.0, query="ancient construction workers",
+        text="The state conscripted every able-bodied commoner to work.",
+        alt_queries=("historical laborers",),
+        neutral_query="Andes mountain landscape",
+    )
+
+
+def _retry_settings():
+    return _settings(
+        relevance_mode="llm",
+        relevance_floor=config.VISUAL_RELEVANCE_FLOOR,
+        relevance_shortlist=6,
+        assets_per_beat=1,
+        reuse_cooldown=0,
+        kinds=["video"],
+    )
+
+
+def _reject_everything(shortlists, beats, topic):
+    return (
+        {index: {position: (False, "shows modern construction")
+                 for position in range(len(candidates))}
+         for index, candidates in shortlists.items()},
+        [],
+    )
+
+
+def test_a_beat_with_nothing_honest_falls_back_to_the_neutral_shot(monkeypatch):
+    """The cement mixer's beat, end to end.
+
+    Both queries come back showing present-day construction, so there is no
+    honest shot to be had. What shipped before this existed was the top-ranked
+    reject: a man working a cement mixer under narration about people who built
+    with stone tools. A neutral shot of the subject's own landscape says less
+    than the beat asked for, but it cannot state something false.
+    """
+    beat = _inca_beat()
+    served = {
+        "ancient construction workers": [
+            _described(30, "a-man-is-working-on-a-cement-mixer"),
+        ],
+        "historical laborers": [
+            _described(31, "construction-worker-setting-up-scaffolding"),
+        ],
+        "Andes mountain landscape": [
+            _described(32, "snow-covered-andes-peaks-at-dawn"),
+        ],
+    }
+    provider = _query_aware_provider(served)(session=None)
+    monkeypatch.setattr(visuals, "llm_screen", _reject_everything)
+
+    plans = {0: [(9.0, served["ancient construction workers"][0],
+                  "ancient construction workers")]}
+    warnings = []
+    notes = visuals._screen_beats(
+        plans, [beat], "how the Inca built roads without the wheel", [provider],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, warnings,
+    )
+
+    ordered = [row[1].provider_id for row in plans[0]]
+    assert ordered[0] == "v32", f"the neutral shot did not take the beat: {ordered}"
+    # The rejects stay underneath rather than being thrown away, so a later
+    # stage that runs out of candidates still has something to place.
+    assert "v30" in ordered and "v31" in ordered
+    assert any("neutral shot" in note for note in notes[0])
+    assert any("rather than a contradicting one" in w for w in warnings)
+
+
+def test_the_neutral_shot_is_not_searched_when_the_fallback_query_works(monkeypatch):
+    """It is a last resort, not a second guess.
+
+    The neutral is deliberately under-specified, so reaching for it while a
+    real match exists would trade a good shot for a merely safe one.
+    """
+    beat = _inca_beat()
+    served = {
+        "ancient construction workers": [
+            _described(33, "a-man-is-working-on-a-cement-mixer"),
+        ],
+        "historical laborers": [
+            _described(34, "hands-stacking-a-dry-stone-wall"),
+        ],
+        "Andes mountain landscape": [
+            _described(35, "snow-covered-andes-peaks-at-dawn"),
+        ],
+    }
+    provider_cls = _query_aware_provider(served)
+    provider = provider_cls(session=None)
+
+    def screen(shortlists, beats, topic):
+        # Rejects the mixer, keeps the stone wall: the graded rule the live
+        # prompt applies.
+        out = {}
+        for index, candidates in shortlists.items():
+            out[index] = {}
+            for position, candidate in enumerate(candidates):
+                modern = "cement-mixer" in (candidate.source_url or "")
+                out[index][position] = (
+                    not modern, "shows modern construction" if modern else "",
+                )
+        return out, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+
+    plans = {0: [(9.0, served["ancient construction workers"][0],
+                  "ancient construction workers")]}
+    visuals._screen_beats(
+        plans, [beat], "how the Inca built roads without the wheel", [provider],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, [],
+    )
+
+    assert [row[1].provider_id for row in plans[0]][0] == "v34"
+    assert "Andes mountain landscape" not in provider_cls.asked, (
+        "spent a search on the neutral shot while a real match existed"
+    )
+
+
+def test_the_retry_is_screened_by_the_model_not_the_lexical_check(monkeypatch):
+    """The retry has to be judged by the standard that sent the beat back.
+
+    The defect it exists to catch - footage from the wrong century - is
+    invisible to word overlap, which reads "cement mixer" and "stone tools" as
+    unrelated in exactly the way it reads a correct shot described in other
+    words. And `screen_lexically` cannot reject a whole shortlist by
+    construction: it returns no verdicts at all unless something clears the
+    floor, and keeps whatever does. Screening the retry with it therefore left
+    the neutral fallback below unreachable.
+    """
+    beat = _inca_beat()
+    served = {
+        "ancient construction workers": [_described(36, "a-cement-mixer-turning")],
+        "historical laborers": [_described(37, "a-forklift-on-a-building-site")],
+        "Andes mountain landscape": [_described(38, "andes-peaks")],
+    }
+    provider = _query_aware_provider(served)(session=None)
+    seen_shortlists = []
+
+    def screen(shortlists, beats, topic):
+        seen_shortlists.append(shortlists)
+        return _reject_everything(shortlists, beats, topic)
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+
+    plans = {0: [(9.0, served["ancient construction workers"][0],
+                  "ancient construction workers")]}
+    visuals._screen_beats(
+        plans, [beat], "how the Inca built roads without the wheel", [provider],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, [],
+    )
+
+    assert len(seen_shortlists) == 2, "the re-searched beat was not screened again"
+    retried = [c.provider_id for c in seen_shortlists[1][0]]
+    assert retried == ["v37"], retried
+    assert [row[1].provider_id for row in plans[0]][0] == "v38"
+
+
+def test_the_screen_names_the_keys_it_rejected(monkeypatch):
+    """Demotion alone only reorders, which acquisition is free to walk past.
+
+    On the live Inca run beat 8 demoted five modern deliverymen and then
+    shipped two of them: the single clip the screen kept did not survive
+    downloading, and the rows underneath it were the rejects. Pass 2 can only
+    avoid that if it can tell one from the other, so the screen hands the keys
+    back rather than only reordering.
+    """
+    beat = _inca_beat()
+    provider = _query_aware_provider({})(session=None)
+    monkeypatch.setattr(visuals, "llm_screen", _reject_everything)
+
+    mixer = _described(40, "a-man-is-working-on-a-cement-mixer")
+    plans = {0: [(9.0, mixer, "ancient construction workers")]}
+    rejected = set()
+    visuals._screen_beats(
+        plans, [beat], "how the Inca built roads without the wheel", [provider],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, [], rejected,
+    )
+    assert mixer.key in rejected
+
+
+def _keep_only(provider_ids, rejected_ids=None):
+    """A screen that keeps the named candidates and rejects every other one."""
+
+    def screen(shortlists, beats, topic):
+        verdicts = {}
+        for index, candidates in shortlists.items():
+            verdicts[index] = {}
+            for position, candidate in enumerate(candidates):
+                ok = candidate.provider_id in provider_ids
+                if not ok and rejected_ids is not None:
+                    rejected_ids.add(candidate.provider_id)
+                verdicts[index][position] = (ok, "" if ok else "modern machinery")
+        return verdicts, []
+
+    return screen
+
+
+def test_a_rejected_clip_is_not_used_while_a_keeper_is_left(sandbox, monkeypatch):
+    """Acquisition walks down the ranking; the screen only reordered it.
+
+    So a keeper that 404s used to hand the beat straight to the clip below it,
+    which is the one the screen had just thrown out. This is the live beat 8:
+    five modern deliverymen demoted, and two of them on screen anyway because
+    the single keeper above them did not come back.
+    """
+    first, second, bad = (make_candidate(1), make_candidate(2),
+                          make_candidate(3))
+    StubProvider.catalog = [first, bad, second]
+    monkeypatch.setattr(
+        visuals, "llm_screen",
+        _keep_only({first.provider_id, second.provider_id}),
+    )
+    # The best keeper 404s. The next row in the ranking is the reject.
+    sandbox.routes[first.download_url] = FakeResponse(404, body=b"gone")
+
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=1, providers=["stub"],
+    )
+    # Scoped to the first beat: the stub serves one catalog to every beat, so a
+    # later one runs out of keepers honestly and is meant to reach the reject.
+    opening = manifest["beats"][0]["asset_indexes"]
+    assert opening, "the opening beat sourced nothing at all"
+    used = {manifest["assets"][i]["source_url"] for i in opening}
+    assert bad.source_url not in used, (
+        "reached past a surviving keeper for a clip the screen had rejected"
+    )
+    assert second.source_url in used
+
+
+def test_a_reject_is_still_placed_when_it_is_the_only_thing_left(
+    sandbox, monkeypatch
+):
+    """A blank beat stays the worst outcome, and the manifest says it happened.
+
+    The rule is an ordering, not a ban: keepers, then the neutral shot, then -
+    only once both have come back empty - a reject, with a warning naming the
+    beat so it is never a silent substitution.
+    """
+    only = make_candidate(3)
+    StubProvider.catalog = [only]
+    # Nothing is kept, and there is no neutral query on a heuristic run with an
+    # empty topic, so the reject is genuinely all there is.
+    monkeypatch.setattr(visuals, "llm_screen", _keep_only(set()))
+
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=1, providers=["stub"], topic="",
+    )
+    assert manifest["assets"], "left the reel with no footage at all"
+    assert any("the relevance screen rejected" in w for w in manifest["warnings"])
+
+
+def test_rejected_footage_is_kept_out_of_the_headroom_top_up(sandbox, monkeypatch):
+    """The top-up pulls spare shots from the leftovers.
+
+    Rejected footage must not sit in there waiting to be collected as filler
+    once each beat itself is full - that puts back on screen exactly what the
+    screen just took off it, and without even a warning, because from the
+    top-up's point of view it is only the next unused candidate.
+    """
+    catalog = [make_candidate(i) for i in range(14)]
+    StubProvider.catalog = catalog
+    keep = {c.provider_id for c in catalog[:3]}
+    rejected_ids = set()
+    monkeypatch.setattr(visuals, "llm_screen", _keep_only(keep, rejected_ids))
+
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=1, headroom=4.0, providers=["stub"],
+    )
+    assert rejected_ids, "the screen rejected nothing, so this proves nothing"
+    banned = {c.source_url for c in catalog if c.provider_id in rejected_ids}
+    shipped = [a["source_url"] for a in manifest["assets"]]
+    # The beats themselves can still reach a reject as a last resort, and say so.
+    # The top-up may not: everything it adds is surplus, so a rejected clip
+    # there is never the difference between a shot and a blank screen.
+    topped_up = {a["source_url"] for a in manifest["assets"]
+                 if a.get("role") == "spare"}
+    assert topped_up, "the top-up added nothing, so this proves nothing"
+    assert not (topped_up & banned), (
+        f"the top-up placed rejected footage: {sorted(topped_up & banned)}"
+    )
+    assert shipped, "nothing was sourced at all"
+
+
+def test_the_query_writer_is_asked_for_a_neutral_shot():
+    """The fallback only exists if step 4 asks for it and can read it back."""
+    prompt = visuals._QUERY_PROMPT_TEMPLATE
+    assert '"neutral"' in prompt
+    assert "no machinery" in prompt
+    parsed = visuals._parse_query_json(
+        '[{"index": 0, "query": "Andes terraces", "alt": "stone wall close up",'
+        ' "neutral": "Andes mountain landscape", "image_prompt": "x"}]', 1,
+    )
+    assert parsed[0]["neutral"] == "Andes mountain landscape"
+
+
+def test_a_query_without_a_neutral_still_parses():
+    """An older or truncated response must cost the fallback, never the run."""
+    parsed = visuals._parse_query_json(
+        '[{"index": 0, "query": "Andes terraces", "alt": "stone wall"}]', 1,
+    )
+    assert parsed[0]["neutral"] == ""
+
+
+def test_the_query_writer_is_told_that_bare_ancient_does_not_search(monkeypatch):
+    """The queries that produced the worst footage were era-stripped.
+
+    "ancient construction workers" returned a cement mixer and "long ancient
+    highway" a motorway with painted lane markings, because a stock library
+    matches the words it indexes and "ancient" is not one of them.
+    """
+    prompt = visuals._QUERY_PROMPT_TEMPLATE
+    assert "proper" in prompt and "noun" in prompt
+    assert "cement mixer" in prompt
+    # The alt must not be a licence to drop the subject, which is how a beat
+    # about the Inca reached an office worker.
+    assert "still in the right world" in prompt
+
+
+def test_lexical_mode_does_not_research_when_it_cannot_tell(monkeypatch):
+    """All-zero is unjudgeable to the lexical check, not evidence of a bad beat.
+
+    Deliberate, and the reason the re-search belongs to the model: "brown bat
+    sleeping" scores every correct flying-fox clip at zero too, so treating a
+    zero sweep as grounds to go back out would re-search good beats and then
+    promote the fallback above footage that was right all along.
+    """
+    beat = Beat(index=0, start=0.0, end=6.0, query="brown bat sleeping",
+                text="Brown bats sleep for nineteen hours.",
+                alt_queries=("bat colony",))
+    searched: list[str] = []
+
+    class CountingProvider(visuals.Provider):
+        name = "stub"
+        kinds = ("video",)
+        key_env = ()
+        attribution_required = False
+
+        def search(self, query, kind, limit):
+            searched.append(query)
+            return []
+
+    plans = {0: [(9.0, _described(30, "grey-headed-flying-foxes-are-amazing"), "q")]}
+    visuals._screen_beats(
+        plans, [beat], "sleep", [CountingProvider(session=None)],
+        _settings(relevance_mode="lexical", relevance_floor=0.15,
+                  relevance_shortlist=6, kinds=["video"]),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+    assert searched == []                    # no quota spent
+    assert plans[0][0][1].provider_id == "v30"   # and nothing demoted
+
+
+def test_the_manifest_records_what_each_clip_says_it_shows(sandbox):
+    StubProvider.catalog = [make_candidate(i) for i in range(1, 5)]
+    manifest = run_visuals()
+    for asset in manifest["assets"]:
+        assert "describes" in asset
+        assert 0.0 <= asset["relevance"] <= 1.0
+
+
+def test_relevance_off_screens_nothing_and_costs_no_call(sandbox):
+    StubProvider.catalog = [make_candidate(i) for i in range(1, 5)]
+    manifest = run_visuals(relevance_mode="off")
+    assert manifest["assets"]
+    assert not any("screen" in w.lower() for w in manifest["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Variety - two files, one shot
+#
+# Both cases below are from the sleep reel, which spent four of its last six
+# shots on two men in two beds. One pair was caught by wording, the other only
+# by the creator: stock libraries sell a whole shoot as separate clips.
+# ---------------------------------------------------------------------------
+
+def _variety_settings(**overrides):
+    base = {"similar_overlap": config.VISUAL_SIMILAR_OVERLAP,
+            "max_per_creator": config.VISUAL_MAX_PER_CREATOR}
+    base.update(overrides)
+    return base
+
+
+def _by(creator: str, index: int, slug: str) -> Candidate:
+    return Candidate(
+        provider="stub", provider_id=f"v{index}", kind="video",
+        width=1080, height=1920, duration=8.0,
+        download_url=f"https://stub.test/video/{index}.mp4",
+        source_url=f"https://www.pexels.com/video/{slug}-{3000 + index}/",
+        creator=creator,
+    )
+
+
+def test_a_second_clip_of_the_same_shot_is_recognised_by_its_wording():
+    state = visuals._RunState()
+    state.remember(_by("Katrin", 1, "man-feeling-sleepy"))
+    repeat = _by("Nicola", 2, "video-of-a-man-sleeping")
+
+    assert state.too_similar(repeat, _variety_settings())
+
+
+def test_two_different_shots_of_one_subject_are_not_the_same_shot():
+    # Both gorillas, and both worth having: this is the case the threshold
+    # must leave alone, or a beat loses its only usable pair.
+    state = visuals._RunState()
+    state.remember(_by("Connor", 3, "gorilla-in-autumn-forest-eating-leaves"))
+    other = _by("David", 4, "majestic-gorilla-walking-in-lush-habitat")
+
+    assert not state.too_similar(other, _variety_settings())
+
+
+def test_one_creator_does_not_supply_two_clips_of_a_run():
+    # "relaxing rest tired indoors" and "video of a man sleeping" share no
+    # word at all, and are the same man on the same bed by the same person.
+    state = visuals._RunState()
+    state.remember(_by("Nicola Barts", 5, "relaxing-rest-tired-indoors"))
+    same_shoot = _by("Nicola Barts", 6, "video-of-a-man-sleeping")
+
+    assert "per creator" in state.too_similar(same_shoot, _variety_settings())
+
+
+def test_the_creator_cap_can_be_lifted():
+    state = visuals._RunState()
+    state.remember(_by("Nicola Barts", 7, "relaxing-rest-tired-indoors"))
+    same_shoot = _by("Nicola Barts", 8, "video-of-a-man-sleeping")
+
+    assert not state.too_similar(
+        same_shoot, _variety_settings(max_per_creator=0, similar_overlap=0.45)
+    )
+
+
+def test_a_clip_with_no_description_is_never_called_a_repeat():
+    state = visuals._RunState()
+    state.remember(_by("Someone", 9, "a-man-sleeping"))
+    blank = Candidate(provider="stub", provider_id="z", kind="video",
+                      width=1080, height=1920, download_url="https://stub.test/z.mp4")
+
+    assert not state.too_similar(blank, _variety_settings())
+
+
+def test_variety_never_leaves_a_beat_short(sandbox):
+    """The preference must yield to the thing it exists to prevent.
+
+    Every clip here is by one creator, so the strict pass can take exactly one
+    of them. The beat still has to come away with two, because one clip over a
+    whole beat is the held shot the rule is trying to avoid.
+    """
+    StubProvider.catalog = [
+        Candidate(provider="stub", provider_id=f"v{i}", kind="video",
+                  width=1080, height=1920, duration=9.0,
+                  download_url=f"https://stub.test/video/{i}.mp4",
+                  source_url=f"https://www.pexels.com/video/one-shoot-{i}/",
+                  creator="The Only Creator")
+        for i in range(6)
+    ]
+    manifest = run_visuals(assets_per_beat=2)
+
+    for record in manifest["beats"]:
+        if record["status"] == "ok":
+            assert len(record["asset_indexes"]) >= 2
+
+
+def test_variety_spreads_a_run_across_creators_when_it_can(sandbox):
+    StubProvider.catalog = [
+        Candidate(provider="stub", provider_id=f"v{i}", kind="video",
+                  width=1080, height=1920, duration=9.0,
+                  download_url=f"https://stub.test/video/{i}.mp4",
+                  source_url=f"https://www.pexels.com/video/subject-{i}-alone/",
+                  creator=f"creator{i}")
+        for i in range(12)
+    ]
+    manifest = run_visuals(assets_per_beat=2)
+    creators = [a["creator"] for a in manifest["assets"]]
+
+    assert len(set(creators)) == len(creators), creators
+
+
+# ---------------------------------------------------------------------------
 # Query construction
 # ---------------------------------------------------------------------------
 
@@ -396,6 +1141,17 @@ def test_beat_with_only_stopwords_still_gets_a_query():
     beats = [Beat(0, "And so it was that they did.", 0.0, 4.0)]
     visuals.heuristic_queries(beats, "the sea")
     assert beats[0].query.strip()
+
+
+def test_the_query_prompt_asks_for_self_contained_queries():
+    """A live run wrote 'salt crystals close up' for a video about the ocean
+    and Pexels returned a kitchen worktop. The query reaches the library with
+    no knowledge of the video, so the prompt has to say so."""
+    prompt = visuals._QUERY_PROMPT_TEMPLATE.format(
+        topic="why the ocean is salty", beats='0. (4.0s) "The ocean is salty."'
+    )
+    assert "never heard of this video" in prompt
+    assert "sea salt crystals" in prompt, "the worked example is the useful part"
 
 
 def test_parse_query_json_handles_fences_and_junk_entries():
@@ -505,6 +1261,321 @@ def test_openverse_carries_the_licence_into_the_attribution():
 
 def test_openverse_has_no_video_endpoint():
     assert visuals.OpenverseProvider(FakeSession()).search("x", "video", 5) == []
+
+
+# ---------------------------------------------------------------------------
+# YouTube (Creative Commons only)
+# ---------------------------------------------------------------------------
+
+def _youtube_session(items, search_ids=None):
+    """A session answering both halves of the youtube provider's two calls."""
+    ids = search_ids if search_ids is not None else [i["id"] for i in items]
+    return FakeSession(routes={
+        "v3/search": FakeResponse(200, payload={
+            "items": [{"id": {"videoId": vid}} for vid in ids]
+        }),
+        "v3/videos": FakeResponse(200, payload={"items": items}),
+    })
+
+
+def _yt_item(video_id="v1", *, license="creativeCommon", duration="PT2M10S",
+             channel="Deep Sea Trust"):
+    return {
+        "id": video_id,
+        "status": {"license": license},
+        "contentDetails": {"duration": duration, "definition": "hd"},
+        "snippet": {
+            "title": f"clip {video_id}", "channelTitle": channel,
+            "channelId": "UC123", "thumbnails": {"high": {"url": "thumb.jpg"}},
+        },
+    }
+
+
+def test_youtube_only_ever_asks_for_creative_commons(monkeypatch):
+    """The licence is a search filter, not something sorted out afterwards."""
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
+    session = _youtube_session([_yt_item()])
+    visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
+
+    search_call = next(c for c in session.calls if "v3/search" in c["url"])
+    assert search_call["params"]["videoLicense"] == "creativeCommon"
+    assert search_call["params"]["type"] == "video"
+
+
+def test_youtube_drops_a_reserved_upload_even_if_the_search_returned_it(monkeypatch):
+    """Belt and braces: the cost of trusting the filter is republishing
+    someone's reserved footage, so status.license is checked again."""
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
+    session = _youtube_session([
+        _yt_item("keep"),
+        _yt_item("drop", license="youtube"),      # the default, All Rights Reserved
+    ])
+    found = visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
+
+    assert [c.provider_id for c in found] == ["keep"]
+
+
+def test_youtube_dimensions_come_from_the_probe_not_the_api(monkeypatch):
+    """The API only says "hd", which does not separate 1080p from 4K - and that
+    is exactly the distinction the 9:16 floor turns on."""
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
+    session = _youtube_session([_yt_item()])
+    [candidate] = visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
+
+    assert (candidate.width, candidate.height) == (3840, 2160)
+    assert visuals.meets_resolution_floor(
+        candidate.width, candidate.height, min_width=1080, min_height=1920
+    )
+
+
+def _video_settings(**over):
+    base = {"kinds": ("video", "image"), "allow_landscape": True,
+            "min_width": 1080, "min_height": 1920, "provider_floors": {}}
+    return {**base, **over}
+
+
+def test_a_1080p_youtube_upload_cannot_clear_the_global_floor(monkeypatch):
+    """The trap the per-provider floor exists to solve: "HD" is not enough for
+    a 16:9 source, because the floor is applied to what survives the crop."""
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (1920, 1080))
+    session = _youtube_session([_yt_item()])
+    [candidate] = visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
+
+    reason = visuals.reject_reason(candidate, _video_settings())
+    assert "608x1080" in reason and "1080x1920 floor" in reason
+
+
+def test_a_1080p_youtube_upload_passes_under_youtubes_own_floor(monkeypatch):
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (1920, 1080))
+    session = _youtube_session([_yt_item()])
+    [candidate] = visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
+
+    settings = _video_settings(provider_floors={"youtube": (608, 1080)})
+    assert visuals.reject_reason(candidate, settings) == ""
+
+
+def test_lowering_youtubes_floor_does_not_lower_anyone_elses():
+    """The whole point of making this per-provider: weak stock stays out."""
+    settings = _video_settings(provider_floors={"youtube": (608, 1080)})
+    stock = make_candidate(1, width=1920, height=1080, provider="pexels")
+
+    assert "under the 1080x1920 floor" in visuals.reject_reason(stock, settings)
+
+
+def test_floor_for_falls_back_to_the_global_pair():
+    settings = _video_settings(provider_floors={"youtube": (608, 1080)})
+    assert visuals.floor_for("youtube", settings) == (608, 1080)
+    assert visuals.floor_for("pexels", settings) == (1080, 1920)
+    assert visuals.floor_for("pexels", _video_settings()) == (1080, 1920)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("youtube:608x1080", {"youtube": (608, 1080)}),
+    ("youtube:608x1080,nasa:900x1600", {"youtube": (608, 1080), "nasa": (900, 1600)}),
+    ("  YouTube : 608X1080 ", {"youtube": (608, 1080)}),
+    ("", {}),
+    (None, {}),
+    ("youtube", {}),                       # no size at all
+    ("youtube:wide", {}),                  # unparseable size
+    ("youtube:608x1080,broken", {"youtube": (608, 1080)}),   # one bad pair only
+])
+def test_provider_floors_parse_forgivingly(raw, expected):
+    """A typo in one pair costs that provider its override, nothing more."""
+    assert config._parse_provider_floors(raw) == expected
+
+
+def test_changing_a_provider_floor_invalidates_the_cached_manifest():
+    """Otherwise a run whose floor had moved would be served the old footage."""
+    base = {
+        "providers": ["youtube"], "assets_per_beat": 2, "headroom": 1.6,
+        "min_width": 1080, "min_height": 1920, "kinds": ("video",),
+        "allow_landscape": True, "query_mode": "llm", "image_duration": 4.0,
+        "relevance_mode": "llm", "relevance_floor": 0.2, "relevance_shortlist": 6,
+        "provider_floors": {},
+    }
+    moved = {**base, "provider_floors": {"youtube": (608, 1080)}}
+
+    assert visuals._settings_fingerprint(base) != visuals._settings_fingerprint(moved)
+
+
+def test_youtube_skips_a_video_the_probe_cannot_play(monkeypatch):
+    """Private, geo-blocked and members-only all look the same from here."""
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: None)
+    session = _youtube_session([_yt_item()])
+    assert visuals.YouTubeCCProvider(session).search("deep sea", "video", 5) == []
+
+
+def test_youtube_credits_the_channel_because_cc_by_requires_it():
+    provider = visuals.YouTubeCCProvider
+    assert provider.attribution_required is True
+    assert provider.key_env == ("YOUTUBE_API_KEY",)
+
+
+def test_youtube_attribution_names_the_channel_and_the_licence(monkeypatch):
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
+    session = _youtube_session([_yt_item(channel="Deep Sea Trust")])
+    [candidate] = visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
+
+    assert candidate.creator == "Deep Sea Trust"
+    assert "CC BY" in candidate.attribution
+    assert "youtube.com/watch?v=v1" in candidate.attribution
+
+
+def test_youtube_caps_how_many_hits_it_probes(monkeypatch):
+    """Each probe is a round trip to the watch page, so the search is not
+    allowed to spend one on every result."""
+    probed = []
+
+    def probe(url):
+        probed.append(url)
+        return (3840, 2160)
+
+    monkeypatch.setattr(visuals, "_ytdl_probe", probe)
+    session = _youtube_session([_yt_item(f"v{i}") for i in range(20)])
+    visuals.YouTubeCCProvider(session).search("deep sea", "video", 20)
+
+    assert len(probed) == visuals.YOUTUBE_PROBE_LIMIT
+
+
+def test_youtube_has_no_image_endpoint():
+    assert visuals.YouTubeCCProvider(FakeSession()).search("x", "image", 5) == []
+
+
+def test_youtube_skips_a_live_stream_reporting_no_duration(monkeypatch):
+    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
+    session = _youtube_session([_yt_item(duration="P0D")])
+    assert visuals.YouTubeCCProvider(session).search("x", "video", 5) == []
+
+
+@pytest.mark.parametrize("text,seconds", [
+    ("PT4M13S", 253.0),
+    ("PT1H2M3S", 3723.0),
+    ("PT45S", 45.0),
+    ("PT2M", 120.0),
+    ("P0D", 0.0),
+    ("", 0.0),
+    ("garbage", 0.0),
+])
+def test_iso8601_durations_parse(text, seconds):
+    assert visuals._parse_iso8601_duration(text) == seconds
+
+
+# ---------------------------------------------------------------------------
+# NASA
+# ---------------------------------------------------------------------------
+
+def _nasa_session(files, *, nasa_id="PIA12345"):
+    return FakeSession(routes={
+        "images-api.nasa.gov/search": FakeResponse(200, payload={"collection": {
+            "items": [{
+                "href": "https://images-assets.nasa.gov/collection.json",
+                "data": [{"nasa_id": nasa_id, "title": "Europa", "center": "JPL"}],
+                "links": [{"href": "thumb.jpg"}],
+            }],
+        }}),
+        "collection.json": FakeResponse(200, payload=files),
+    })
+
+
+def test_nasa_prefers_the_original_rendition():
+    session = _nasa_session([
+        "https://x/PIA12345~thumb.jpg",
+        "https://x/PIA12345~medium.jpg",
+        "https://x/PIA12345~orig.jpg",
+        "https://x/PIA12345~large.jpg",
+    ])
+    [candidate] = visuals.NasaProvider(session).search("europa", "image", 5)
+
+    assert candidate.download_url.endswith("~orig.jpg")
+    assert candidate.provider_id == "PIA12345"
+    assert candidate.license == "Public domain (NASA)"
+
+
+def test_nasa_falls_back_down_the_rendition_ladder():
+    session = _nasa_session(["https://x/PIA12345~medium.jpg"])
+    [candidate] = visuals.NasaProvider(session).search("europa", "image", 5)
+    assert candidate.download_url.endswith("~medium.jpg")
+
+
+def test_nasa_skips_an_item_whose_manifest_holds_no_image():
+    session = _nasa_session(["https://x/PIA12345~orig.tif", "https://x/meta.json"])
+    assert visuals.NasaProvider(session).search("europa", "image", 5) == []
+
+
+def test_nasa_survives_a_dead_manifest():
+    """One unreachable manifest is a skipped item, not a failed search."""
+    session = FakeSession(routes={
+        "images-api.nasa.gov/search": FakeResponse(200, payload={"collection": {
+            "items": [{
+                "href": "https://images-assets.nasa.gov/collection.json",
+                "data": [{"nasa_id": "PIA1", "title": "t", "center": "JPL"}],
+            }],
+        }}),
+        "collection.json": FakeResponse(500, body=b"nope"),
+    })
+    assert visuals.NasaProvider(session).search("europa", "image", 5) == []
+
+
+def test_nasa_claims_no_more_than_the_floor_it_must_clear():
+    """The nominal size only buys a ticket past reject_reason, which drops
+    anything reporting no dimensions. probe_image_size settles it for real."""
+    assert visuals.NasaProvider.NOMINAL_SIZE == (
+        config.VISUAL_MIN_WIDTH, config.VISUAL_MIN_HEIGHT
+    )
+
+
+def test_nasa_needs_no_key_and_owes_no_credit():
+    assert visuals.NasaProvider.is_configured()
+    assert visuals.NasaProvider.attribution_required is False
+
+
+def test_nasa_has_no_video_endpoint():
+    assert visuals.NasaProvider(FakeSession()).search("x", "video", 5) == []
+
+
+# ---------------------------------------------------------------------------
+# The ytdl:// download path
+# ---------------------------------------------------------------------------
+
+def test_a_ytdl_url_never_reaches_the_http_session(monkeypatch, tmp_path):
+    """youtube publishes no direct media link, so the scheme is a hand-off."""
+    handled = {}
+
+    def fake(url, destination, *, provider):
+        handled["url"] = url
+        return {"bytes": 1, "sha256": "d", "content_type": "video/mp4"}
+
+    monkeypatch.setattr(visuals, "download_via_ytdl", fake)
+    session = FakeSession()
+    visuals.download(session, "ytdl://abc123", tmp_path / "f.mp4", provider="youtube")
+
+    assert handled["url"] == "ytdl://abc123"
+    assert session.calls == []
+
+
+def test_a_ytdl_url_is_cached_under_mp4():
+    """path_for reads the extension off the URL, and ytdl:// carries none."""
+    assert visuals._extension_for("ytdl://abc123") == ".mp4"
+
+
+def test_ytdl_download_without_the_library_says_what_to_install(monkeypatch):
+    monkeypatch.setitem(sys.modules, "yt_dlp", None)
+    with pytest.raises(visuals.ProviderError, match="pip install yt-dlp"):
+        visuals._import_ytdl("youtube")
+
+
+def test_both_new_providers_are_registered():
+    assert visuals._PROVIDERS["youtube"] is visuals.YouTubeCCProvider
+    assert visuals._PROVIDERS["nasa"] is visuals.NasaProvider
+    for name in ("youtube", "nasa"):
+        assert name in config.VISUAL_PROVIDER_KEYS
+
+
+def test_the_new_providers_are_opt_in():
+    """Enabling youtube spends the topic scout's quota and needs yt-dlp; nasa
+    only knows about space. Neither belongs in a default run."""
+    assert "youtube" not in config.VISUAL_PROVIDERS
+    assert "nasa" not in config.VISUAL_PROVIDERS
 
 
 def test_provider_readiness_reflects_the_configured_keys(monkeypatch):
@@ -973,21 +2044,35 @@ def test_an_image_smaller_than_it_claimed_is_discarded(sandbox, monkeypatch):
         run_visuals()
 
 
-def test_a_fallback_provider_is_not_queried_when_the_first_one_delivers(
+def test_every_provider_is_asked_the_primary_query_even_when_the_first_delivers(
     sandbox, monkeypatch
 ):
-    """Openverse allows 200 anonymous requests a day; do not burn them for
-    nothing when Pexels already returned a full pool."""
+    """The primary query goes to all providers; the fallback queries do not.
+
+    This used to stop at the first provider that returned a full pool, to save
+    Openverse's 200 anonymous requests a day. The saving was real and the cost
+    was worse: sufficiency is counted in clips that are *shot* well enough to
+    use, which is decided before anything has looked at what they show. So one
+    library answering a historical query with well-shot modern footage ended
+    the search, and the relevance screen - which can only reorder the pool it
+    is handed - had nothing else to promote. On the Inca run that meant
+    Openverse, the only provider here indexing museum and archive collections,
+    performed 0 searches.
+
+    The quota argument still holds for the *fallback* queries, which is where
+    the early exit now lives, so the extra spend is one search per provider per
+    beat and only on the query most likely to be answered.
+    """
 
     class FallbackProvider(StubProvider):
         name = "fallback"
-        searched = 0
+        queries: list[str] = []
 
         def search(self, query, kind, limit):
-            FallbackProvider.searched += 1
+            FallbackProvider.queries.append(query)
             return []
 
-    FallbackProvider.searched = 0
+    FallbackProvider.queries = []
     monkeypatch.setattr(
         visuals, "_PROVIDERS", {"stub": StubProvider, "fallback": FallbackProvider}
     )
@@ -995,7 +2080,17 @@ def test_a_fallback_provider_is_not_queried_when_the_first_one_delivers(
     manifest = run_visuals(providers=["stub", "fallback"])
 
     assert manifest["assets"]
-    assert FallbackProvider.searched == 0, "spent a fallback provider's quota"
+    asked = FallbackProvider.queries
+    assert asked, "the primary query never reached the second provider"
+
+    primary = {b["query"] for b in manifest["beats"]}
+    assert set(asked) <= primary, (
+        f"a fallback query was spent on the second provider: "
+        f"{sorted(set(asked) - primary)}"
+    )
+    # One search per beat: the pool is already full by the time this provider is
+    # reached, so the still search for each beat is still skipped.
+    assert len(asked) == len(manifest["beats"])
 
 
 def test_a_fallback_provider_is_used_when_the_first_one_is_empty(
@@ -1118,3 +2213,237 @@ def test_cli_providers_status_needs_no_script(capsys):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# The opening shot is not scored like the others
+# ---------------------------------------------------------------------------
+
+def test_the_opening_beat_takes_a_landscape_clip_over_a_perfect_still():
+    """Everywhere else a still is honest filler. On the first shot it is the
+    reel announcing that nothing is going to happen, in the second and a half
+    where the viewer decides."""
+    still = make_candidate(1, kind="image", width=1080, height=1920)
+    clip = make_candidate(2, kind="video", width=3840, height=2160, duration=8.0)
+
+    assert visuals.score_candidate(clip, _beat(), provider_rank=0,
+                                   recently_used=False, hook=True) \
+        > visuals.score_candidate(still, _beat(), provider_rank=0,
+                                  recently_used=False, hook=True)
+
+
+def test_away_from_the_opening_a_vertical_still_still_beats_a_cropped_clip():
+    """The premium is paid on the hook and nowhere else - otherwise it would
+    just be a global preference dressed up as one."""
+    still = make_candidate(1, kind="image", width=1080, height=1920)
+    clip = make_candidate(2, kind="video", width=3840, height=2160, duration=8.0)
+
+    ordinary = visuals.score_candidate(still, _beat(), provider_rank=0,
+                                       recently_used=False, hook=False)
+    assert ordinary > visuals.score_candidate(
+        still, _beat(), provider_rank=0, recently_used=False, hook=True
+    )
+
+
+def test_the_opening_prefers_a_clip_that_will_not_have_to_loop():
+    """A clip that runs out and restarts snaps back to the frame it opened on,
+    which is the one thing the opening shot must not do."""
+    covers = make_candidate(1, kind="video", duration=9.0)
+    short = make_candidate(2, kind="video", duration=1.0)
+
+    hook_gap = (visuals.score_candidate(covers, _beat(5.0), provider_rank=0,
+                                        recently_used=False, hook=True)
+                - visuals.score_candidate(short, _beat(5.0), provider_rank=0,
+                                          recently_used=False, hook=True))
+    plain_gap = (visuals.score_candidate(covers, _beat(5.0), provider_rank=0,
+                                         recently_used=False, hook=False)
+                 - visuals.score_candidate(short, _beat(5.0), provider_rank=0,
+                                           recently_used=False, hook=False))
+    assert hook_gap > plain_gap
+
+
+def test_the_hook_weighting_does_not_disturb_the_default_scoring():
+    candidate = make_candidate(1, kind="video")
+    assert visuals.score_candidate(candidate, _beat(), provider_rank=0,
+                                   recently_used=False) \
+        == visuals.score_candidate(candidate, _beat(), provider_rank=0,
+                                   recently_used=False, hook=False)
+
+
+# ---------------------------------------------------------------------------
+# Step 2's hook card is carried through to step 5
+# ---------------------------------------------------------------------------
+
+def test_the_hook_card_is_read_off_step_2s_result():
+    text, topic, card = visuals._resolve_script({
+        "script": "An opening line. A body.",
+        "topic": "salt",
+        "hook_card": "Rain made it salty",
+    })
+    assert text == "An opening line. A body."
+    assert topic == "salt"
+    assert card == "Rain made it salty"
+
+
+def test_a_bare_script_string_carries_no_card():
+    text, topic, card = visuals._resolve_script("An opening line. A body.")
+    assert text == "An opening line. A body."
+    assert (topic, card) == ("", "")
+
+
+def test_a_step_2_result_without_a_card_is_not_an_error():
+    _, _, card = visuals._resolve_script({"script": "An opening. A body.",
+                                          "topic": "salt"})
+    assert card == ""
+
+
+# ---------------------------------------------------------------------------
+# Similes
+#
+# A beat that describes one thing by comparing it to another is still about
+# the first thing. Measured on a live run, "Enough to crush a submarine like a
+# tin can" produced the query 'crushed metal can' and four seconds of spray
+# paint cans in the middle of a deep-ocean reel.
+# ---------------------------------------------------------------------------
+
+def test_a_comparison_is_read_off_the_sentence():
+    got = visuals.simile_terms(
+        "Enough to crush a submarine like a tin can. It's utterly dark."
+    )
+    assert got == {"tin", "can"}
+
+
+def test_the_comparison_stops_at_the_end_of_its_sentence():
+    """Otherwise the rest of the narration is swept in as the comparison."""
+    got = visuals.simile_terms("Crushed like a tin can. Bioluminescence follows.")
+    assert "bioluminescence" not in got
+
+
+def test_the_general_stoplist_is_not_used_on_a_comparison():
+    """`can` is a modal verb in _STOPWORDS and the whole noun in 'a tin can'."""
+    assert "can" in visuals._STOPWORDS
+    assert "can" in visuals.simile_terms("crushed like a tin can")
+
+
+@pytest.mark.parametrize("text, vehicle", [
+    ("A squid the size of a bus.", "bus"),
+    ("Clouds like cotton wool.", "cotton"),
+    ("It moves as if a curtain were drawn.", "curtain"),
+    ("Ice no bigger than a marble.", "marble"),
+])
+def test_the_markers_that_announce_a_comparison(text, vehicle):
+    assert vehicle in visuals.simile_terms(text)
+
+
+def test_a_query_built_on_the_comparison_is_flagged():
+    warning = visuals.simile_warning(
+        3, "crushed metal can",
+        "Enough to crush a submarine like a tin can. It's utterly dark.",
+    )
+    assert "beat 3" in warning and "'can'" in warning
+
+
+def test_a_query_about_the_subject_is_left_alone():
+    assert not visuals.simile_warning(
+        3, "deep sea submarine",
+        "Enough to crush a submarine like a tin can. It's utterly dark.",
+    )
+
+
+def test_narration_without_a_comparison_is_never_flagged():
+    assert not visuals.simile_warning(
+        4, "bioluminescent deep sea", "Below that, creatures make their own light."
+    )
+
+
+def test_the_check_is_advisory_and_does_not_replace_the_query(monkeypatch):
+    """A warning the operator can read, not a good query silently discarded."""
+    from google import genai
+
+    beats = visuals.segment_script(
+        "Enough to crush a submarine like a tin can. It is utterly dark.", 8.0
+    )
+    payload = json.dumps([
+        {"index": beat.index, "query": "crushed metal can",
+         "alt": "deep sea pressure", "image_prompt": "a crushed tin can"}
+        for beat in beats
+    ])
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return type("R", (), {"text": payload})()
+
+    class FakeClient:
+        def __init__(self, api_key=None):
+            self.models = FakeModels()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(genai, "Client", FakeClient)
+
+    warnings = visuals.llm_queries(beats, "the deep ocean")
+
+    assert any("comparison" in w for w in warnings)
+    assert beats[0].query == "crushed metal can"     # flagged, not overridden
+    assert beats[0].query_source == "llm"
+
+
+def test_the_prompt_tells_the_model_which_half_to_shoot():
+    """The warning notices the failure; the prompt is what prevents it."""
+    assert "never the comparison" in visuals._QUERY_PROMPT_TEMPLATE
+    assert "tin can" in visuals._QUERY_PROMPT_TEMPLATE
+
+
+# ---------------------------------------------------------------------------
+# Step 2's sidecar
+#
+# Step 2 writes a .txt and a .json. Only the .json carries the hook card, and
+# the documented flow passed the .txt - so the card that step 2 wrote several
+# openings to choose between was dropped, and step 5 truncated the first line
+# mid-sentence instead ("A Roman messenger could cover 100").
+# ---------------------------------------------------------------------------
+
+def test_step_2_json_is_read_as_a_result_not_as_narration():
+    raw = json.dumps({"script": "A line. Another line.", "topic": "messengers",
+                      "hook_card": "100 miles a day"})
+    text, topic, card = visuals._resolve_script(visuals._load_step_2_result(raw))
+    assert text == "A line. Another line."
+    assert topic == "messengers"
+    assert card == "100 miles a day"
+
+
+def test_a_plain_script_file_is_still_narration():
+    raw = "A Roman messenger could cover 100 miles in a day."
+    assert visuals._load_step_2_result(raw) == raw
+
+
+def test_text_that_merely_starts_with_a_brace_is_not_guessed_at():
+    raw = "{not json at all, just a script that opens oddly"
+    assert visuals._load_step_2_result(raw) == raw
+
+
+def test_json_that_is_not_a_step_2_result_is_left_alone():
+    raw = json.dumps({"something": "else"})
+    assert visuals._load_step_2_result(raw) == raw
+
+
+def test_pexels_is_asked_for_english_descriptions():
+    """`alt` is published verbatim as the cover's alt text, and Pexels
+    localises it - a reel went out described in Spanish before this."""
+    session = FakeSession(routes={"pexels": FakeResponse(200, payload={"videos": []})})
+    visuals.PexelsProvider(session).search("ocean waves", "video", 5)
+
+    [call] = session.calls
+    assert call["params"]["locale"] == "en-US"
+
+
+def test_ytdl_console_output_is_swallowed():
+    """quiet/no_warnings do not cover yt-dlp's ERROR lines, which otherwise
+    land in output/logs looking like a failed run."""
+    options = visuals._ytdl_base_options()
+    logger = options["logger"]
+
+    for level in ("debug", "info", "warning", "error"):
+        getattr(logger, level)("[youtube] xyz: This video is not available")
+
+    assert options["quiet"] is True
+
