@@ -2001,3 +2001,53 @@ def test_the_backlog_window_advances_with_the_day(tmp_path, monkeypatch):
         monkeypatch.setattr(topics, "datetime", FixedDate)
         windows.add(tuple(c.topic for c in topics.EvergreenSource(None).fetch("", 3)))
     assert len(windows) == 3
+
+
+def test_a_boarded_backlog_line_can_still_clear_the_floor(tmp_path, monkeypatch):
+    """Board #41 skipped the day because it could not.
+
+    SCOUTED_PENALTY and EVERGREEN_PENALTY together cost 4.3 against a backlog
+    ceiling of 4.2, so the best possible line scored -0.1 and every daily run
+    skipped. The recency penalty a backlog line pays is its own.
+    """
+    monkeypatch.setattr(config, "TOPIC_EVERGREEN_FILE",
+                        backlog(tmp_path, "why the ocean is salty"))
+    line = topics.EvergreenSource(None).fetch("", 1)[0]
+
+    components = topics.score_candidate(
+        line, on_niche=True, seen=True)["components"]
+    assert components["on a recent board"] == topics.EVERGREEN_SCOUTED_PENALTY
+    assert components["from the backlog"] == topics.EVERGREEN_PENALTY
+
+    # The ceiling EVERGREEN_PENALTY is priced against: 1.0 niche + 1.2 shape
+    # + 1.5 footage + 0.5 curiosity. A line that reaches it must stay makeable
+    # after both penalties, or the board deadlocks the way #41 did.
+    ceiling = 1.0 + topics.EXPLAINER_BONUS + topics.SOURCEABLE_BONUS + 0.5
+    assert (ceiling + topics.EVERGREEN_SCOUTED_PENALTY
+            + topics.EVERGREEN_PENALTY) >= 1.0
+
+
+def test_a_scouted_topic_still_pays_the_full_recency_penalty():
+    seen = topics.score_candidate(
+        candidate("why the ocean is salty", rate=300, age_hours=2),
+        on_niche=True, seen=True)
+    assert seen["components"]["on a recent board"] == topics.SCOUTED_PENALTY
+
+
+def test_every_registered_source_is_known_to_the_self_check():
+    """`python config.py` called the working evergreen source an unknown name.
+
+    The registry is the list of sources that exist; TOPIC_SOURCE_KEYS is what
+    the self-check consults to say what each one needs. A source missing from
+    the second is reported as broken while running fine.
+    """
+    assert set(topics._SOURCES) <= set(config.TOPIC_SOURCE_KEYS)
+
+
+def test_the_self_check_reports_the_backlog_as_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TOPIC_SOURCES", ("evergreen",))
+    monkeypatch.setattr(config, "TOPIC_EVERGREEN_FILE",
+                        backlog(tmp_path, "why the ocean is salty"))
+    row, = topics.source_status()
+    assert row["known"] is True and row["ready"] is True
+    assert "unknown" not in row["detail"].lower()

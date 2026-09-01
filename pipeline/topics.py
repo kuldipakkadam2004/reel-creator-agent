@@ -237,6 +237,33 @@ SCOUTED_PENALTY = -2.5
 #: should overwrite.
 EVERGREEN_PENALTY = -1.8
 
+#: SCOUTED_PENALTY's replacement for a backlog line, because the full one and
+#: EVERGREEN_PENALTY together cost more than a backlog line can ever score.
+#:
+#: Measured on board #41 (2026-09-01): the daily run skipped with "the best of
+#: 8 scored -0.1", and all 8 were backlog lines carrying both penalties. The
+#: ceiling documented on EVERGREEN_PENALTY above is 1.0 niche + 1.2 shape + 1.5
+#: footage + 0.5 curiosity = 4.2, so -2.5 and -1.8 together put the *best
+#: possible* backlog line at -0.1 against a RUN_TOPIC_MIN_SCORE of 1.0. The
+#: board's top score being exactly -0.1 is that ceiling, not a coincidence.
+#:
+#: It could not recover on its own either. All 45 evergreen entries in the
+#: ledger had been boarded inside TOPIC_HISTORY_RUNS, and the lines that score
+#: best are the ones shown most often, so the good ones stayed the poisoned
+#: ones. Left alone the scheduled run skips every day, forever.
+#:
+#: The two numbers were priced independently and never against each other:
+#: EVERGREEN_PENALTY's own arithmetic ("lands at 1.9, or 2.4 carrying
+#: curiosity - clear of a 1.0 floor") assumes nothing else is subtracted.
+#:
+#: Not zero, because a board that opens on the same line every day is still
+#: worth varying, and `used` already drops a taken line outright. At -0.6 a
+#: clean line with footage lands at 1.3 and one carrying curiosity at 1.8, both
+#: clear of the floor, while a line the probe cannot shoot (footage +0.167)
+#: lands at -0.03 and still fails it - which is the trade EVERGREEN_PENALTY
+#: documents wanting.
+EVERGREEN_SCOUTED_PENALTY = -0.6
+
 # --- sourceability ----------------------------------------------------------
 # The check that makes step 0 belong to *this* pipeline rather than being a
 # generic trend reader.
@@ -1914,11 +1941,12 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
     if limit > 0 and candidate.age_hours > limit:
         parts["past its peak"] = STALE_PENALTY
 
-    if seen:
-        parts["on a recent board"] = SCOUTED_PENALTY
-
     if candidate.source == EvergreenSource.name:
+        if seen:
+            parts["on a recent board"] = EVERGREEN_SCOUTED_PENALTY
         parts["from the backlog"] = EVERGREEN_PENALTY
+    elif seen:
+        parts["on a recent board"] = SCOUTED_PENALTY
 
     return {"score": round(sum(parts.values()), 3), "components": parts}
 

@@ -419,6 +419,7 @@ TOPIC_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
     "youtube": ("YOUTUBE_API_KEY",),
     "trends": (),
     "wikipedia": (),
+    "evergreen": (),
 }
 
 #: Sources that run without their keys, more slowly or more thinly.
