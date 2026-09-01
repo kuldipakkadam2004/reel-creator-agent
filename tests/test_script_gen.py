@@ -1438,6 +1438,128 @@ def test_no_shipped_script_trips_the_seesaw_check():
         assert script_gen.seesaw_pairs(script_gen.split_sentences(script)) == []
 
 
+#: The shape of the canyon reel as it shipped: sentence three says what
+#: sentence two just said, in fewer words and with nothing added. No polarity
+#: flips, which is exactly why the seesaw check never saw it.
+SAYS_IT_TWICE = (
+    "This desert was once a seabed. "
+    "A canyon is a book that records that deep time. "
+    "It's a record of deep time. "
+    "Each layer of rock is a page. "
+    "But the river did not pile that rock up, it took it away. "
+    "You can still read the proof."
+)
+
+
+def test_a_sentence_reworded_and_said_again_is_caught_without_a_flip():
+    """The failure the seesaw check was built too narrowly to see.
+
+    The pair below scores high enough to be charged for, and always did. It
+    was never measured, because the seesaw check bailed on any pair whose
+    polarity does not turn over before it looked at the overlap at all.
+    """
+    sentences = script_gen.split_sentences(SAYS_IT_TWICE)
+    pairs = script_gen.restatement_pairs(sentences)
+
+    assert pairs == [(1, 2)]
+    assert "A canyon is a book" in sentences[1]
+    assert "It's a record of deep time" in sentences[2]
+
+
+def test_the_reworded_repeat_is_charged_hard_enough_to_buy_a_rewrite():
+    scored = script_gen.score_structure(SAYS_IT_TWICE)
+
+    assert scored["components"]["says the same thing twice"] == -2.0
+    assert scored["score"] < config.STRUCTURE_MIN_SCORE
+
+
+def test_the_rewrite_is_told_the_second_sentence_is_padding():
+    faults = script_gen.structure_faults(
+        script_gen.score_structure(SAYS_IT_TWICE)["components"]
+    )
+    assert "padding" in faults
+
+
+def test_a_script_that_repeats_itself_is_rewritten_however_well_it_scores(
+    monkeypatch,
+):
+    """The rule had no enforcement: it was in both prompts and nowhere else.
+
+    Dropping the threshold under the script's own score takes away the
+    ordinary reason to buy a rewrite, so what is left buying one is the repeat
+    itself - rather than the -2.0 charge happening to outweigh whatever else
+    fired, which is arithmetic between two constants and not a decision.
+    """
+    monkeypatch.setattr(config, "STRUCTURE_MIN_SCORE", -10.0)
+    fake_rewrite(monkeypatch, SHAPELY)
+    report = script_gen.choose_structure("canyons", SAYS_IT_TWICE)
+
+    assert report["score"] >= config.STRUCTURE_MIN_SCORE  # nothing is owed
+    assert report["revised"] is True                      # and one is bought
+
+
+def test_a_script_that_says_each_thing_once_still_buys_nothing(monkeypatch):
+    # The other half of the test above: it is the repeat that forces the call,
+    # not the lowered threshold.
+    monkeypatch.setattr(config, "STRUCTURE_MIN_SCORE", -10.0)
+    monkeypatch.setattr(script_gen, "call_gemini", _explode)
+    report = script_gen.choose_structure("salt", SHAPELY)
+
+    assert report["revised"] is False
+
+
+def test_a_reworded_repeat_and_a_negated_one_are_not_charged_twice():
+    """The two checks split the neighbouring pairs between them on the flip."""
+    for script in (SAYS_IT_TWICE, SEESAW):
+        sentences = script_gen.split_sentences(script)
+        both = set(script_gen.seesaw_pairs(sentences))
+        both &= set(script_gen.restatement_pairs(sentences))
+        assert both == set()
+
+
+def test_a_chain_that_carries_a_subject_forward_is_not_a_repeat():
+    """Where the threshold has to sit, measured against what has shipped.
+
+    "Then it flows into rivers. The rivers carry the salt into the sea." is
+    the closest any legitimate pair in the shipped scripts comes, and it is a
+    step in an argument: the second sentence takes the subject the first one
+    handed it and does something new with it.
+    """
+    chain = (
+        "Rain picks up carbon dioxide on the way down. "
+        "Then it flows into rivers. "
+        "The rivers carry the salt into the sea. "
+        "Nothing carries it back out."
+    )
+    assert script_gen.restatement_pairs(script_gen.split_sentences(chain)) == []
+
+
+def test_a_real_turn_is_still_judged_against_the_higher_threshold():
+    """The good version of the flip must not fall through to the lower bar.
+
+    "It doesn't." is one of the strongest turns available. It flips, so it is
+    the seesaw check's business and never the restatement check's, and it goes
+    on being measured against the threshold that was set for it.
+    """
+    good = (
+        "The deep sea should crush every creature flat. "
+        "It doesn't. "
+        "Snailfish hold their shape eleven kilometres down. "
+        "The pressure never wins."
+    )
+    sentences = script_gen.split_sentences(good)
+    assert script_gen.restatement_pairs(sentences) == []
+    assert script_gen.seesaw_pairs(sentences) == []
+
+
+def test_no_shipped_script_says_anything_twice_by_accident():
+    """Guards the lower threshold against being read as a false positive."""
+    for script in (SHAPELY, RESTATES, DRIFTS):
+        assert script_gen.restatement_pairs(
+            script_gen.split_sentences(script)
+        ) == []
+
+
 def test_the_prompt_forbids_saying_a_thing_twice_negated():
     assert "negated" in script_gen.PROMPT_TEMPLATE
     assert "negated" in script_gen._STRUCTURE_PROMPT_TEMPLATE

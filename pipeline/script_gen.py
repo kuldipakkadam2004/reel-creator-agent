@@ -111,8 +111,11 @@ You are a scriptwriter for short-form vertical video (Instagram Reels, \
 TikTok, YouTube Shorts). You write narration that is spoken aloud by a \
 voiceover artist, never read on screen.
 
-Your writing is punchy, concrete and conversational. You use short sentences. \
-You favour vivid specifics over generalities, and you never pad."""
+Your writing is punchy, concrete and conversational. You build rhythm out \
+of contrast - a long sentence that gathers speed, then three words that \
+stop it dead - because sentences that all come in at the same length are a \
+metronome, and the ear stops hearing a metronome. You favour vivid \
+specifics over generalities, and you never pad."""
 
 
 PROMPT_TEMPLATE = """\
@@ -129,11 +132,15 @@ to hear the next sentence. No throat-clearing, no "in this video", no \
 does not answer until its final line. Do not answer it early.
 - Turn somewhere in the middle: a point where what the viewer assumed stops \
 being true. "But", "except", "the part nobody mentions".
-- Write for the ear, not the eye. Short sentences. Natural spoken rhythm.
+- Write for the ear, not the eye. Most sentences short - but vary the \
+length on purpose: at least two sentences must run past fifteen words and \
+build, and at least two must come in under four words and land. The \
+alternation between them IS the rhythm. Sentences that all come in at the \
+same length read as a metronome, however punchy each one is by itself.
 - Be specific. Use real details, numbers or images rather than vague claims.
 - Never stop to ask a question you are about to answer yourself.
 - Every claim must survive the evidence you give for it. If the facts you cite do not support the line you opened with, change the opening rather than asserting past them - a viewer who hears the numbers contradict the claim stops trusting the rest.
-- Say a thing once. Never follow a sentence with the same sentence negated ("they don't sleep less than us. We sleep less than them"): heard once, at speed, that reads as a contradiction and the viewer stops to work out which way round it goes.
+- Say a thing once. Never follow a sentence with the same sentence reworded ("A canyon is a book that records that deep time. It's a record of deep time"), and never follow one with the same sentence negated ("they don't sleep less than us. We sleep less than them"). Heard once, at speed, the first is dead air the viewer has already understood, and the second reads as a contradiction they stop to work out the direction of. Move on instead: the next sentence carries something the last one did not.
 - End on a short line that answers the opening in DIFFERENT words - not a \
 restatement of it, not a summary of the script. It should run back into the \
 opening line closely enough that a viewer watching twice hears the two as \
@@ -1182,6 +1189,23 @@ _STRUCTURE_FILLER_QUESTION_RE = re.compile(
 #: the same handful of words with the polarity flipped.
 _STRUCTURE_SEESAW_OVERLAP = 0.75
 
+#: How alike two neighbouring sentences have to be, when the polarity does
+#: *not* flip, before the second one is a restatement of the first rather than
+#: the next step in an argument. Lower than the seesaw threshold above, for two
+#: reasons. The negation words are stripped from both sides before the
+#: comparison, which shrinks the sets and inflates the ratio - so 0.75 measured
+#: across a flip is not the same amount of sameness as 0.75 measured without
+#: one. And the corpus leaves room: across the 170 neighbouring pairs in the 13
+#: scripts shipped so far the highest legitimate score is 0.5 ("Then it flows
+#: into rivers. The rivers carry the salt into the sea." - a chain, not a
+#: repeat), while the canyon reel's "A canyon is a book that records that deep
+#: time. It's a record of deep time." scores 0.75. Nothing sits between them,
+#: and 0.6 sits in the gap rather than on the edge of it - the canyon pair only
+#: comes in as low as 0.75 because "It's" stems to "it'" and pads the smaller
+#: set, and a restatement written with a different contraction would fall off
+#: the knife edge that reusing 0.75 would put it on.
+_STRUCTURE_RESTATEMENT_OVERLAP = 0.6
+
 #: ...and both sides must actually say something. Without this, "It doesn't."
 #: pairs with whatever precedes it - which is the *good* version of this shape,
 #: a flat claim knocked down in three words, and must never be charged for.
@@ -1316,6 +1340,33 @@ def closing_sentences(sentences: list[str]) -> list[str]:
     return sentences[-min(_STRUCTURE_CLOSE_SENTENCES, room):]
 
 
+def _neighbour_pairs(
+    sentences: list[str],
+) -> list[tuple[tuple[int, int], float, bool]]:
+    """Every neighbouring pair, how alike it is, and whether polarity flips.
+
+    Negations are dropped from both sides before the comparison so the flip
+    itself cannot be what makes two otherwise identical sentences look
+    different. A pair where either side carries less than
+    _STRUCTURE_SEESAW_MIN_WORDS of subject matter scores 0.0 rather than being
+    left out, because "It doesn't." pairs with whatever precedes it and that is
+    the *good* version of this shape.
+    """
+    measured: list[tuple[tuple[int, int], float, bool]] = []
+    for index in range(len(sentences) - 1):
+        first, second = sentences[index], sentences[index + 1]
+        flipped = (bool(_NEGATION_RE.search(first))
+                   != bool(_NEGATION_RE.search(second)))
+        left = {w for w in _content_words(first)
+                if not _NEGATION_RE.fullmatch(w)}
+        right = {w for w in _content_words(second)
+                 if not _NEGATION_RE.fullmatch(w)}
+        thin = min(len(left), len(right)) < _STRUCTURE_SEESAW_MIN_WORDS
+        overlap = 0.0 if thin else _overlap(left, right)
+        measured.append(((index, index + 1), overlap, flipped))
+    return measured
+
+
 def seesaw_pairs(sentences: list[str]) -> list[tuple[int, int]]:
     """Neighbouring sentences that say the same thing, one of them negated.
 
@@ -1334,27 +1385,36 @@ def seesaw_pairs(sentences: list[str]) -> list[tuple[int, int]]:
     against the old one - "The deep sea should crush every creature flat. It
     doesn't." shares no content words at all and is one of the strongest turns
     available. Only a restatement can score above the threshold.
+
+    Restatement *without* the flip is `restatement_pairs`, on its own lower
+    threshold. This function only ever looks at pairs whose polarity turns
+    over, which is what lets that threshold stay as high as it is.
     """
-    found: list[tuple[int, int]] = []
-    for index in range(len(sentences) - 1):
-        first, second = sentences[index], sentences[index + 1]
-        negated = (
-            bool(_NEGATION_RE.search(first)),
-            bool(_NEGATION_RE.search(second)),
-        )
-        if negated[0] == negated[1]:
-            continue                     # both or neither: not a flip
-        # Negations are dropped before the comparison so the flip itself
-        # cannot be what makes the two sentences look different.
-        left = {w for w in _content_words(first)
-                if not _NEGATION_RE.fullmatch(w)}
-        right = {w for w in _content_words(second)
-                 if not _NEGATION_RE.fullmatch(w)}
-        if min(len(left), len(right)) < _STRUCTURE_SEESAW_MIN_WORDS:
-            continue
-        if _overlap(left, right) >= _STRUCTURE_SEESAW_OVERLAP:
-            found.append((index, index + 1))
-    return found
+    return [pair for pair, overlap, flipped in _neighbour_pairs(sentences)
+            if flipped and overlap >= _STRUCTURE_SEESAW_OVERLAP]
+
+
+def restatement_pairs(sentences: list[str]) -> list[tuple[int, int]]:
+    """Neighbouring sentences that say the same thing twice, plainly.
+
+    The shape this catches, from a real run about the Grand Canyon:
+
+        A canyon is a book that records that deep time.
+        It's a record of deep time.
+
+    Both prompts have asked for "say a thing once" from the start, and until
+    now nothing measured it: `seesaw_pairs` requires a polarity flip before it
+    ever looks at the overlap, so the pair above - which scores high enough to
+    be charged for - walked past the only detector there was.
+
+    The two functions split the neighbouring pairs between them on that flip,
+    so nothing is charged twice and the good version of the flip is still safe.
+    A real turn - "The deep sea should crush every creature flat. It doesn't."
+    - flips, and is judged against the higher threshold it has always been
+    judged against.
+    """
+    return [pair for pair, overlap, flipped in _neighbour_pairs(sentences)
+            if not flipped and overlap >= _STRUCTURE_RESTATEMENT_OVERLAP]
 
 
 def score_structure(script: str) -> dict:
@@ -1416,6 +1476,16 @@ def score_structure(script: str) -> dict:
     if seesaws:
         parts["argues with itself"] = round(-2.0 * len(seesaws), 3)
 
+    # Charged the same as the seesaw, and for the same reason: a script that
+    # says a thing twice is worse than a script with a long last line, and
+    # every other rule here is blind to it. The canyon reel closed its loop,
+    # turned in the middle, landed short, scored the ceiling and shipped with
+    # "It's a record of deep time." sitting under "A canyon is a book that
+    # records that deep time."
+    repeats = restatement_pairs(sentences)
+    if repeats:
+        parts["says the same thing twice"] = round(-2.0 * len(repeats), 3)
+
     return {"score": round(sum(parts.values()), 3), "components": parts}
 
 
@@ -1436,6 +1506,9 @@ def structure_faults(components: dict) -> str:
         "argues with itself":
             "two sentences next to each other say the same thing with the "
             "polarity flipped, so the claim reads as a contradiction",
+        "says the same thing twice":
+            "two sentences next to each other say the same thing in different "
+            "words, so the second one is heard as padding",
     }
     faults = [said[name] for name in components if name in said]
     if "a turn mid-reel" not in components:
@@ -1481,8 +1554,13 @@ the opening and it must not summarise the script.
 - the final line runs back into the opening line. Read the last line and the \
 first line one after the other: they should sound continuous, because a viewer \
 who watches it twice hears them that way.
+- the sentence lengths vary. Across the whole narration at least two \
+sentences run past fifteen words and build, and at least two come in \
+under four words and land; keep the rest short. That alternation is the \
+rhythm, and a rewrite that hands back sentences all the same length has \
+flattened it, however clean each one reads on its own.
 - it never stops to ask itself a question it is about to answer.
-- no sentence is followed by the same sentence negated. Say each thing once, in the direction that makes the claim clearest.
+- no sentence is followed by the same sentence reworded, and none is followed by the same sentence negated. Say each thing once, in the direction that makes the claim clearest, and give the next sentence something new to carry.
 - the claims survive the facts quoted for them. Where a number does not support the line it sits under, cut the claim rather than asserting past it.
 
 Keep the same facts and invent no new numbers. Keep the whole thing between \
@@ -1593,7 +1671,16 @@ def choose_structure(topic: str, script: str,
     # threshold sits at the score of a script that closes its loop and does
     # nothing else, so everything failing to close one is rewritten and nothing
     # that closes one is rewritten for polish.
-    if incumbent["score"] >= config.STRUCTURE_MIN_SCORE:
+    # ...with one exception. "Say a thing once" is in both prompts and was, for
+    # a long time, the only rule here with nothing behind it. A script that
+    # repeats itself buys the rewrite whatever the rest of its shape scores,
+    # rather than depending on the -2.0 charge happening to outweigh whatever
+    # else fired. The charge does outweigh it today - the ceiling is 3.7 - but
+    # that is arithmetic between two constants, not a decision, and it would
+    # stop being true the first time a component is added or a weight moves.
+    repeats = {"argues with itself", "says the same thing twice"}
+    said_twice = repeats & set(incumbent["components"])
+    if incumbent["score"] >= config.STRUCTURE_MIN_SCORE and not said_twice:
         return report
 
     result = revise_structure(topic, script, duration_seconds)
