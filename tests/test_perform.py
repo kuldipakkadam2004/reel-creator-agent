@@ -189,7 +189,9 @@ def test_features_read_the_run_directory_s_manifests(paths, tmp_path):
         "duration_seconds": 52.69,
         "stats": {"shots": 16, "beats": 12, "sfx_cues": 2},
         "captions": {"backend": "elevenlabs", "loss": 0.119},
-        "music": {"name": "drift"},
+        # The key step 5 actually writes. This fixture said "name" for a long
+        # time, which is why the reader agreeing with it went unnoticed.
+        "music": {"file": "drift.mp3", "credit": "\"Drift\" by x (CC BY 3.0)"},
     }), encoding="utf-8")
     (run_dir / "post.json").write_text(json.dumps({
         "mode": "llm",
@@ -202,9 +204,41 @@ def test_features_read_the_run_directory_s_manifests(paths, tmp_path):
 
     assert features["shots"] == 16
     assert features["aligner"] == "elevenlabs"
-    assert features["music"] == "drift"
+    assert features["music"] == "drift.mp3"
     assert features["tag_bands"] == {"broad": 1, "mid": 2}
     assert features["duration_band"] == "50-60s"
+
+
+def test_the_music_column_reads_what_step_5_actually_writes(paths, tmp_path):
+    """Ties the reader to the writer instead of to a hand-typed fixture.
+
+    The bug this pins: `Track.to_dict` writes "file", the features row read
+    "name", and both sides had tests that agreed with themselves. Every reel
+    ever made was recorded as having no music.
+    """
+    from pipeline.assemble import Track
+
+    written = Track(path=tmp_path / "millennium-sunset.mp3",
+                    credit='"Millennium sunset" by zero-project (CC BY 3.0)',
+                    credit_required=True, duration=104.0).to_dict()
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "assembly.json").write_text(
+        json.dumps({"music": written}), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+    assert features["music"] == "millennium-sunset.mp3"
+    assert ("music", "on") in perform.facets(features, {})
+
+
+def test_rows_written_before_the_music_fix_are_not_asked_about_music(paths):
+    """They all say "" whether a bed played or not - that is a typo, not silence."""
+    old = {**_features("r1"), "features_version": 2}
+    new = {**_features("r2"), "music": "millennium-sunset.mp3"}
+
+    assert not any(q == "music" for q, _ in perform.facets(old, {}))
+    assert ("music", "on") in perform.facets(new, {})
 
 
 def test_a_missing_manifest_costs_a_column_not_the_row(paths):

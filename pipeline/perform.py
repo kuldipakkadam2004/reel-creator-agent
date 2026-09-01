@@ -73,7 +73,13 @@ from pipeline import visuals  # noqa: E402
 #: version 1 row carries neither, and `facets` declines to ask it those
 #: questions rather than reading the absence as "no components fired" or "the
 #: footage was static" - the same distinction a backfilled row already draws.
-FEATURES_VERSION = 2
+#: 3 is the first version whose `music` column is true. Step 5 writes the
+#: track's filename under "file"; this read it as "name" and got None every
+#: time, so every row up to and including version 2 says the reel had no music
+#: whether it had a bed or not. They are not evidence of silence, they are
+#: evidence of a typo, and `facets` skips the question for them rather than
+#: scoring every reel ever made as music-off.
+FEATURES_VERSION = 3
 
 LEDGER_VERSION = 1
 
@@ -251,7 +257,10 @@ def features_for(record: dict) -> dict:
         "assets_sourced": stats.get("assets_sourced"),
         "moving_shots": stats.get("moving_shots") or 0,
         "sfx_cues": stats.get("sfx_cues") or 0,
-        "music": (music.get("name") or "") if music else "",
+        # "file", not "name": `Track.to_dict` writes the filename under "file"
+        # and has no "name" key at all, so this read None on every reel that
+        # had a bed playing. See FEATURES_VERSION 3.
+        "music": (music.get("file") or "") if music else "",
 
         "aligner": captions.get("backend") or "",
         "caption_loss": captions.get("loss"),
@@ -666,7 +675,11 @@ def facets(features: dict, vocabulary: dict[str, list[str]]) -> list[tuple[str, 
                       "rewritten" if features.get("structure_revised") else "kept"))
     if features.get("aligner"):
         pairs.append(("captions", str(features["aligner"])))
-    pairs.append(("music", "on" if features.get("music") else "off"))
+    # Only from version 3: every earlier row records "" for the music whether
+    # a bed played or not, so asking them scores the whole back catalogue as
+    # music-off and buries whatever the column is worth.
+    if _written_since(features, 3):
+        pairs.append(("music", "on" if features.get("music") else "off"))
     pairs.append(("sfx", "on" if features.get("sfx_cues") else "off"))
     if _written_since(features, 2):
         pairs.append(("motion", "on" if features.get("moving_shots") else "off"))
