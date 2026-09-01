@@ -112,6 +112,11 @@ MAX_DOWNLOAD_BYTES = 120 * 1024 * 1024
 #: One retry after a 429, then the provider is benched for the rest of the run.
 RATE_LIMIT_BACKOFF_SECONDS = 2.0
 
+#: ...and after a transfer that broke off mid-body. Shorter than the rate-limit
+#: wait because nothing is asking us to back off: the file was being served and
+#: the connection dropped, so the second attempt is the cheap one to make.
+TRANSIENT_BACKOFF_SECONDS = 1.0
+
 #: How many downloads a single beat may attempt before giving up. Without a cap,
 #: one beat can burn a hundred requests on a provider that refuses them all.
 MAX_DOWNLOAD_ATTEMPTS_PER_BEAT = 8
@@ -234,6 +239,21 @@ class ProviderRateLimitError(ProviderError):
 
     def __init__(self, message: str, *, provider: str = ""):
         super().__init__(message, provider=provider, fatal=True)
+
+
+class ProviderTransientError(ProviderError):
+    """The transfer broke mid-flight. Worth one more go, then step over it.
+
+    A dead link is a fact about the URL and a truncated body is a fact about
+    the network, and the difference decides whether trying again is sensible.
+    Both are `ProviderError` so every caller that already steps over a bad
+    candidate keeps doing so; only `_download_with_backoff` reads the
+    distinction, and only to spend one retry on it.
+
+    Not fatal: a stream that broke off says nothing about the provider, and
+    benching pexels because one 20MB file arrived short would cost the run the
+    only provider it has.
+    """
 
 
 class NoAssetsError(VisualsError):
@@ -2179,7 +2199,7 @@ def download(session, url: str, destination: Path, *, provider: str) -> dict:
     try:
         response = session.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
     except requests.exceptions.RequestException as exc:
-        raise ProviderError(
+        raise ProviderTransientError(
             f"{provider} download failed: {type(exc).__name__}: {exc}", provider=provider
         ) from exc
 
@@ -2234,6 +2254,22 @@ def download(session, url: str, destination: Path, *, provider: str) -> dict:
                     provider=provider,
                 )
             os.replace(partial, destination)
+        except requests.exceptions.RequestException as exc:
+            # The headers arrived and then the body did not: a truncated
+            # chunked body, a reset connection, a read timeout part-way
+            # through. Only the `session.get` above was converted before, so
+            # this escaped `download` as a bare requests exception, past every
+            # `except ProviderError` between here and the beat loop, and took
+            # the whole beat with it - along with the neutral-shot and
+            # reject-recovery fallbacks that exist for exactly this. Measured
+            # on the deep-ocean run: three beats lost to it, 12.7s of the
+            # narration's best lines handed to a world map.
+            partial.unlink(missing_ok=True)
+            raise ProviderTransientError(
+                f"{provider} download broke off after {written / 1e6:.1f}MB: "
+                f"{type(exc).__name__}: {exc}",
+                provider=provider,
+            ) from exc
         except BaseException:
             partial.unlink(missing_ok=True)
             raise
@@ -2853,7 +2889,13 @@ def _download_host(url: str) -> str:
 
 
 def _download_with_backoff(session, candidate: Candidate, target: Path) -> dict:
-    """One download, retried once after a rate limit before giving up."""
+    """One download, retried once after a rate limit or a broken stream.
+
+    Both retries are worth making for the same reason and no others are: the
+    URL is good and something outside it went wrong. A 404, an HTML error page
+    and an over-cap file all come back as a plain `ProviderError` and are not
+    retried, because the second attempt would fetch the same bytes.
+    """
     for attempt in (0, 1):
         try:
             return download(
@@ -2862,6 +2904,11 @@ def _download_with_backoff(session, candidate: Candidate, target: Path) -> dict:
         except ProviderRateLimitError:
             if attempt == 0:
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+                continue
+            raise
+        except ProviderTransientError:
+            if attempt == 0:
+                time.sleep(TRANSIENT_BACKOFF_SECONDS)
                 continue
             raise
     raise AssertionError("unreachable")

@@ -1683,6 +1683,125 @@ def test_empty_body_is_rejected(tmp_path):
     assert not (tmp_path / "a.mp4.part").exists()
 
 
+class TruncatedResponse(FakeResponse):
+    """Headers arrive, then the body breaks off part-way through.
+
+    What a real ChunkedEncodingError looks like from `download`'s side: the
+    status and Content-Type are fine, some bytes land, and then the connection
+    dies. This is the shape that lost three beats on the deep-ocean run.
+    """
+
+    #: Bytes per yielded chunk. Fixed rather than taking `chunk_size`, so the
+    #: break lands mid-body whatever DOWNLOAD_CHUNK_SIZE is set to - at its
+    #: real 64KB the whole test body would arrive in one piece and nothing
+    #: would break at all.
+    piece = 64
+
+    def __init__(self, body=b"a-real-clip-" * 64, after=2, headers=None):
+        super().__init__(200, body=body,
+                         headers=headers or {"Content-Type": "video/mp4"})
+        self.after = after
+
+    def iter_content(self, chunk_size=8192):
+        import requests
+
+        for index, start in enumerate(range(0, len(self.content), self.piece)):
+            if index >= self.after:
+                raise requests.exceptions.ChunkedEncodingError(
+                    "Connection broken: IncompleteRead(128 bytes read, "
+                    "19726597 more expected)"
+                )
+            yield self.content[start:start + self.piece]
+
+
+def test_a_broken_stream_is_a_provider_error_not_a_raw_requests_error(tmp_path):
+    """The whole point: `_acquire` only steps over `ProviderError`.
+
+    A bare requests exception escaped past it, past the beat loop's own
+    handlers, and cost the beat its footage plus every fallback below it.
+    """
+    session = FakeSession(default=TruncatedResponse())
+    destination = tmp_path / "clip.mp4"
+
+    with pytest.raises(visuals.ProviderTransientError, match="broke off"):
+        visuals.download(session, "https://x/clip.mp4", destination,
+                         provider="stub")
+
+    assert isinstance(visuals.ProviderTransientError("x"), visuals.ProviderError)
+    assert not destination.exists()
+    assert not (tmp_path / "clip.mp4.part").exists(), "left a partial file behind"
+
+
+def test_a_broken_stream_does_not_bench_the_provider(tmp_path):
+    """A dropped connection says nothing about the provider's health."""
+    session = FakeSession(default=TruncatedResponse())
+    with pytest.raises(visuals.ProviderTransientError) as caught:
+        visuals.download(session, "https://x/a.mp4", tmp_path / "a.mp4",
+                         provider="stub")
+    assert caught.value.fatal is False
+
+
+def test_a_broken_stream_buys_one_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(visuals.time, "sleep", lambda _: None)
+    attempts = []
+
+    def flaky(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            return TruncatedResponse()
+        return unique_media(url)
+
+    session = FakeSession(default=flaky)
+    candidate = make_candidate(0)
+    result = visuals._download_with_backoff(session, candidate, tmp_path / "a.mp4")
+
+    assert len(attempts) == 2, "a truncated body should be tried once more"
+    assert result["bytes"] > 0
+
+
+def test_a_dead_url_is_not_retried(tmp_path, monkeypatch):
+    """Only transient failures buy the retry - a 404 serves the same bytes."""
+    monkeypatch.setattr(visuals.time, "sleep", lambda _: None)
+    attempts = []
+
+    def gone(url):
+        attempts.append(url)
+        return FakeResponse(404, body=b"gone")
+
+    session = FakeSession(default=gone)
+    with pytest.raises(visuals.ProviderError, match="404"):
+        visuals._download_with_backoff(session, make_candidate(0),
+                                       tmp_path / "a.mp4")
+    assert len(attempts) == 1
+
+
+def test_a_broken_stream_costs_one_asset_not_the_beat(sandbox, monkeypatch):
+    """The regression this whole fix exists for.
+
+    Before it, one truncated body took the beat down and skipped the
+    neutral-shot and reject-recovery fallbacks with it.
+    """
+    monkeypatch.setattr(visuals.time, "sleep", lambda _: None)
+    broken = "/0.mp4"
+
+    def route(url):
+        if url.endswith(broken):
+            return TruncatedResponse()
+        return unique_media(url)
+
+    monkeypatch.setattr(visuals, "_new_session", lambda: FakeSession(default=route))
+    manifest = run_visuals()
+
+    beat = next(b for b in manifest["beats"] if b["index"] == 0)
+    assert beat["status"] == "ok", "a broken stream took the beat down with it"
+    assert len(beat["asset_indexes"]) == 2, "the beat fell short of its shots"
+    assert not any(a["provider_id"] == "video0" for a in manifest["assets"])
+    assert any("broke off" in w for w in manifest["warnings"])
+    # ...which is exactly how the same beat behaves when a URL is simply dead.
+    assert manifest["stats"]["beats_failed"] == 1  # the last beat, starved of
+    assert manifest["beats"][-1]["index"] == 7     # catalogue either way
+
+
 def test_oversized_file_is_refused_before_download(tmp_path):
     session = FakeSession(default=FakeResponse(200, body=b"x", headers={
         "Content-Type": "video/mp4",
@@ -2446,4 +2565,3 @@ def test_ytdl_console_output_is_swallowed():
         getattr(logger, level)("[youtube] xyz: This video is not available")
 
     assert options["quiet"] is True
-
