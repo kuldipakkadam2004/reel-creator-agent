@@ -432,7 +432,19 @@ REQUIRED_TOPICS: tuple[str, ...] = ()
 
 # Step 2 — script generation
 GEMINI_API_KEY = get_env("GEMINI_API_KEY")
-GEMINI_MODEL = get_env("GEMINI_MODEL", "gemini-2.5-flash")
+#: Pro rather than Flash. Four calls write the narration - the draft, then the
+#: hook, structure and claim passes rewriting it - and each of those passes
+#: optimises one narrow thing: opening punch, shape, factual survival. None of
+#: them optimises for voice, so what shipped was Flash's rewrite of Flash's
+#: rewrite of Flash's draft and it read like a metronome. At a few hundred
+#: words once a day the difference in cost is not worth measuring.
+#:
+#: Read by more than step 2: step 0's topic scouting, step 4's query writing
+#: and relevance screening, and the caption. The two screening calls in
+#: `visuals.py` already branch on this name - they drop their zero thinking
+#: budget, which only the flash family accepts - so they follow it correctly,
+#: just more slowly than they were tuned for.
+GEMINI_MODEL = get_env("GEMINI_MODEL", "gemini-2.5-pro")
 REQUIRED_SCRIPT_GEN = ("GEMINI_API_KEY",)
 
 # --- the length -------------------------------------------------------------

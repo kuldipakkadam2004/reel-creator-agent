@@ -728,14 +728,20 @@ def llm_queries(beats: list[Beat], topic: str) -> list[str]:
         from google import genai
         from google.genai import types
 
+        from pipeline import script_gen   # the pro-model quirks live there
+
         kwargs = {
             "system_instruction": _QUERY_SYSTEM_INSTRUCTION,
             "temperature": QUERY_MODEL_TEMPERATURE,
             "max_output_tokens": QUERY_MODEL_MAX_TOKENS,
             "response_mime_type": "application/json",
         }
-        # Only the 2.5 flash family accepts a zero thinking budget; pro rejects it.
-        if "pro" not in config.GEMINI_MODEL.lower():
+        # Only the 2.5 flash family accepts a zero thinking budget; pro rejects
+        # it and spends the ceiling on reasoning instead, so it is raised by
+        # the same headroom step 2 gives its own calls.
+        if script_gen.is_pro_model():
+            kwargs["max_output_tokens"] += script_gen.PRO_THINKING_HEADROOM
+        else:
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=QUERY_THINKING_BUDGET
             )
@@ -1866,13 +1872,17 @@ def llm_screen(
         from google import genai
         from google.genai import types
 
+        from pipeline import script_gen   # the pro-model quirks live there
+
         kwargs = {
             "system_instruction": _SCREEN_SYSTEM_INSTRUCTION,
             "temperature": SCREEN_MODEL_TEMPERATURE,
             "max_output_tokens": SCREEN_MODEL_MAX_TOKENS,
             "response_mime_type": "application/json",
         }
-        if "pro" not in config.GEMINI_MODEL.lower():
+        if script_gen.is_pro_model():
+            kwargs["max_output_tokens"] += script_gen.PRO_THINKING_HEADROOM
+        else:
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=SCREEN_THINKING_BUDGET
             )

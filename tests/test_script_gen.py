@@ -229,6 +229,67 @@ def test_the_cli_falls_back_to_the_configured_default(scripted_gemini,
 
 
 # ---------------------------------------------------------------------------
+# The model family: what a pro model needs that a flash one does not
+# ---------------------------------------------------------------------------
+
+def _config_for(model: str, ceiling: int = script_gen.MAX_OUTPUT_TOKENS):
+    return script_gen._build_generation_config(
+        model,
+        system_instruction="write a reel",
+        temperature=script_gen.TEMPERATURE,
+        max_output_tokens=ceiling,
+        thinking_budget=script_gen.THINKING_BUDGET,
+        json_mode=False,
+    )
+
+
+def test_a_pro_model_is_given_room_for_the_thinking_it_cannot_skip():
+    """The first pro run of step 2 returned nothing at all.
+
+    A pro model cannot be told to stop thinking, and on 2.5 the reasoning is
+    charged against max_output_tokens - so a ceiling sized for a ninety-word
+    script was spent before the script started and the call came back empty
+    with finish_reason=MAX_TOKENS.
+    """
+    assert _config_for("gemini-2.5-pro").max_output_tokens == (
+        script_gen.MAX_OUTPUT_TOKENS + script_gen.PRO_THINKING_HEADROOM
+    )
+
+
+def test_a_flash_model_keeps_the_ceiling_it_was_given():
+    # Flash is told not to think at all, so there is nothing to make room for.
+    assert (_config_for("gemini-2.5-flash").max_output_tokens
+            == script_gen.MAX_OUTPUT_TOKENS)
+
+
+def test_the_headroom_is_added_to_whatever_the_caller_asked_for():
+    """Step 4 and step 6 have their own opinions about answer length.
+
+    The headroom is added to the caller's ceiling rather than replacing it, so
+    a call that wanted a short answer still gets a short answer - it just also
+    gets room to reason its way to one.
+    """
+    assert _config_for("gemini-2.5-pro", 512).max_output_tokens == (
+        512 + script_gen.PRO_THINKING_HEADROOM
+    )
+
+
+def test_only_a_flash_model_is_sent_a_zero_thinking_budget():
+    # A zero budget is what pro rejects outright, so it is never sent one.
+    assert _config_for("gemini-2.5-pro").thinking_config is None
+    assert _config_for("gemini-2.5-flash").thinking_config.thinking_budget == 0
+
+
+def test_the_model_family_is_decided_in_one_place(monkeypatch):
+    """Step 4 builds its own generation config and asks the same question."""
+    assert script_gen.is_pro_model("gemini-2.5-pro") is True
+    assert script_gen.is_pro_model("gemini-2.5-flash") is False
+
+    monkeypatch.setattr(config, "GEMINI_MODEL", "gemini-2.5-pro")
+    assert script_gen.is_pro_model() is True
+
+
+# ---------------------------------------------------------------------------
 # The claims: is any of this true?
 # ---------------------------------------------------------------------------
 

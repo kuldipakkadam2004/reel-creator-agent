@@ -72,6 +72,18 @@ MAX_OUTPUT_TOKENS = 2048
 #: Skipped for `pro` models, which cannot disable thinking.
 THINKING_BUDGET = 0
 
+#: Room for the thinking a pro model cannot be told to skip. On 2.5 the
+#: reasoning tokens are charged against max_output_tokens, so a ceiling sized
+#: for the answer alone is spent before the answer starts and the call comes
+#: back empty with finish_reason=MAX_TOKENS - which is exactly what the first
+#: pro run of step 2 did, on a 2048 ceiling and a ninety-word script.
+#:
+#: Added to whatever ceiling the caller asked for rather than replacing it, so
+#: every caller keeps its own opinion about how long the answer may be and
+#: none of them has to know why the number moved. A ceiling is not a spend:
+#: on a model that reasons briefly this costs nothing.
+PRO_THINKING_HEADROOM = 8192
+
 #: Accepted duration range, in seconds.
 MIN_DURATION_SECONDS = 5
 MAX_DURATION_SECONDS = 180
@@ -271,21 +283,33 @@ def _extract_text(response) -> str:
     )
 
 
+def is_pro_model(model: str | None = None) -> bool:
+    """Whether `model` reasons on every call and cannot be told not to.
+
+    Two things follow from it and both are easy to get half right, so they are
+    decided in one place: a zero thinking budget must not be sent, and the
+    output ceiling must leave room for the thinking that happens anyway.
+    Step 4 builds its own generation config and asks the same question.
+    """
+    return "pro" in (model or config.GEMINI_MODEL).lower()
+
+
 def _build_generation_config(model: str, *, system_instruction: str,
                              temperature: float, max_output_tokens: int,
                              thinking_budget: int | None, json_mode: bool):
     """Assemble GenerateContentConfig, adapting to the model family."""
     from google.genai import types
 
+    pro = is_pro_model(model)
     kwargs = {
         "system_instruction": system_instruction,
         "temperature": temperature,
-        "max_output_tokens": max_output_tokens,
+        "max_output_tokens": max_output_tokens + (PRO_THINKING_HEADROOM if pro else 0),
     }
     if json_mode:
         kwargs["response_mime_type"] = "application/json"
     # Only 2.5 flash / flash-lite accept a zero thinking budget; pro rejects it.
-    if thinking_budget is not None and "pro" not in model.lower():
+    if thinking_budget is not None and not pro:
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
     return types.GenerateContentConfig(**kwargs)
 
