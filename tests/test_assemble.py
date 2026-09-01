@@ -1468,6 +1468,48 @@ def test_an_implausible_tempo_is_refused_with_a_warning(music_dir, monkeypatch):
     assert assemble.beat_grid(track, 10.0) == []
 
 
+def test_a_feature_that_cannot_run_says_so(music_dir, monkeypatch):
+    """SHOT_SNAP_TO_BEAT on and no tempo anywhere is a silent no-op.
+
+    run.py prints step warnings and not assemble's own summary, so on the
+    daily path this looked switched on and cut nothing on the grid. Every reel
+    shipped so far reports 0 of N cuts on beat for exactly this reason.
+    """
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 60.0)
+    monkeypatch.setattr(config, "MUSIC_BPM", 0.0)
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_BEAT", True)
+    track_file(music_dir, "millennium-sunset.mp3", credit="Someone")
+    warnings = []
+    track = assemble.prepare_track(assemble.available_tracks()[0], warnings)
+
+    assert track is not None, "a missing tempo must not cost the reel its music"
+    assert any("no tempo is known" in w for w in warnings)
+    assert any("millennium-sunset.txt" in w for w in warnings)
+
+
+def test_no_tempo_is_not_worth_mentioning_when_snapping_is_off(
+    music_dir, monkeypatch
+):
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 60.0)
+    monkeypatch.setattr(config, "MUSIC_BPM", 0.0)
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_BEAT", False)
+    track_file(music_dir, "a.mp3", credit="Someone")
+    warnings = []
+    assemble.prepare_track(assemble.available_tracks()[0], warnings)
+
+    assert not any("no tempo" in w for w in warnings)
+
+
+def test_a_track_with_a_tempo_does_not_warn(music_dir, monkeypatch):
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 60.0)
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_BEAT", True)
+    track_file(music_dir, "a.mp3", credit="Someone\nbpm: 92\n")
+    warnings = []
+    assemble.prepare_track(assemble.available_tracks()[0], warnings)
+
+    assert not any("no tempo" in w for w in warnings)
+
+
 def test_an_opening_cut_is_placed_on_the_beat():
     plan_rows = [{"start": 0.0, "end": 3.2}, {"start": 3.2, "end": 7.0}]
     beats = assemble.beat_grid(assemble.Track(path=Path("a.mp3"), bpm=120.0), 8.0)

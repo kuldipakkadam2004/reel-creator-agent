@@ -1,1 +1,3 @@
 "Documentary Background" by Soundrider/Dope (CC BY 3.0)
+bpm: 99.4
+beat_offset: 1.834

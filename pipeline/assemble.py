@@ -2744,6 +2744,19 @@ def prepare_track(track: Track | None, warnings: list[str]) -> Track | None:
             f"was left off for this reel"
         )
         track.bpm = 0.0
+
+    # Say so when the feature is switched on and cannot run. `main` prints this
+    # in its summary, but a scheduled run goes through run.py, which shows the
+    # warnings and not the summary - so on the daily path SHOT_SNAP_TO_BEAT
+    # looked enabled, cut nothing on the grid, and said nothing about it. Every
+    # reel shipped so far reports 0 cuts on beat for exactly this reason: no
+    # sidecar states a tempo and MUSIC_BPM is 0.
+    if config.SHOT_SNAP_TO_BEAT and not track.bpm:
+        warnings.append(
+            f"cutting on the beat is on, but no tempo is known for "
+            f"{track.name!r} - add a \"bpm: <n>\" line to "
+            f"{Path(track.name).stem}.txt (or set MUSIC_BPM) to switch it on"
+        )
     return track
 
 
