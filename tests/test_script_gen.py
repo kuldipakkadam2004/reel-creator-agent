@@ -629,6 +629,46 @@ def test_a_concrete_number_is_worth_something():
     assert with_number["score"] > without["score"]
 
 
+def test_a_number_counts_whether_it_is_typed_in_digits_or_words():
+    """The same fact, typed two ways, has to score the same.
+
+    Measured on the deep-ocean run: "heard ten thousand kilometres away" came
+    back 0.0 and three of five candidates scored a flat zero, so the pass kept
+    an incumbent it had a live challenger for.
+    """
+    spelled = script_gen.score_hook(
+        "A sound in the deep ocean can be heard ten thousand kilometres away."
+    )
+    digits = script_gen.score_hook(
+        "A sound in the deep ocean can be heard 10,000 kilometres away."
+    )
+    assert spelled["components"].get("a number") == 0.8
+    assert spelled["score"] == pytest.approx(digits["score"])
+
+
+def test_a_hyphenated_number_word_counts_too():
+    """The compound shape the structure pass already learned to read."""
+    assert script_gen.says_a_number("Ninety-five percent of it is unexplored.")
+    assert script_gen.score_hook(
+        "Ninety-five percent of the ocean is unexplored."
+    )["components"].get("a number") == 0.8
+
+
+def test_one_as_a_pronoun_is_not_a_number():
+    """"No one" and "the one thing" are most of English, not a figure."""
+    for line in ("No one knows why the deep ocean sounds like this.",
+                 "This is the one thing nobody tells you about the ocean."):
+        assert not script_gen.says_a_number(line), line
+        assert "a number" not in script_gen.score_hook(line)["components"]
+
+
+def test_a_bare_magnitude_is_not_a_figure():
+    """"Thousands of kilometres" is a hand-wave; the scorer wants a quantity."""
+    assert not script_gen.says_a_number(
+        "Sound travels thousands of kilometres down there."
+    )
+
+
 def test_a_digit_is_no_longer_the_biggest_term_in_the_scorer():
     """What the reweighting is for.
 
@@ -889,6 +929,36 @@ def test_a_card_stops_at_a_clause_break_when_one_fits():
 def test_a_card_never_ends_on_dangling_punctuation():
     for text in ("Nobody has seen it.", "Salt never leaves,", "One thing:"):
         assert not script_gen.hook_card_text(text).endswith((".", ",", ":", ";"))
+
+
+def test_a_card_never_ends_on_a_word_that_cannot_end_a_thought():
+    """The shipped cover of the deep-ocean reel, and the alt text under it.
+
+    Six words of "The quietest place on earth isn't what you think." is the
+    line interrupted, not a short version of it.
+    """
+    assert script_gen.hook_card_text(
+        "The quietest place on earth isn't what you think."
+    ) == "The quietest place on earth"
+
+
+def test_the_dangling_trim_only_shortens_and_never_empties():
+    """A card trimmed to one word says less than the awkward cut it replaced."""
+    assert script_gen.hook_card_text("Nobody is") == "Nobody is"
+    assert script_gen.hook_card_text("It was") == "It was"
+    for hook in ("The quietest place on earth isn't what you think.",
+                 "A spider's eight legs are also its eight ears.",
+                 "The silence you're hearing is actually two sounds now."):
+        card = script_gen.hook_card_text(hook)
+        assert len(card.split()) >= 2
+        assert hook.lower().startswith(card.lower())
+
+
+def test_a_clause_break_still_wins_over_the_dangling_trim():
+    """A word before a comma is already somewhere the line breathes."""
+    assert script_gen.hook_card_text(
+        "It is not what you think, and the reason is stranger", max_words=6
+    ) == "It is not what you think"
 
 
 def test_an_empty_hook_yields_an_empty_card():

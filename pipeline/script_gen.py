@@ -499,6 +499,14 @@ _HOOK_STRONG_OPENERS = (
 )
 
 _HOOK_NUMBER_RE = re.compile(r"\b\d")
+
+#: The one number word that is usually not a number. "No one knows", "one of
+#: the", "the one thing" - it does the work of a pronoun far more often than it
+#: states a quantity, and counting it would hand the bonus to most openings in
+#: the language. Every other number word in the table is a figure when it
+#: appears, and bare plurals ("thousands of kilometres") are magnitudes rather
+#: than figures and fold to nothing, so they are excluded for free.
+_HOOK_NUMBER_WORD_SKIP = frozenset({"one"})
 _HOOK_WORD_RE = re.compile(r"[A-Za-z0-9'’-]+")
 
 #: A sentence carrying a negation. Contractions are matched whole because the
@@ -550,6 +558,32 @@ _HOOK_ECHO_MIN_CONTENT = 3
 #: sound like a finished thought.
 _HOOK_CLAUSE_END = ",;:—–"
 
+#: Words a card must not be left ending on. The card is a fragment by design -
+#: it is the hook with its tail cut off - but a fragment can still stop
+#: somewhere the eye accepts, and these are the places it cannot. They are the
+#: words that exist to point at the next one: articles, prepositions,
+#: conjunctions, and the auxiliaries and negations that are only half a verb.
+#:
+#: The shipped case: "The quietest place on earth isn't what you think." cut at
+#: six words gives "The quietest place on earth isn't", which is not a short
+#: version of the line, it is the line interrupted - and it went onto the cover
+#: image and into the alt text, where it is the first thing anyone reads.
+#: Backing off one word gives "The quietest place on earth", which is a title.
+_HOOK_CARD_DANGLING = frozenset("""
+a an the and or but so than that because while when if as of to in on at for
+from with by into onto over under about across through is are was were be been
+am isn't aren't wasn't weren't has have had hasn't haven't does do did doesn't
+don't didn't can can't cannot will won't would wouldn't should shouldn't could
+couldn't may might must not no your our their its his her my this these those
+every each any some there here what which who whose how why
+also actually just even still really very quite almost nearly
+""".split())
+
+#: A card trimmed below this is worse than the dangling word it was trimmed to
+#: avoid - "The quietest" says less than nothing. Two words is the floor, and a
+#: card that cannot clear it keeps the plain cut.
+_HOOK_CARD_MIN_WORDS = 2
+
 
 def _echoes_body(hook: str, body: str) -> str:
     """The sentence near the top of `body` that restates `hook`, or "".
@@ -583,6 +617,25 @@ def _echoes_body(hook: str, body: str) -> str:
         if _overlap(words, theirs) >= _HOOK_ECHO_ABOVE:
             return sentence
     return ""
+
+
+def says_a_number(text: str) -> bool:
+    """Whether `text` states a figure, in digits or in words.
+
+    `_fold_number_word` is the same reader the structure pass uses to make
+    "eleven" and "11" one token, so the two passes agree about what a number
+    is instead of each keeping its own opinion. It also brings the hyphenated
+    compounds ("ninety-five") with it.
+    """
+    if _HOOK_NUMBER_RE.search(text or ""):
+        return True
+    for raw in _HOOK_WORD_RE.findall(text or ""):
+        word = raw.lower().strip("'’-")
+        if word in _HOOK_NUMBER_WORD_SKIP:
+            continue
+        if _fold_number_word(word).isdigit():
+            return True
+    return False
 
 
 def score_hook(text: str, *, max_words: int | None = None,
@@ -680,7 +733,15 @@ def score_hook(text: str, *, max_words: int | None = None,
     # a win over "We know more about the surface of Mars than we do this
     # place.", which is the better line by any reading and lost only for having
     # no digit in it.
-    if _HOOK_NUMBER_RE.search(clean):
+    #
+    # Digits *or* the same number spelled out, which this could not see until
+    # now: "heard ten thousand kilometres away" scored 0.0 and "heard 10,000
+    # kilometres away" scored 0.8, for the same fact typed two ways. Measured
+    # on the deep-ocean run, where three of five candidates scored a flat zero
+    # and the pass kept an incumbent it should have been able to beat. The fold
+    # the structure pass already uses does the reading, so "ninety-five" counts
+    # for the same reason "95" does.
+    if says_a_number(clean):
         parts["a number"] = 0.8
 
     # Direct address. "You" makes the line about the viewer rather than about
@@ -744,12 +805,29 @@ def hook_card_text(hook: str, max_words: int | None = None) -> str:
         return clean.rstrip(_HOOK_CLAUSE_END + ". ")
 
     # Prefer to stop where the sentence itself pauses, taking the longest such
-    # stop that still fits.
+    # stop that still fits. A word before a comma is already a place the line
+    # breathes, so it needs no further trimming.
     for position in range(limit, 1, -1):
         if words[position - 1][-1:] in _HOOK_CLAUSE_END:
             return " ".join(words[:position]).rstrip(_HOOK_CLAUSE_END + " ")
 
-    return " ".join(words[:limit]).rstrip(_HOOK_CLAUSE_END + ". ")
+    return " ".join(_trim_dangling(words[:limit])).rstrip(_HOOK_CLAUSE_END + ". ")
+
+
+def _trim_dangling(words: list[str]) -> list[str]:
+    """Back a guillotined card off any word that cannot end a thought.
+
+    Only ever shortens, never reorders or rewrites, and gives up rather than
+    trimming below `_HOOK_CARD_MIN_WORDS` - at which point the plain cut is
+    the lesser of the two bad options.
+    """
+    kept = list(words)
+    while len(kept) > _HOOK_CARD_MIN_WORDS:
+        last = kept[-1].lower().strip(_HOOK_CLAUSE_END + ".!?\"'’")
+        if last not in _HOOK_CARD_DANGLING:
+            break
+        kept.pop()
+    return kept if len(kept) >= _HOOK_CARD_MIN_WORDS else list(words)
 
 
 def split_first_sentence(script: str) -> tuple[str, str]:
