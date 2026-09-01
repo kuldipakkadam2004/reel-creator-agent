@@ -539,27 +539,69 @@ def _beat_slots(manifest: dict, usable: dict[int, dict], total: float,
     # A beat step 4 could not source anything for has no pictures of its own;
     # give its time to a neighbour rather than leaving a hole in the video.
     if any(slot.assets for slot in slots):
-        merged: list[_Slot] = []
-        for slot in slots:
-            if slot.assets or not merged:
-                merged.append(slot)
-                continue
+        slots = _absorb_empty_slots(slots, warnings)
+    return slots
+
+
+def _absorb_empty_slots(slots: list[_Slot], warnings: list[str]) -> list[_Slot]:
+    """Fold beats with no footage into their neighbours, splitting the cost.
+
+    A run of empty beats is shared between the beat before it and the beat
+    after it, meeting in the middle, rather than being handed wholesale to
+    whichever one happens to come first.
+
+    This used to absorb strictly leftwards, which is fine for one empty beat
+    and compounds badly for several: on the deep-ocean run, beats 5, 6 and 7
+    all failed together and all 12.7s of them landed on beat 4, so two clips
+    covered 18 of the reel's 45 seconds while beat 8 - which had footage, and
+    sat directly against beat 7 - was untouched. Splitting the run does not
+    make the pictures right (nothing here can; the fix for that is upstream in
+    step 4) but it stops one shot holding for a third of the reel, which is
+    the part a viewer actually feels.
+
+    A run with no beat on one side goes entirely to the other: a leading run
+    has nothing to its left to borrow from, and a trailing one nothing to its
+    right.
+    """
+    merged: list[_Slot] = []
+    index = 0
+    while index < len(slots):
+        if slots[index].assets:
+            merged.append(slots[index])
+            index += 1
+            continue
+
+        run_end = index
+        while run_end < len(slots) and not slots[run_end].assets:
+            run_end += 1
+        run = slots[index:run_end]
+        left = merged[-1] if merged else None
+        right = slots[run_end] if run_end < len(slots) else None
+
+        if left is not None and right is not None:
+            boundary = round((run[0].start + run[-1].end) / 2, 3)
+            left.end, right.start = boundary, boundary
+            took = f"beats {left.beat_index} and {right.beat_index}"
+        elif left is not None:      # trailing run: nothing to its right
+            left.end = run[-1].end
+            took = f"beat {left.beat_index}"
+        elif right is not None:     # leading run: nothing to its left
+            right.start = run[0].start
+            took = f"beat {right.beat_index}"
+        else:
+            # Every beat is empty. The caller only gets here with at least one
+            # slot holding footage, so this cannot happen - and if it ever
+            # does, a reel with no pictures at all is not something to paper
+            # over with a merge.
+            break
+
+        for slot in run:
             warnings.append(
                 f"beat {slot.beat_index} has no usable footage - its "
-                f"{slot.duration:.1f}s was absorbed by beat {merged[-1].beat_index}"
+                f"{slot.duration:.1f}s was absorbed by {took}"
             )
-            merged[-1].end = slot.end
-        # A leading empty beat cannot borrow from the left, so pull it right.
-        while len(merged) > 1 and not merged[0].assets:
-            warnings.append(
-                f"beat {merged[0].beat_index} has no usable footage - its "
-                f"{merged[0].duration:.1f}s was absorbed by beat "
-                f"{merged[1].beat_index}"
-            )
-            merged[1].start = merged[0].start
-            merged.pop(0)
-        slots = merged
-    return slots
+        index = run_end
+    return merged
 
 
 def shot_target_at(position: float, total: float) -> float:

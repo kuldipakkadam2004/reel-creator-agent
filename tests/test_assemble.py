@@ -258,6 +258,53 @@ def test_a_beat_with_no_footage_gives_its_time_to_a_neighbour():
     )
 
 
+def test_a_run_of_empty_beats_is_split_between_both_neighbours():
+    """The deep-ocean shape: three beats fail together in the middle.
+
+    All 12.7s of them used to land on the beat to their left, so two clips
+    covered 18 of 45 seconds while the beat directly against the run - which
+    had footage - was left as it was.
+    """
+    manifest = make_manifest(assets_per_beat=1, beats=6)
+    shots, warnings = plan(manifest, ok={0, 4, 5})   # beats 1, 2 and 3 empty
+
+    covered = {shot.beat_index for shot in shots}
+    assert covered == {0, 4, 5}
+
+    held = {index: 0.0 for index in covered}
+    for shot in shots:
+        held[shot.beat_index] += shot.end - shot.start
+
+    # Beat 0 took the front half of the run and beat 4 the back half, rather
+    # than beat 0 taking all of it.
+    assert held[0] == pytest.approx(held[4], rel=0.25), held
+    assert held[0] < NARRATION / 2, "one beat swallowed the whole run"
+    for index in (1, 2, 3):
+        assert any(f"beat {index} has no usable footage" in w for w in warnings)
+    assert any("absorbed by beats 0 and 4" in w for w in warnings)
+
+
+def test_a_trailing_empty_beat_still_goes_entirely_left():
+    """There is nothing to its right to share with."""
+    manifest = make_manifest(assets_per_beat=1, beats=3)
+    shots, warnings = plan(manifest, ok={0, 1})      # beat 2 empty
+
+    assert {shot.beat_index for shot in shots} == {0, 1}
+    assert shots[-1].end == pytest.approx(
+        NARRATION + config.VIDEO_TAIL_SECONDS, abs=0.01
+    )
+    assert any("absorbed by beat 1" in w for w in warnings)
+
+
+def test_the_absorbed_run_leaves_no_gap_in_the_timeline():
+    manifest = make_manifest(assets_per_beat=1, beats=6)
+    shots, _ = plan(manifest, ok={0, 4, 5})
+
+    assert shots[0].start == 0.0
+    for earlier, later in zip(shots, shots[1:]):
+        assert later.start == pytest.approx(earlier.end, abs=0.01)
+
+
 def test_a_leading_empty_beat_is_absorbed_by_the_one_after_it():
     manifest = make_manifest(assets_per_beat=2, beats=3)
     shots, warnings = plan(manifest, ok={2, 3, 4, 5})  # beat 0 has nothing
