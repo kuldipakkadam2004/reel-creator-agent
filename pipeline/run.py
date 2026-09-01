@@ -727,6 +727,16 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
         _collect(record, "script", (script.get(pass_name) or {}).get("warnings"))
 
     claims = script.get("claims") or {}
+    # A pass that did not run leaves no findings and no warnings, which reads
+    # from the log exactly like a pass that ran and found nothing. They are
+    # opposite facts about the reel: one script was checked and one was not,
+    # and the deep-ocean reel shipped as the second while the log said neither.
+    if claims.get("mode") != "llm":
+        _collect(record, "script", [
+            "the fact-check did not run (VERIFY_MODE="
+            f"{claims.get('mode') or 'off'}) - nothing checked this script's "
+            "claims before it was narrated"
+        ])
     if claims.get("revised"):
         _announce(2, "script", "a claim was corrected by the fact-check")
     for finding in claims.get("findings") or ():

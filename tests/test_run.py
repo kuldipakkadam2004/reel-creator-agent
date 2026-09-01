@@ -67,6 +67,9 @@ class Steps:
         # topic -> exception, raised when that topic reaches the step
         self.fail_visuals: dict[str, Exception] = {}
         self.fail: dict[str, Exception] = {}
+        #: What step 2's claim check reports it did. "off" is the shape a run
+        #: takes when VERIFY_MODE is turned down.
+        self.verify_mode = "llm"
 
     # --- step 0 --------------------------------------------------------
     def find_topics(self, **kwargs):
@@ -92,7 +95,12 @@ class Steps:
         if isinstance(self.fail.get("script"), Exception):
             raise self.fail["script"]
         return {"topic": topic, "script": f"words about {topic}.",
-                "estimated_duration": duration or 40, "hook_card": "HOOK"}
+                "estimated_duration": duration or 40, "hook_card": "HOOK",
+                # What step 2 hands back when the fact-check ran and the
+                # script came through it clean - the normal case, so unrelated
+                # tests are not measuring a run that skipped it.
+                "claims": {"mode": self.verify_mode, "findings": [],
+                           "revised": False, "blocked": False, "warnings": []}}
 
     def save_script(self, result, output_path=None):
         stem = "-".join(result["topic"].split()[:3])
@@ -249,6 +257,24 @@ def test_warnings_are_labelled_with_the_step_that_raised_them(steps):
 
     assert "topics: youtube: no key - skipped" in record["warnings"]
     assert "visuals: one clip was small" in record["warnings"]
+
+
+def test_a_reel_that_was_never_fact_checked_says_so(steps):
+    """"No findings" and "nobody looked" read the same from a log.
+
+    The deep-ocean reel shipped with the claim check off and the log's
+    warnings block said nothing at all about it.
+    """
+    steps.verify_mode = "off"
+    record = run.run_pipeline()
+
+    assert any("the fact-check did not run" in w for w in record["warnings"])
+    assert any("VERIFY_MODE=off" in w for w in record["warnings"])
+
+
+def test_a_fact_checked_reel_does_not_carry_the_warning(steps):
+    record = run.run_pipeline()
+    assert not any("fact-check did not run" in w for w in record["warnings"])
 
 
 def test_spend_is_recorded(steps):
