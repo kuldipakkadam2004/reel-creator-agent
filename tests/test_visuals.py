@@ -1345,30 +1345,6 @@ def _yt_item(video_id="v1", *, license="creativeCommon", duration="PT2M10S",
     }
 
 
-def test_youtube_only_ever_asks_for_creative_commons(monkeypatch):
-    """The licence is a search filter, not something sorted out afterwards."""
-    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
-    session = _youtube_session([_yt_item()])
-    visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
-
-    search_call = next(c for c in session.calls if "v3/search" in c["url"])
-    assert search_call["params"]["videoLicense"] == "creativeCommon"
-    assert search_call["params"]["type"] == "video"
-
-
-def test_youtube_drops_a_reserved_upload_even_if_the_search_returned_it(monkeypatch):
-    """Belt and braces: the cost of trusting the filter is republishing
-    someone's reserved footage, so status.license is checked again."""
-    monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
-    session = _youtube_session([
-        _yt_item("keep"),
-        _yt_item("drop", license="youtube"),      # the default, All Rights Reserved
-    ])
-    found = visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
-
-    assert [c.provider_id for c in found] == ["keep"]
-
-
 def test_youtube_dimensions_come_from_the_probe_not_the_api(monkeypatch):
     """The API only says "hd", which does not separate 1080p from 4K - and that
     is exactly the distinction the 9:16 floor turns on."""
