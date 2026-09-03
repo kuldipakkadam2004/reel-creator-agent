@@ -737,6 +737,15 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
             f"{claims.get('mode') or 'off'}) - nothing checked this script's "
             "claims before it was narrated"
         ])
+    elif not claims.get("checked", True):
+        # Configured on, asked, and never answered - a third state, and the
+        # one that is easiest to miss, because the pass reports a mode of
+        # "llm" and a rewrite it made. Said plainly here so it is not read off
+        # the warning list as one more line about a timeout.
+        _collect(record, "script", [
+            "the fact-check could not be completed - this script was narrated "
+            "with its claims unverified"
+        ])
     if claims.get("revised"):
         _announce(2, "script", "a claim was corrected by the fact-check")
     for finding in claims.get("findings") or ():

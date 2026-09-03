@@ -573,6 +573,32 @@ STRUCTURE_MIN_SCORE = get_env_float("STRUCTURE_MIN_SCORE", 2.0)
 #: off - publish whatever the scriptwriter asserts
 VERIFY_MODE = get_env("VERIFY_MODE", "llm")
 
+#: How many times step 2 may buy a rewrite for a script the claim check
+#: refused, before giving the topic up.
+#:
+#: Was effectively 1, and 1 was measured too few. On 2026-09-02 two runs threw
+#: away six topics in a row, each on a single failed repair: geyser, deep-ocean
+#: sound, plankton, deep-sea dark, coral, sea ice. The findings behind them are
+#: specific and mechanical - "all that water flashes to steam" should say some
+#: of it, "ninety-nine percent gone. Total darkness" should say effectively
+#: dark - which is exactly the kind of fault a second attempt lands.
+#:
+#: The economics are lopsided. A round here is two calls, a repair and its
+#: re-check. Falling through to the next candidate costs a whole generation -
+#: the script, the best-of-N hook pass, the structure pass and two checks -
+#: and then usually fails the same way, because the fault is in how a 40-second
+#: narration is written and not in which topic it is about.
+#:
+#: Rounds stop early only when a rewrite leaves *more* blocking findings than
+#: it went in with - that one is going backwards, and the next round would
+#: start from a worse script. A rewrite that holds level is re-sampled instead:
+#: `revise_claims` is a sampled call, so asked twice for the same qualifier it
+#: can miss once and land once. Requiring strict improvement was measured worse
+#: than useless on 2026-09-03 - a script with one blocking finding can never
+#: leave "fewer than one" without leaving none, so the single-finding case,
+#: which is the common one, bought a single attempt whatever this was set to.
+VERIFY_REPAIR_ROUNDS = get_env_int("VERIFY_REPAIR_ROUNDS", 2)
+
 # Step 3 — text-to-speech
 ELEVENLABS_API_KEY = get_env("ELEVENLABS_API_KEY")
 ELEVENLABS_MODEL = get_env("ELEVENLABS_MODEL", "eleven_multilingual_v2")
@@ -1870,8 +1896,10 @@ def _report() -> None:
                            + (f", rewritten below {STRUCTURE_MIN_SCORE:g}"
                               if STRUCTURE_MODE == "llm" else "")),
         ("VERIFY_MODE", f"{VERIFY_MODE}"
-                        + (", false claims and self-contradictions refuse "
-                           "the script" if VERIFY_MODE == "llm" else "")),
+                        + (f", false claims and self-contradictions refuse "
+                           f"the script, up to {VERIFY_REPAIR_ROUNDS} repair "
+                           f"round(s) to save it"
+                           if VERIFY_MODE == "llm" else "")),
         ("HOOK_CARD", (f"{HOOK_CARD_SECONDS:g}s, {HOOK_CARD_FONT_SIZE}px, "
                        f"<={HOOK_CARD_MAX_WORDS} words")
                       if HOOK_CARD_ENABLED else "off"),

@@ -301,24 +301,48 @@ GLACIER = (
 
 
 def _verify_gemini(monkeypatch, *, findings, repaired="", recheck=None):
-    """Stand in for both calls the claim check makes.
+    """Stand in for every call the claim check makes.
 
-    `findings` answers the check, `repaired` the repair, and `recheck` the
-    check that is run over the repair - defaulting to a clean bill.
+    `findings` answers the first check, `repaired` the repair and `recheck`
+    the check run over that repair - defaulting to a clean bill.
+
+    Both of the last two take a round-by-round sequence as well as a single
+    answer, because the repair may now be bought more than once: `repaired`
+    a list of scripts, `recheck` a list of finding-lists. A single answer is
+    given to every round, which is what the tests written before the loop
+    existed expect. Running past the end of a sequence repeats its last entry.
     """
     calls: list[str] = []
+    repairs = [repaired] if isinstance(repaired, str) else list(repaired)
+    if recheck is None:
+        rechecks: list[list] = []
+    elif recheck and isinstance(recheck[0], list):
+        rechecks = list(recheck)
+    else:
+        rechecks = [recheck]
+
+    def nth(seq, i, empty):
+        if not seq:
+            return empty
+        return seq[min(i, len(seq) - 1)]
 
     def dispatch(prompt, **kwargs):
         calls.append(prompt)
         if "fact-check found these faults" in prompt:
-            return repaired
+            bought = sum(1 for c in calls
+                         if "fact-check found these faults" in c)
+            return nth(repairs, bought - 1, "")
         seen = sum(1 for c in calls if "Find every place" in c)
-        payload = findings if seen == 1 else (recheck if recheck is not None
-                                              else [])
-        return json.dumps(payload)
+        if seen == 1:
+            return json.dumps(findings)
+        return json.dumps(nth(rechecks, seen - 2, []))
 
     monkeypatch.setattr(script_gen, "call_gemini", dispatch)
     return calls
+
+
+def _repairs_bought(calls: list[str]) -> int:
+    return sum(1 for c in calls if "fact-check found these faults" in c)
 
 
 def test_a_sound_script_costs_one_call_and_changes_nothing(monkeypatch):
@@ -374,6 +398,175 @@ def test_a_repair_that_does_not_clear_the_fault_is_thrown_away(monkeypatch):
     assert report["blocked"] is True
     assert report["script"] == GLACIER
     assert any("did not clear" in w for w in report["warnings"])
+
+
+DEEP_SEA = (
+    "Sunlight does not go far into the ocean. The water strips out red first, "
+    "then green, then blue. The ocean does not block the light. By a thousand "
+    "feet, ninety-nine percent of the sun is gone. Total darkness."
+)
+
+_HALF_FIXED = (
+    "Sunlight does not go far into the ocean. The water strips out red first, "
+    "then green, then blue. It filters the light away with depth. By a "
+    "thousand feet, ninety-nine percent of the sun is gone. Total darkness."
+)
+
+_FULLY_FIXED = (
+    "Sunlight does not go far into the ocean. The water strips out red first, "
+    "then green, then blue. It filters the light away with depth. By a "
+    "thousand feet, ninety-nine percent of the sun is gone. Effectively dark."
+)
+
+
+def test_a_second_round_lands_the_repair_the_first_one_missed(monkeypatch):
+    """The deep-sea reel of 2026-09-02. The first rewrite cleared the
+    contradiction and left the overstatement standing, and under a single
+    repair that cost the entire topic - as it did for five others the same
+    day, every one of them refused on an overstatement."""
+    calls = _verify_gemini(
+        monkeypatch,
+        findings=[
+            {"sentence": "The ocean does not block the light.",
+             "kind": "contradiction",
+             "problem": "the water is described stripping light out above"},
+            {"sentence": "Total darkness.",
+             "kind": "false",
+             "problem": "one percent of the light is left, which is not total"},
+        ],
+        repaired=[_HALF_FIXED, _FULLY_FIXED],
+        recheck=[
+            [{"sentence": "Total darkness.", "kind": "false",
+              "problem": "one percent of the light is left"}],
+            [],
+        ],
+    )
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert _repairs_bought(calls) == 2, "the second round is the whole point"
+    assert report["blocked"] is False
+    assert report["revised"] is True
+    assert report["script"] == _FULLY_FIXED
+    assert report["remaining"] == []
+
+
+def test_a_lone_finding_that_holds_level_is_still_tried_again(monkeypatch):
+    """The run of 2026-09-03, which lost both its topics to this. A script
+    with a *single* blocking finding can never leave "strictly fewer" without
+    leaving none, so demanding a strict reduction bought one attempt and no
+    more - VERIFY_REPAIR_ROUNDS was inert in exactly the common case. The
+    repair is a sampled call: it misses the qualifier once and lands it on the
+    next ask."""
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    standing = [{"sentence": "Total darkness.", "kind": "false",
+                 "problem": "one percent of the light is left"}]
+    calls = _verify_gemini(monkeypatch, findings=standing,
+                           repaired=[_HALF_FIXED, _FULLY_FIXED],
+                           recheck=[standing, []])
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert _repairs_bought(calls) == 2, "holding level is not unrepairable"
+    assert report["blocked"] is False
+    assert report["revised"] is True
+    assert report["script"] == _FULLY_FIXED
+    assert report["remaining"] == []
+
+
+def test_a_rewrite_that_never_lands_spends_its_rounds_and_keeps_the_original(
+        monkeypatch):
+    """Re-sampling is bounded by the budget, not by hope. When every round
+    comes back with the same finding standing, the rounds run out and the
+    original ships - a rewrite that only ever held level was never an
+    improvement and is not recorded as one."""
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    standing = [{"sentence": "Total darkness.", "kind": "false",
+                 "problem": "one percent of the light is left"}]
+    # Both rounds hand back a script that still contains "Total darkness.",
+    # so the finding survives the check that a finding quotes a sentence the
+    # script really has - a rewrite that dropped the sentence would clear it.
+    calls = _verify_gemini(monkeypatch, findings=standing,
+                           repaired=[_HALF_FIXED, _HALF_FIXED],
+                           recheck=[standing, standing])
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert _repairs_bought(calls) == 2, "the budget, and not one call more"
+    assert report["blocked"] is True
+    assert report["revised"] is False
+    assert report["script"] == DEEP_SEA
+    assert any("did not clear" in w for w in report["warnings"])
+
+
+def test_a_rewrite_that_makes_things_worse_stops_the_rounds(monkeypatch):
+    """The one kind that still ends the loop early. A rewrite that comes back
+    with more faults than it went in with is going backwards, and the next
+    round would start from that worse script."""
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    standing = [{"sentence": "Total darkness.", "kind": "false",
+                 "problem": "one percent of the light is left"}]
+    # Both sentences are ones _HALF_FIXED still contains, so both survive the
+    # check that a finding quotes a sentence the script really has.
+    worse = standing + [
+        {"sentence": "By a thousand feet, ninety-nine percent of the sun "
+                     "is gone.",
+         "kind": "false",
+         "problem": "the figure is depth- and water-dependent"},
+    ]
+    calls = _verify_gemini(monkeypatch, findings=standing,
+                           repaired=[_HALF_FIXED, _FULLY_FIXED],
+                           recheck=[worse, []])
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert _repairs_bought(calls) == 1, "it went backwards, so it stopped"
+    assert report["blocked"] is True
+    assert report["revised"] is False
+    assert report["script"] == DEEP_SEA
+
+
+def test_a_repair_that_improves_to_the_last_round_is_kept_and_still_blocks(
+        monkeypatch):
+    """Converging and arriving are not the same thing. Every round left fewer
+    faults than the one before, the rounds ran out anyway, and what is kept is
+    the best script of the three - still refused, because something on it is
+    still wrong."""
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    three = [{"sentence": "Total darkness.", "kind": "false",
+              "problem": "one percent of the light is left"},
+             {"sentence": "The water strips out red first, then green, then "
+                          "blue.",
+              "kind": "false", "problem": "blue is what is left, not stripped"},
+             {"sentence": "The ocean does not block the light.",
+              "kind": "contradiction", "problem": "it is stripped out above"}]
+    calls = _verify_gemini(
+        monkeypatch, findings=three,
+        repaired=[DEEP_SEA.replace("red first", "the reds first"), _HALF_FIXED],
+        recheck=[
+            [{"sentence": "Total darkness.", "kind": "false",
+              "problem": "one percent is left"},
+             {"sentence": "The ocean does not block the light.",
+              "kind": "contradiction", "problem": "it is stripped out above"}],
+            [{"sentence": "Total darkness.", "kind": "false",
+              "problem": "one percent is left"}],
+        ],
+    )
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert _repairs_bought(calls) == 2, "both rounds, and no more"
+    assert report["revised"] is True
+    assert report["blocked"] is True
+    assert report["script"] == _HALF_FIXED
+    assert len(report["remaining"]) == 1
+    assert any("still stand" in w for w in report["warnings"])
+
+
+def test_the_repair_is_told_to_qualify_an_overstatement():
+    """The rule the six topics discarded on 2026-09-02 all needed. The repair
+    used to be told only that it must not go vague, which forbids the one
+    correction an overstatement actually wants: "all that water flashes to
+    steam" needs "some of it", and that is more accurate, not vaguer."""
+    template = script_gen._VERIFY_FIX_TEMPLATE
+    assert "overstated" in template
+    assert "Almost all" in template
+    assert "go vague in order to survive the check" in template,         "and dodging a false claim is still forbidden"
 
 
 def test_an_unrepairable_script_blocks(monkeypatch):
@@ -438,6 +631,51 @@ def test_the_claim_check_can_be_switched_off_without_calling_anything(monkeypatc
     assert report["mode"] == "off"
     assert report["blocked"] is False
     assert report["script"] == GLACIER
+
+
+def test_a_repair_nobody_could_re_check_is_not_recorded_as_cleared(monkeypatch):
+    """The shipwreck reel's script, and why it was the one that shipped.
+
+    An unreachable checker comes back with no findings, and no findings read
+    exactly like a clean bill: the repair cleared `len(still) < len(blocking)`
+    against an empty list and went out as verified, on the evening three fully
+    checked scripts were turned away for faults this one was never tested for.
+    """
+    fixed = (
+        "This mountain of ice moves a few centimetres a day. It carves whole "
+        "valleys as it goes. The ice crystals deform under their own "
+        "pressure. This happens slowly. A few centimetres a day."
+    )
+    finding = [{"sentence": "This mountain of ice is moving at your walking "
+                            "speed.",
+                "kind": "contradiction", "problem": "it says otherwise later"}]
+    calls: list[str] = []
+
+    def dispatch(prompt, **kwargs):
+        calls.append(prompt)
+        if "fact-check found these faults" in prompt:
+            return fixed
+        if sum(1 for c in calls if "Find every place" in c) == 1:
+            return json.dumps(finding)
+        raise script_gen.ScriptGenerationError("503 unavailable")
+
+    monkeypatch.setattr(script_gen, "call_gemini", dispatch)
+    report = script_gen.verify_claims("glaciers", GLACIER)
+
+    # Still not a reason for the reel not to exist, and still the better of the
+    # two scripts on offer - but not something to call checked.
+    assert report["blocked"] is False
+    assert report["script"] == fixed
+    assert report["checked"] is False
+    assert any("re-checked" in w for w in report["warnings"])
+
+
+def test_a_script_that_passes_is_recorded_as_actually_checked(monkeypatch):
+    """The flag has to separate the two states, or it says nothing."""
+    _verify_gemini(monkeypatch, findings=[])
+    report = script_gen.verify_claims("glaciers", GLACIER)
+
+    assert report["checked"] is True
 
 
 def test_a_checker_that_cannot_be_reached_never_blocks_a_reel(monkeypatch):

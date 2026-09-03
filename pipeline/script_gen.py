@@ -1824,8 +1824,8 @@ _VERIFY_FIX_SYSTEM_INSTRUCTION = """\
 You repair narration for short-form video that has been fact-checked.
 
 You are given a script and the specific things wrong with it. You fix exactly \
-those, change nothing else, and never paper over a fault by making the \
-sentence vaguer - you correct it or you cut it.
+those, change nothing else, and never paper over a fault by retreating into \
+vagueness - you correct it, you qualify it, or you cut it.
 
 You return only the words to be spoken."""
 
@@ -1844,7 +1844,17 @@ come through word for word.
 - Where two sentences disagree, keep the one that is true and correct the \
 other. Do not split the difference and do not delete both.
 - Where a claim is false, cut it or replace it with what is actually the \
-case. Do not make it vague to make it survivable.
+case.
+- Where the fault is that something true was overstated - "all" of what is \
+only most of it, "total" for what is only nearly total, two quantities \
+equated that are merely comparable - put the missing qualifier in. \
+"Almost all", "most of", "effectively", "close to". That IS the correction \
+and it is what the finding asks for: the qualified sentence is more \
+accurate than the one it replaces, not vaguer than it. A qualifier is one \
+word - keep the sentence as short and as speakable as it already is.
+- What you must not do is go vague in order to survive the check: dropping \
+the number, the name or the whole point so that nothing is left to judge. \
+Say less than the script said only where the claim was wrong outright.
 - Do not add new numbers, names or claims that were not already there.
 - Keep the first sentence exactly as it is UNLESS it is one of the faults.
 - Keep the length within a few words of what it is now.
@@ -1920,14 +1930,16 @@ def _finding_is_about(script: str, sentence: str) -> bool:
 def check_claims(topic: str, script: str) -> dict:
     """Fact-check `script`. Never raises.
 
-    Returns {"findings": [...], "warnings": [...]}. Every failure path comes
-    back as no findings and a warning: a checker that cannot be reached must
-    not be the reason a reel does not exist, and a script nobody could check
-    is exactly where the pipeline stood before this pass was written.
+    Returns {"findings": [...], "warnings": [...], "checked": bool}. Every
+    failure path comes back as no findings and a warning: a checker that cannot
+    be reached must not be the reason a reel does not exist, and a script
+    nobody could check is exactly where the pipeline stood before this pass was
+    written. `checked` is what separates the two states an empty finding list
+    can mean - nothing was wrong, or nothing was asked.
     """
     sentences = split_sentences(script)
     if len(sentences) < 2:
-        return {"findings": [], "warnings": []}
+        return {"findings": [], "warnings": [], "checked": True}
 
     prompt = _VERIFY_PROMPT_TEMPLATE.format(
         topic=topic or "(not given)",
@@ -1942,7 +1954,7 @@ def check_claims(topic: str, script: str) -> dict:
         )
         found = _parse_verify_json(raw)
     except (ScriptGenerationError, config.MissingConfigError, ValueError) as exc:
-        return {"findings": [],
+        return {"findings": [], "checked": False,
                 "warnings": [f"the claim check failed ({exc}). "
                              f"The script was not fact-checked."]}
 
@@ -1955,7 +1967,7 @@ def check_claims(topic: str, script: str) -> dict:
                 "the claim check quoted a sentence that is not in the script "
                 f"({finding['sentence'][:60]!r}) - ignored"
             )
-    return {"findings": findings, "warnings": warnings}
+    return {"findings": findings, "warnings": warnings, "checked": True}
 
 
 def blocking_findings(findings: list[dict]) -> list[dict]:
@@ -1993,7 +2005,13 @@ def revise_claims(script: str, findings: list[dict]) -> dict:
 
 
 def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
-    """Fact-check `script` and repair it once if it needs it. Never raises.
+    """Fact-check `script` and repair it if it needs it. Never raises.
+
+    The repair is re-checked and bought again for up to
+    `config.VERIFY_REPAIR_ROUNDS` rounds. It stops the moment the script is
+    clean, and the moment a round leaves *more* blocking findings than the one
+    before it - a rewrite that merely holds level is re-sampled, because the
+    repair is a sampled call that can miss once and land the next time.
 
     Returns the report step 8 and the saved metadata read:
 
@@ -2011,6 +2029,7 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
     setting = (mode or config.VERIFY_MODE or "off").strip().lower()
     report = {"mode": setting, "findings": [], "remaining": [],
               "revised": False, "script": script, "blocked": False,
+              "checked": True,
               "warnings": []}
     if setting != "llm":
         return report
@@ -2018,30 +2037,95 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
     checked = check_claims(topic, script)
     report["findings"] = checked["findings"]
     report["warnings"] = list(checked["warnings"])
+    report["checked"] = checked["checked"]
 
     blocking = blocking_findings(checked["findings"])
     if not blocking:
         return report
 
-    repair = revise_claims(script, blocking)
-    report["warnings"].extend(repair["warnings"])
-    if not repair["script"]:
-        report["remaining"] = blocking
-        report["blocked"] = True
-        return report
+    # One repair is one guess. The findings are specific and mechanical - put
+    # the qualifier in, cut the false comparison - so a rewrite that misses is
+    # usually worth another round rather than another topic: a fresh candidate
+    # costs a whole generation (script, best-of-N hook, structure pass, two
+    # checks) where a round here costs two calls. Measured 2026-09-02: six
+    # topics in a row were discarded on a single failed repair each.
+    rounds = max(1, config.VERIFY_REPAIR_ROUNDS)
+    current, faults = script, blocking
+    improved = None
 
-    # Asking is not checking: the repair is re-checked, and kept only if it
-    # actually cleared the faults. A rewrite that fixes one contradiction and
-    # introduces another is not an improvement, and this is the pass that must
-    # not wave anything through.
-    rechecked = check_claims(topic, repair["script"])
-    report["warnings"].extend(rechecked["warnings"])
-    still = blocking_findings(rechecked["findings"])
-    if len(still) < len(blocking):
-        report["script"] = repair["script"]
+    for attempt in range(rounds):
+        repair = revise_claims(current, faults)
+        report["warnings"].extend(repair["warnings"])
+        if not repair["script"]:
+            break
+
+        # Asking is not checking: the repair is re-checked, and kept only if
+        # it actually cleared the faults. A rewrite that fixes one
+        # contradiction and introduces another is not an improvement, and this
+        # is the pass that must not wave anything through.
+        rechecked = check_claims(topic, repair["script"])
+        report["warnings"].extend(rechecked["warnings"])
+        if not rechecked["checked"]:
+            # The re-check never ran, so there is no verdict to read. Taking
+            # the repair anyway is still the better of the two scripts on offer
+            # - one has faults nobody disputes, the other has an attempt at
+            # fixing them - but an unreachable checker returns an empty finding
+            # list, and letting that count as "cleared" is how the
+            # least-verified script of a run becomes the one that ships while
+            # three fully checked ones are turned away. It is recorded as
+            # unverified instead, and does not block.
+            report["checked"] = False
+            report["script"] = repair["script"]
+            report["revised"] = True
+            report["remaining"] = faults
+            report["warnings"].append(
+                "the rewrite could not be re-checked - it was kept, but "
+                "nothing confirmed the corrections landed"
+            )
+            return report
+
+        still = blocking_findings(rechecked["findings"])
+        if not still:
+            report["script"] = repair["script"]
+            report["revised"] = True
+            report["remaining"] = []
+            report["blocked"] = False
+            return report
+
+        if len(still) > len(faults):
+            # Going backwards: the rewrite introduced more than it fixed.
+            # Another round starts from a worse script than the last one, so
+            # stop before the drift compounds.
+            break
+
+        # Holding level is not the same as being unrepairable, and treating it
+        # as such is what made VERIFY_REPAIR_ROUNDS inert where it was needed
+        # most. `revise_claims` is a sampled Gemini call: asked twice for the
+        # same qualifier it can miss once and land once. The old rule stopped
+        # unless a round left *strictly* fewer findings, which a script with a
+        # single blocking finding can never do - "fewer than one" is zero, and
+        # zero returns clean above - so exactly the common case bought exactly
+        # one attempt, no matter what this was set to. Measured 2026-09-03:
+        # both topics of that run were refused with one finding standing.
+        # The budget is still what bounds the spend; only a repair that makes
+        # things worse ends the loop early.
+        if len(still) < len(faults):
+            # Fewer faults than it started with, but not none. Keep it as the
+            # best script so far. A rewrite that only held level is not an
+            # improvement and is deliberately not recorded as one - if the
+            # rounds run out, the original ships and blocks.
+            improved = (repair["script"], still)
+        current, faults = repair["script"], still
+
+    if improved is not None:
+        report["script"], report["remaining"] = improved
         report["revised"] = True
-        report["remaining"] = still
-        report["blocked"] = bool(still)
+        report["blocked"] = True
+        report["warnings"].append(
+            f"the rewrite cleared some of the fact-check but not all of it "
+            f"after {rounds} round(s) - "
+            f"{len(improved[1])} finding(s) still stand"
+        )
         return report
 
     report["remaining"] = blocking
