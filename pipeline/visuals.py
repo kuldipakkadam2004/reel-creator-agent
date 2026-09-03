@@ -2644,6 +2644,7 @@ def _screen_beats(
     ledger: UsageLedger, run_id: str, state: "_RunState",
     rejections: dict[str, int], warnings: list[str],
     rejected_keys: set[str] | None = None,
+    screened_keys: set[str] | None = None,
 ) -> dict[int, list[str]]:
     """Check every beat's shortlist against its narration, in one pass.
 
@@ -2673,6 +2674,14 @@ def _screen_beats(
     # Naming the keys lets pass 2 tell a keeper from a reject.
     if rejected_keys is None:
         rejected_keys = set()
+    # Only the shortlist is ever judged, so "not rejected" and "kept" are not
+    # the same set: everything below the shortlist was never looked at. Naming
+    # the screened keys as well as the rejected ones is what lets acquisition
+    # tell a clip the screen approved from one it never saw - which is how a
+    # beat that rejected five power drills still shipped a caterpillar and a
+    # man at Christmas dinner from the rows underneath.
+    if screened_keys is None:
+        screened_keys = set()
     by_index = {b.index: b for b in beats}
 
     shortlists = {
@@ -2694,6 +2703,7 @@ def _screen_beats(
         if not verdicts:
             continue
         reordered, beat_notes = _demote_rejects(head, verdicts)
+        screened_keys.update(row[1].key for row in head)
         rejected_keys.update(
             row[1].key for position, row in enumerate(head)
             if not verdicts.get(position, (True, ""))[0]
@@ -2756,6 +2766,7 @@ def _screen_beats(
             if verdicts:
                 reordered, beat_notes = _demote_rejects(head, verdicts)
                 kept = len([1 for ok, _ in verdicts.values() if ok])
+                screened_keys.update(row[1].key for row in head)
                 rejected_keys.update(
                     row[1].key for position, row in enumerate(head)
                     if not verdicts.get(position, (True, ""))[0]
@@ -3320,6 +3331,8 @@ def source_visuals(
     state = _RunState()
     rejections: dict[str, int] = {}
     rejected_keys: set[str] = set()
+    screened_keys: set[str] = set()
+    unjudged_keys: set[str] = set()
     assets: list[dict] = []
     beat_records: list[dict] = []
     leftovers: dict[int, list[tuple[float, Candidate, str]]] = {}
@@ -3347,7 +3360,7 @@ def source_visuals(
 
     screen_notes = _screen_beats(
         plans, beats, topic, active, settings, ledger, run_id, state,
-        rejections, warnings, rejected_keys,
+        rejections, warnings, rejected_keys, screened_keys,
     )
 
     # --- pass 2: download in beat order ------------------------------------
@@ -3379,8 +3392,26 @@ def source_visuals(
                 continue
 
             want = settings["assets_per_beat"]
-            keepers = [r for r in ranked if r[1].key not in rejected_keys]
             rejects = [r for r in ranked if r[1].key in rejected_keys]
+            if screened_keys:
+                # The screen only ever judged the shortlist. What sits below it
+                # is not approved footage, it is unjudged footage, and walking
+                # into it to fill a beat is indistinguishable - from here - from
+                # walking into the rejects.
+                keepers = [r for r in ranked
+                           if r[1].key in screened_keys
+                           and r[1].key not in rejected_keys]
+                unscreened = [r for r in ranked
+                              if r[1].key not in screened_keys
+                              and r[1].key not in rejected_keys]
+            else:
+                # No screen ran at all (mode "off", or it said nothing about
+                # any beat). Then unjudged is all there is, and holding it back
+                # would leave every beat empty.
+                keepers = [r for r in ranked if r[1].key not in rejected_keys]
+                unscreened = []
+            unscreened_keys = {r[1].key for r in unscreened}
+            unjudged_keys.update(unscreened_keys)
 
             acquired = take(keepers, want, beat)
             if len(acquired) < want:
@@ -3397,7 +3428,7 @@ def source_visuals(
             # itself makes: an under-specified shot of the subject's own world
             # beats one that contradicts the narration. Only beats that need it
             # pay for the search.
-            if len(acquired) < want and rejects:
+            if len(acquired) < want and (rejects or unscreened):
                 seen = {row[1].key for row in ranked}
                 safe = _neutral_plan(beat, active, settings, ledger, run_id,
                                      state, rejections, warnings, seen)
@@ -3410,6 +3441,27 @@ def source_visuals(
                         f"not be downloaded"
                     )
                 ranked = ranked + safe
+
+            # Below the neutral shot, above the rejects: these are the rows
+            # the screen never reached. One of them may be perfect and one may
+            # be a man in a Christmas jumper - nothing here knows which, so it
+            # is placed only after the neutral shot has failed, and the run
+            # says out loud that it happened.
+            if len(acquired) < want and unscreened:
+                unjudged = take(unscreened, want - len(acquired), beat,
+                                avoid_similar=False)
+                if unjudged:
+                    acquired += unjudged
+                    record["notes"].append(
+                        f"placed {len(unjudged)} clip(s) from below the "
+                        f"shortlist: the screen never judged them"
+                    )
+                    warnings.append(
+                        f"beat {beat.index} ({beat.query!r}): placed "
+                        f"{len(unjudged)} unscreened clip(s) - the screen kept "
+                        f"too few to fill the beat and the neutral shot did "
+                        f"not cover it"
+                    )
 
             # Last resort, and the order matters: a blank beat is still the
             # worst outcome, so a reject does go up rather than leave a hole -
@@ -3426,7 +3478,7 @@ def source_visuals(
                         f"rejected - nothing else could be downloaded"
                     )
 
-            leftovers[beat.index] = [
+            spares = [
                 row for row in ranked
                 if row[1].key not in state.taken_keys
                 and row[1].key not in state.failed_keys
@@ -3434,6 +3486,15 @@ def source_visuals(
                 # footage must not sit in it waiting to be picked up as filler.
                 and row[1].key not in rejected_keys
             ]
+            # A spare is on screen exactly as long as a planned shot, so the
+            # top-up spends what the screen approved before it reaches what the
+            # screen never saw. Ordering rather than excluding, because the
+            # top-up exists to keep step 5 in footage to cut between, and a
+            # beat held on one stretched shot is its own kind of wrong.
+            leftovers[beat.index] = (
+                [r for r in spares if r[1].key not in unscreened_keys]
+                + [r for r in spares if r[1].key in unscreened_keys]
+            )
         except Exception as exc:  # noqa: BLE001 - one beat must not kill the run
             warnings.append(
                 f"beat {beat.index} failed: {type(exc).__name__}: {exc}"
@@ -3527,6 +3588,17 @@ def source_visuals(
             if not progressed:
                 break
         cache.save()
+
+    unjudged_spares = len([
+        a for a in assets
+        if a.get("role") == "spare" and a.get("provider_key") in unjudged_keys
+    ])
+    if unjudged_spares:
+        warnings.append(
+            f"{unjudged_spares} spare shot(s) came from below the relevance "
+            f"shortlist - the screen never judged them. Raise "
+            f"VISUAL_RELEVANCE_SHORTLIST if this keeps happening"
+        )
 
     sourced = round(
         sum(_usable_seconds(a, settings["image_duration"]) for a in assets), 3

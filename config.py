@@ -795,6 +795,9 @@ VISUAL_RELEVANCE_FLOOR = get_env_float("VISUAL_RELEVANCE_FLOOR", 0.15)
 #: How many of a beat's ranked candidates are put in front of the screener.
 #: Every one costs prompt tokens, and the ranking below the top few is mostly
 #: noise, so this buys variety to choose from without paying for the tail.
+#: It is also the depth of judged footage a beat has: what sits below the
+#: shortlist is unjudged, and is reached only after the neutral shot. Raise it
+#: for a run that keeps warning it placed unscreened clips.
 VISUAL_RELEVANCE_SHORTLIST = get_env_int("VISUAL_RELEVANCE_SHORTLIST", 6)
 
 #: Two clips can be different files, clear every filter, and still read as one

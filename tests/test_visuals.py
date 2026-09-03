@@ -923,6 +923,60 @@ def test_rejected_footage_is_kept_out_of_the_headroom_top_up(sandbox, monkeypatc
     assert shipped, "nothing was sourced at all"
 
 
+def test_footage_below_the_shortlist_is_never_placed_silently(sandbox, monkeypatch):
+    """The screen judges the shortlist. It says nothing about the rest.
+
+    "Not rejected" was being read as "kept", so acquisition walked out of the
+    judged rows and into the unjudged ones without a word. That is the shipwreck
+    reel's beat 1: five power drills demoted, one keeper left for a two-clip
+    beat, and a caterpillar and a man at Christmas dinner underneath it.
+    """
+    StubProvider.catalog = [make_candidate(i) for i in range(30)]
+    keep = {c.provider_id for c in StubProvider.catalog[:2]}
+    rejected_ids = set()
+    monkeypatch.setattr(visuals, "llm_screen", _keep_only(keep, rejected_ids))
+
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=2, providers=["stub"],
+    )
+
+    judged = keep | rejected_ids
+    unjudged = [a for a in manifest["assets"]
+                if a["provider_key"].split(":", 1)[1] not in judged]
+    assert unjudged, "nothing came from below the shortlist, so this proves nothing"
+    assert any("unscreened clip(s)" in w for w in manifest["warnings"]), (
+        f"unjudged footage shipped without a word: {manifest['warnings']}"
+    )
+
+    notes = {b["index"]: b["notes"] for b in manifest["beats"]}
+    for asset in unjudged:
+        if asset.get("role") == "spare":
+            continue           # the top-up reports once, at the end of the run
+        assert any("never judged them" in note
+                   for note in notes[asset["beat_index"]]), (
+            f"beat {asset['beat_index']} placed unjudged footage with no note"
+        )
+
+
+def test_an_unscreened_run_does_not_hold_its_own_footage_back(sandbox):
+    """The other half of the rule: no screen, no verdicts, no unjudged tail.
+
+    "Unjudged" only means anything against a screen that ran. With the screen
+    off every clip is unjudged, and demoting them all below a neutral shot
+    would empty every beat in the reel rather than protect it.
+    """
+    StubProvider.catalog = [make_candidate(i) for i in range(30)]
+
+    manifest = run_visuals(
+        relevance_mode="off", assets_per_beat=1, providers=["stub"],
+    )
+
+    assert manifest["assets"], "left the reel with no footage at all"
+    assert not any("unscreened clip(s)" in w for w in manifest["warnings"])
+    for beat in manifest["beats"]:
+        assert not any("never judged them" in note for note in beat["notes"])
+
+
 def test_the_query_writer_is_asked_for_a_neutral_shot():
     """The fallback only exists if step 4 asks for it and can read it back."""
     prompt = visuals._QUERY_PROMPT_TEMPLATE
