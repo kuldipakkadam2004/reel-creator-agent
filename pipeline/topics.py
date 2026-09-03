@@ -21,9 +21,11 @@ What happens, in order:
   3. everything is scored on velocity, niche fit, curiosity, shape and age,
      and anything off the account's subject is held off the board while there
      is something on it to show;
-  4. the top TOPIC_PROBE_LIMIT are *probed against step 4's stock providers* -
-     the check that makes this specific to this pipeline, and the subject of
-     the long comment further down;
+  4. the top TOPIC_PROBE_LIMIT are *checked for footage* - the check that
+     makes this specific to this pipeline, and the subject of the long comment
+     further down. By default the model is asked whether a stock library could
+     show the topic; TOPIC_SOURCEABILITY=probe reads stock search results
+     instead, which was measured not to separate good topics from bad;
   5. the survivors are re-ranked, the winners' titles are polished into topic
      phrases, and the board is recorded on the ledger so the same candidate
      does not head every board.
@@ -416,6 +418,55 @@ NICHE_THINKING_BUDGET = 0
 #: nothing in common still pays this much, because between the two the verdict
 #: is the more reliable and the wording is the part that was already wrong.
 NICHE_VERDICT_SHARE = 0.5
+
+# --- the sourceability pass -------------------------------------------------
+
+#: Gemini settings for the footage question. Temperature 0 for the same reason
+#: the niche pass uses it: a closed question with a right answer.
+SOURCEABILITY_TEMPERATURE = 0.0
+SOURCEABILITY_MAX_TOKENS = 4096
+SOURCEABILITY_THINKING_BUDGET = 0
+
+#: The scale the model answers on, and what each rung means. Kept small and
+#: named in the prompt, because a model asked for "0 to 100" invents precision
+#: it does not have and clusters on round numbers.
+#:
+#:   0 - nothing depicting this exists: a person, a fixture, a named event, a
+#:       product. This is the rung the hard filter reads.
+#:   1 - only loosely related or generic imagery
+#:   2 - the subject can be shown with common footage, but not exactly
+#:   3 - a library plainly holds shots of this
+SOURCEABILITY_SCALE = 3
+
+#: What each rung is worth, named rather than interpolated.
+#:
+#: The rungs are not evenly spaced in meaning, so spacing them evenly in score
+#: was measured to be wrong. Running the 62-line evergreen backlog through the
+#: pass on the straight line `sourceability_component` draws - rung 2 landing
+#: at +0.17, a drop of 1.33 from rung 3 - put ten lines under
+#: RUN_TOPIC_MIN_SCORE that the keyword probe had passed, and they were lines
+#: like "what happens inside a volcano before it erupts", "why earthquakes
+#: happen where two plates meet" and "how a sinkhole opens without warning".
+#: The model was right to call those a 2 - nobody has filmed inside a volcano
+#: - and the reels are perfectly makeable from footage that stands in. The
+#: rung was reading correctly and being priced as a near-failure.
+#:
+#: So rung 2 sits just under the bonus: it is a topic that will be shot with
+#: stand-ins, which is what half this account's back catalogue already is. The
+#: cliff belongs between 1 and 0, where "filler" becomes "there is nothing".
+SOURCEABILITY_COMPONENTS = {
+    0: SOURCEABLE_FLOOR,
+    1: -0.7,
+    2: 0.9,
+    3: SOURCEABLE_BONUS,
+}
+
+
+def sourceability_rung(rating: int) -> float:
+    """What a model rating is worth. Clamped, because the model can answer 7."""
+    rating = min(SOURCEABILITY_SCALE, max(0, int(rating)))
+    return SOURCEABILITY_COMPONENTS[rating]
+
 
 # --- the phrase pass --------------------------------------------------------
 
@@ -1964,11 +2015,19 @@ def sourceability_component(hits: int, needed: int | None = None) -> float:
 
 
 def apply_sourceability(candidate: Candidate, needed: int | None = None) -> None:
-    """Fold a completed probe into a candidate's score, in place."""
+    """Fold a completed check into a candidate's score, in place.
+
+    A report carrying `component` priced itself - that is the model pass, whose
+    rungs are named in SOURCEABILITY_COMPONENTS rather than interpolated. Any
+    other report is a keyword probe and is read off its hit count.
+    """
     probe = candidate.sourceability or {}
     if not probe.get("checked"):
         return
-    component = sourceability_component(int(probe.get("hits") or 0), needed)
+    if probe.get("component") is not None:
+        component = round(float(probe["component"]), 3)
+    else:
+        component = sourceability_component(int(probe.get("hits") or 0), needed)
     candidate.components["footage"] = component
     candidate.score = round(sum(candidate.components.values()), 3)
 
@@ -2041,8 +2100,16 @@ def suggest_duration(candidate: Candidate) -> dict:
 
     probe = candidate.sourceability or {}
     if probe.get("checked"):
-        threshold = max(1, config.TOPIC_SOURCEABLE_HITS)
-        share = min(1.0, max(0, int(probe.get("hits") or 0)) / threshold)
+        # The model pass carries a rung and the keyword probe a hit count.
+        # Read the rung where there is one: it is the finer of the two, and
+        # `hits` under that mode is only ever zero or the threshold, which
+        # would hand a topic rated "filler" the same seconds as one the
+        # library plainly holds.
+        if probe.get("rating") is not None:
+            share = min(1.0, max(0, int(probe["rating"])) / SOURCEABILITY_SCALE)
+        else:
+            threshold = max(1, config.TOPIC_SOURCEABLE_HITS)
+            share = min(1.0, max(0, int(probe.get("hits") or 0)) / threshold)
         parts["footage"] = round(
             DURATION_FOOTAGE_THIN
             + (DURATION_FOOTAGE_RICH - DURATION_FOOTAGE_THIN) * share, 1
@@ -2179,6 +2246,160 @@ def probe_sourceability(topic: str, providers: list, *, sample: int | None = Non
         if hits >= threshold:
             break
     return report
+
+
+_SOURCEABILITY_SYSTEM_INSTRUCTION = """\
+You decide whether a stock footage library could illustrate a video topic.
+
+You answer about pictures only - whether generic, unbranded library clips \
+could show this - and never about whether the topic is interesting, popular, \
+recent, true or well written.
+
+You always return valid JSON and nothing else."""
+
+
+_SOURCEABILITY_PROMPT_TEMPLATE = """\
+For each topic below, rate how well an ordinary stock footage library \
+(Pexels, Pixabay, Openverse) could illustrate a short explainer about it.
+
+Rate 0 to 3:
+3 - the library plainly holds shots of this. Nature, weather, landscapes, \
+animals, water, cities, people doing everyday things.
+2 - the subject can be carried by common footage without being shown exactly. \
+Something abstract or microscopic that stands in well - an idea about time, \
+pressure, sound, growth.
+1 - only loosely related or generic imagery. The clips would be filler.
+0 - nothing depicting this exists in such a library. A named person, a \
+specific company, a sports fixture, an election result, a product launch, a \
+one-off news event, or an invented phrase that means nothing.
+
+Judge the subject, not the wording. A topic sharing no word with anything \
+filmable can still be a 3 - "how a jellyfish survives without a brain" is \
+jellyfish footage. A topic full of ordinary filmable words can still be a 0 - \
+"State Farm's dividend payout" is not farm footage, it is a company report, \
+and the farm clips a keyword search returns are the wrong pictures.
+
+Topics:
+{topics}
+
+Return ONLY a JSON array, {count} objects long, in the same order:
+[{{"index": 0, "footage": 3}}]"""
+
+
+def _parse_sourceability_json(raw: str) -> dict[int, int]:
+    """Read the ratings, tolerantly.
+
+    Shaped like `_parse_niche_json`: a missing entry is simply absent, and an
+    absent rating leaves the candidate unchecked rather than guessed at.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"no JSON array in model output: {text[:200]!r}")
+
+    data = json.loads(text[start:end + 1])
+    if not isinstance(data, list):
+        raise ValueError("model output was not a JSON array")
+
+    out: dict[int, int] = {}
+    for position, entry in enumerate(data):
+        if isinstance(entry, bool):
+            continue
+        if isinstance(entry, (int, float)):
+            out[position] = int(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        try:
+            index = int(entry.get("index", position))
+        except (TypeError, ValueError):
+            index = position
+        rating = entry.get("footage", entry.get("rating"))
+        if isinstance(rating, str):
+            rating = rating.strip()
+            rating = int(rating) if rating.lstrip("-").isdigit() else None
+        if isinstance(rating, bool) or rating is None:
+            continue
+        try:
+            out[index] = int(rating)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def classify_sourceability(candidates: list[Candidate], *,
+                           needed: int | None = None
+                           ) -> tuple[dict[int, dict], list[str]]:
+    """Ask the model whether each topic can be shot. Never raises.
+
+    Returns a report per index in the same shape `probe_sourceability` returns,
+    so `apply_sourceability` and the hard filter in `find_topics` cannot tell
+    which mode produced it, and any failure path - no key, a refused call,
+    unparseable JSON - returns no reports at all. An unreported candidate is
+    left `checked: False`, which scores as nothing rather than as no footage.
+
+    One call for the whole shortlist, like the niche pass: sixteen topics is a
+    short list to read and sixteen requests would be the expensive way to ask
+    the same question.
+    """
+    if not candidates:
+        return {}, []
+
+    listing = "\n".join(
+        f"{index}. {candidate.topic or candidate.title}"
+        for index, candidate in enumerate(candidates)
+    )
+    prompt = _SOURCEABILITY_PROMPT_TEMPLATE.format(
+        topics=listing, count=len(candidates)
+    )
+
+    try:
+        raw = script_gen.call_gemini(
+            prompt,
+            system_instruction=_SOURCEABILITY_SYSTEM_INSTRUCTION,
+            temperature=SOURCEABILITY_TEMPERATURE,
+            max_output_tokens=SOURCEABILITY_MAX_TOKENS,
+            thinking_budget=SOURCEABILITY_THINKING_BUDGET,
+            json_mode=True,
+        )
+        ratings = _parse_sourceability_json(raw)
+    except (script_gen.ScriptGenerationError, config.MissingConfigError,
+            ValueError) as exc:
+        return {}, [f"the footage pass failed ({exc}). No candidate was "
+                    f"checked for footage, so the board may hold topics step 4 "
+                    f"cannot shoot. Set TOPIC_SOURCEABILITY=probe to fall back "
+                    f"to the keyword probe."]
+
+    reports: dict[int, dict] = {}
+    for index, rating in ratings.items():
+        if not 0 <= index < len(candidates):
+            continue
+        rating = min(SOURCEABILITY_SCALE, max(0, int(rating)))
+        threshold = max(1, config.TOPIC_SOURCEABLE_HITS
+                        if needed is None else needed)
+        reports[index] = {
+            "query": candidates[index].topic or candidates[index].title,
+            # Carried so the hard filter reads a zero the same way whichever
+            # mode ran. Only rung 0 is a zero - a 1 is thin, not absent.
+            "hits": 0 if rating == 0 else threshold,
+            "sample": threshold,
+            "provider": "model",
+            "checked": True,
+            "rating": rating,
+            "component": sourceability_rung(rating),
+            "by_provider": {},
+            "notes": [],
+        }
+
+    missing = len(candidates) - len(reports)
+    warnings = ([f"the footage pass returned no rating for {missing} of "
+                 f"{len(candidates)} candidates - those were left unchecked "
+                 f"and scored as neither shootable nor not"] if missing else [])
+    return reports, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -2618,7 +2839,8 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
         sources: override config.TOPIC_SOURCES.
         limit: how many candidates the board holds.
         per_source: how deep to read each source.
-        sourceability: "probe" or "off". Defaults to config.TOPIC_SOURCEABILITY.
+        sourceability: "llm", "probe" or "off". Defaults to
+            config.TOPIC_SOURCEABILITY.
         phrases: "llm" or "heuristic". Defaults to config.TOPIC_PHRASE_MODE.
         niche_mode: "gate", "prefer" or "off". Defaults to
             config.TOPIC_NICHE_MODE.
@@ -2775,33 +2997,56 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
     # no point asking whether a topic that lost on every other count is
     # shootable.
     probed = 0
-    if probe_mode == "probe":
+    shortlist = scored[:max(wanted, config.TOPIC_PROBE_LIMIT)]
+    if probe_mode == "llm" and shortlist:
+        # One call for the shortlist rather than a request per candidate. The
+        # keyword probe this replaced is still here and still selectable, but
+        # it was measured not to separate good topics from bad at any
+        # threshold - see TOPIC_SOURCEABILITY in config.py for the numbers.
+        reports, notes = classify_sourceability(shortlist)
+        warnings.extend(notes)
+        for index, candidate in enumerate(shortlist):
+            report = reports.get(index)
+            if not report:
+                continue
+            candidate.sourceability = report
+            apply_sourceability(candidate)
+            probed += 1
+    elif probe_mode == "probe":
         providers = _ready_providers(session, warnings)
         if providers:
-            for candidate in scored[:max(wanted, config.TOPIC_PROBE_LIMIT)]:
+            for candidate in shortlist:
                 candidate.sourceability = probe_sourceability(
                     candidate.topic, providers
                 )
                 apply_sourceability(candidate)
                 probed += 1
-            # The one hard filter on the board, and it takes two signals to
-            # trigger because neither is sound alone. A probe that found
-            # nothing may only mean the provider knew a synonym this does not.
-            # Proper nouns alone are often fine - the Atlantic is proper and
-            # every library has it. Together they are conclusive: a named
-            # subject that no stock library names back is a person, a fixture
-            # or a product, and there is no footage of it to find.
-            survivors = []
-            for candidate in scored:
-                probe = candidate.sourceability
-                if (probe.get("checked") and not int(probe.get("hits") or 0)
-                        and _proper_nouns(candidate.topic)):
-                    rejected.append({**candidate.as_dict(),
-                                     "reason": "a named subject with no footage"})
-                    continue
-                survivors.append(candidate)
-            scored = survivors
-            scored.sort(key=lambda c: (-c.score, len(c.topic)))
+
+    # The one hard filter on the board, and it takes two signals to trigger
+    # because neither is sound alone. A probe that found nothing may only mean
+    # the provider knew a synonym this does not, and under `llm` a zero is a
+    # judgement that can be wrong in its own way. Proper nouns alone are often
+    # fine - the Atlantic is proper and every library has it. Together they are
+    # conclusive: a named subject that no stock library can show is a person, a
+    # fixture or a product, and there is no footage of it to find.
+    #
+    # Kept conjunctive under `llm` even though the verdict is the stronger
+    # signal, for the reason PROBE_MIN_TERM_HITS gives: a wrong pass costs a
+    # place on a board a human is reading anyway, with the footage rating
+    # printed beside it, and a wrong drop silently removes a topic that could
+    # have been made.
+    if probed:
+        survivors = []
+        for candidate in scored:
+            probe = candidate.sourceability
+            if (probe.get("checked") and not int(probe.get("hits") or 0)
+                    and _proper_nouns(candidate.topic)):
+                rejected.append({**candidate.as_dict(),
+                                 "reason": "a named subject with no footage"})
+                continue
+            survivors.append(candidate)
+        scored = survivors
+        scored.sort(key=lambda c: (-c.score, len(c.topic)))
 
     # --- 3b. what step 9 has measured about boards like this one -----------
     # Last, so that a component added by the probe counts the same as one that
@@ -2983,9 +3228,12 @@ def _print_board(board: dict) -> None:
         else f"{entry['name']} -" for entry in board["sources"]
     ) + f"   ({stats['fetched']} fetched, {stats['considered']} after dedupe)")
     if stats["probed"]:
+        how = (config.TOPIC_SOURCEABILITY or "").strip().lower()
         print(f"PROBE   : {stats['probed']} checked for footage, "
-              f"{config.TOPIC_SOURCEABLE_HITS} of "
-              f"{config.TOPIC_PROBE_SAMPLE} results naming it is comfortable")
+              + (f"rated 0-{SOURCEABILITY_SCALE} by the model"
+                 if how == "llm" else
+                 f"{config.TOPIC_SOURCEABLE_HITS} of "
+                 f"{config.TOPIC_PROBE_SAMPLE} results naming it is comfortable"))
     print(f"BOARD   : #{stats['board']}, {stats['shown']} shown, "
           f"{stats['rejected']} rejected")
     print(rule)

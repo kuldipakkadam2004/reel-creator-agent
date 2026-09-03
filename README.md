@@ -242,31 +242,59 @@ total is the same large number whatever you search for. Measured: "ocean"
 8,000, "shawver" 2,526, a random string 2,560. A count-based filter would have
 passed every unshootable topic on the board.
 
-So the probe **reads the results instead**. `provider.search` already returns
-titles and source URLs, and Pexels names each clip in its own link even when
-the alt text is empty — `serene-ocean-surface-with-gentle-waves`. How many of
-the returned clips name what was asked for is a real measurement. A result has
-to match **two** of the query's words when the query has three or more: on a
-one-word rule `ted cruz american` matched all eight results, every one of them
-a stock flag, because "american" is in half the library.
+**Reading the results instead does not work either, and that took measuring.**
+The obvious repair is to read the clips that came back rather than the count:
+`provider.search` returns titles and source URLs, and Pexels names each clip in
+its own link even when the alt text is empty —
+`serene-ocean-surface-with-gentle-waves`. Counting how many returned clips name
+what was asked for looks like a real measurement. It is not.
 
-It is a **strong positive and a weak negative**, and the scoring says so.
-Results that name the topic mean it is definitely shootable. Results that do
-not may still be shootable through a synonym the provider understood and this
-does not — `bioluminescence` returns jellyfish footage, which is exactly right
-and matches not one letter of the query. So a failed probe scores *down*
-rather than dropping, and the one hard filter on the board takes **two**
-signals: a zero-hit probe **and** proper nouns in the topic. Neither is sound
-alone — the Atlantic is a proper noun every library has — but together they are
-conclusive: a named subject no stock library names back is a person, a fixture
-or a product, and there is no footage of it to find.
+Measured on 2026-09-02 over 439 results, from six known-good topics and five
+known-bad ones (nonsense phrases plus real fixtures out of the ledger — a
+Seahawks trade, a State Farm dividend, an LA mayoral result):
 
-Only the top `TOPIC_PROBE_LIMIT` candidates are probed, because the probe costs
-a request and there is no point asking whether a topic that lost on every other
-count is shootable. Providers are asked in step 4's own preference order and
-the walk stops at the first one holding enough, so a topic Pexels can shoot
-never spends an Openverse request — which matters, as Openverse allows 200
-anonymous requests a day.
+| | Pexels | Pixabay |
+|---|---|---|
+| `how a spider builds a web across a gap` (real) | 20/20 | 20/20 |
+| `why a purple hexagon dreams of accounting` | 7/20 | **20/20** |
+| `what makes a spreadsheet taste like violin` | 17/20 | **20/20** |
+
+Across the whole evergreen backlog the effective count averaged **19.82 of 20,
+median 20, with 56 of 62 lines scoring exactly 20**. A component that is the
+same number for every candidate does no ranking at all — and worse, the hard
+filter below needs a genuine zero to fire, so it had quietly stopped firing.
+
+No threshold recovers it. Requiring two query words, or scaling the bar by how
+many words the result describes itself with, was tried at 8, 10 and 12: good
+and bad overlap under every one. Per-result term hits average 0.86 for good
+topics against 0.60 for bad on Pexels, 1.40 against 1.22 on Pixabay. The reason
+is that `probe_query` strips a topic to three keywords, so `State Farm
+dividend` honestly retrieves farm footage — **the results are right and the
+query was the wrong question**, and no amount of reading them fixes a question
+that was wrong before it was asked.
+
+So the question is now asked of **something that can read the topic**. Under
+the default `TOPIC_SOURCEABILITY=llm` the model rates each shortlisted topic
+0–3 on whether an ordinary stock library could illustrate it, batched into one
+call the way the niche pass is. `TOPIC_SOURCEABILITY=probe` still selects the
+keyword probe for anyone who wants it, and `off` skips the question entirely.
+
+It stays a **strong positive and a weak negative**, and the scoring still says
+so. A topic the model rates highly is definitely shootable; a low rating may
+still be shootable through a synonym — `bioluminescence` returns jellyfish
+footage, which is exactly right and matches not one letter of the query. So a
+low rating scores *down* rather than dropping, and the one hard filter on the
+board takes **two** signals: a zero rating **and** proper nouns in the topic.
+Neither is sound alone — the Atlantic is a proper noun every library has — but
+together they are conclusive: a named subject nothing can show is a person, a
+fixture or a product, and there is no footage of it to find.
+
+Only the top `TOPIC_PROBE_LIMIT` candidates are checked, because there is no
+point asking whether a topic that lost on every other count is shootable. Under
+`probe` that also saves requests: providers are asked in step 4's own
+preference order and the walk stops at the first one holding enough, so a topic
+Pexels can shoot never spends an Openverse request — which matters, as
+Openverse allows 200 anonymous requests a day.
 
 ### How long should it be?
 
@@ -1223,9 +1251,8 @@ typing, not the judgement about what goes out.
 ### Which topic it makes
 
 The top of the board. That is not a shrug — step 0 has already gated the niche,
-probed the stock providers for footage and ranked what survived, and a second
-ranking layered over a good one would only be a worse ranking nobody can read
-back. The topic is marked made (step 0's `--take`) so no later board offers it
+checked what survived for footage and ranked it, and a second ranking layered
+over a good one would only be a worse ranking nobody can read back. The topic is marked made (step 0's `--take`) so no later board offers it
 again.
 
 `RUN_TOPIC_MIN_SCORE` is the one judgement left: the score a candidate has to

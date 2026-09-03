@@ -321,21 +321,58 @@ TOPIC_TRENDS_GEO = get_env("TOPIC_TRENDS_GEO", "US")
 TOPIC_WIKI_PROJECT = get_env("TOPIC_WIKI_PROJECT", "en.wikipedia")
 
 #: Check that step 4 could actually find footage before recommending a topic.
+#:   llm   - ask the model whether a stock library plausibly holds shots of
+#:           this. The default, because the keyword probe below was measured
+#:           not to separate good topics from bad ones at any threshold.
 #:   probe - search the ready stock providers for the topic's keywords and read
 #:           how many of the results are genuinely about it
 #:   off   - do not ask. Faster, and the board will hold topics that cannot be
 #:           made.
-TOPIC_SOURCEABILITY = get_env("TOPIC_SOURCEABILITY", "probe")
+#:
+#: Why `probe` is no longer the default, measured 2026-09-02 over 439 results
+#: from six known-good topics and five known-bad ones (nonsense phrases plus
+#: real fixtures out of the ledger - a Seahawks trade, a State Farm dividend,
+#: an LA mayoral result):
+#:
+#:   - Nonsense scores like fact. "why a purple hexagon dreams of accounting"
+#:     came back 20/20 on Pixabay and 7/20 on Pexels; "how a spider builds a
+#:     web across a gap" came back 20/20. Across the whole evergreen backlog
+#:     the effective count averaged 19.82 of 20, median 20, 56 of 62 lines
+#:     scoring exactly 20 - a component that is the same number for every
+#:     candidate does no ranking at all.
+#:   - No threshold recovers it. Requiring two query words, or scaling the bar
+#:     by how many words the result describes itself with (8, 10, 12), was
+#:     tried: good and bad overlap under every one. Per-result term hits
+#:     average 0.86 for good topics against 0.60 for bad on Pexels, 1.40
+#:     against 1.22 on Pixabay.
+#:   - The reason is the one PROBE_MIN_TERM_HITS already gives in
+#:     pipeline/topics.py: probe_query strips a topic to three keywords, so
+#:     "State Farm dividend" honestly retrieves farm footage. The results are
+#:     right and the query was the wrong question. That is a fault no amount of
+#:     reading search results can fix, so the question is asked of something
+#:     that can read the topic instead.
+#:
+#: The cost of the fix is one extra Gemini call per board, batched across the
+#: shortlist exactly like the niche pass. Set `probe` to go back to keywords,
+#: or `off` to stop paying for the question at all - note that `off` also
+#: retires the board's one hard filter, which matters more now that `trends`
+#: is not usually in TOPIC_SOURCES.
+TOPIC_SOURCEABILITY = get_env("TOPIC_SOURCEABILITY", "llm")
 
 #: How many results the probe reads, and how many of them have to actually name
 #: the topic before its footage counts as comfortable.
+#:
+#: TOPIC_SOURCEABILITY=probe only. Under the default `llm` the model rates each
+#: topic 0-3 and SOURCEABILITY_COMPONENTS in pipeline/topics.py prices the
+#: rungs, so neither of these is read.
 #:
 #: Note what this deliberately does *not* do: ask a provider how many results
 #: it holds. Pexels answers about 2,500 for a string of random letters - stock
 #: APIs fall back to a generic pool rather than returning nothing, so the total
 #: is the same large number whatever is searched for and carries no information
 #: at all. The only honest question is whether the results that came back are
-#: about the thing that was asked for, and that has to be read off the results.
+#: about the thing that was asked for - which is the right question, and which
+#: reading the results still turned out not to answer. See TOPIC_SOURCEABILITY.
 TOPIC_PROBE_SAMPLE = get_env_int("TOPIC_PROBE_SAMPLE", 8)
 TOPIC_SOURCEABLE_HITS = get_env_int("TOPIC_SOURCEABLE_HITS", 3)
 
@@ -1755,8 +1792,11 @@ def _report() -> None:
         ("TOPIC_CANDIDATES", f"{TOPIC_CANDIDATES} shown, "
                              f"{TOPIC_PER_SOURCE} read per source"),
         ("TOPIC_SOURCEABILITY",
-         f"probe, {TOPIC_SOURCEABLE_HITS} of {TOPIC_PROBE_SAMPLE} results "
-         f"naming it, top {TOPIC_PROBE_LIMIT}"
+         f"asked of the model, top {TOPIC_PROBE_LIMIT}"
+         if TOPIC_SOURCEABILITY == "llm"
+         else f"probe, {TOPIC_SOURCEABLE_HITS} of {TOPIC_PROBE_SAMPLE} results "
+              f"naming it, top {TOPIC_PROBE_LIMIT} (measured not to separate "
+              f"good topics from bad - see config.py)"
          if TOPIC_SOURCEABILITY == "probe"
          else "off (the board may hold topics step 4 cannot shoot)"),
         ("TOPIC_PHRASE_MODE", TOPIC_PHRASE_MODE),

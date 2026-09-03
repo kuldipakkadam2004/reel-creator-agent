@@ -551,6 +551,183 @@ def test_an_unchecked_probe_does_not_touch_the_score():
     assert item.score == 1.0 and "footage" not in item.components
 
 
+def test_the_footage_pass_reads_its_ratings_back(monkeypatch):
+    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **kw: json.dumps([
+        {"index": 0, "footage": 3},
+        {"index": 1, "footage": 0},
+    ]))
+    reports, warnings = topics.classify_sourceability(
+        [candidate("why the ocean is salty", external_id="a"),
+         candidate("State Farm dividend payout", external_id="b")],
+        needed=3,
+    )
+    assert warnings == []
+    assert reports[0]["checked"] is True and reports[0]["hits"] == 3
+    assert reports[1]["checked"] is True and reports[1]["hits"] == 0
+    assert reports[0]["provider"] == "model"
+
+
+def test_the_footage_pass_asks_once_for_the_whole_shortlist(monkeypatch):
+    """Sixteen requests would be the expensive way to ask one question."""
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(args)
+        return json.dumps([{"index": n, "footage": 2} for n in range(5)])
+
+    monkeypatch.setattr(script_gen, "call_gemini", capture)
+    reports, _ = topics.classify_sourceability(
+        [candidate(f"why the ocean is salty {n}", external_id=f"n{n}")
+         for n in range(5)]
+    )
+    assert len(calls) == 1
+    assert len(reports) == 5
+
+
+def test_a_failed_footage_call_leaves_the_board_unchecked(monkeypatch):
+    """Never a guess: an unchecked candidate scores as neither shootable nor
+    not, exactly as a probe where every provider failed does."""
+    def boom(*args, **kwargs):
+        raise script_gen.ScriptGenerationError("503")
+
+    monkeypatch.setattr(script_gen, "call_gemini", boom)
+    reports, warnings = topics.classify_sourceability(
+        [candidate("why the ocean is salty")]
+    )
+    assert reports == {}
+    assert warnings and "footage pass failed" in warnings[0]
+
+
+def test_a_candidate_the_footage_pass_skipped_is_left_unchecked(monkeypatch):
+    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **kw: json.dumps([
+        {"index": 0, "footage": 3},
+    ]))
+    reports, warnings = topics.classify_sourceability(
+        [candidate("why the ocean is salty", external_id="a"),
+         candidate("why the sky is blue", external_id="b")]
+    )
+    assert set(reports) == {0}
+    assert warnings and "no rating for 1 of 2" in warnings[0]
+
+
+def test_the_rungs_run_from_the_floor_to_the_bonus():
+    assert topics.sourceability_rung(0) == topics.SOURCEABLE_FLOOR
+    assert topics.sourceability_rung(topics.SOURCEABILITY_SCALE) == \
+        topics.SOURCEABLE_BONUS
+    # Out-of-range answers are clamped rather than trusted.
+    assert topics.sourceability_rung(99) == topics.SOURCEABLE_BONUS
+    assert topics.sourceability_rung(-4) == topics.SOURCEABLE_FLOOR
+
+
+def test_a_topic_shot_with_stand_ins_is_not_priced_as_a_near_failure():
+    """Rung 2 on the straight line was +0.17, which put ten backlog lines -
+    'what happens inside a volcano before it erupts' among them - under
+    RUN_TOPIC_MIN_SCORE. The cliff belongs between 1 and 0."""
+    assert topics.sourceability_rung(2) > topics.sourceability_rung(1)
+    assert topics.sourceability_rung(2) > 0.5
+    assert topics.sourceability_rung(2) < topics.SOURCEABLE_BONUS
+    # The drop from 1 to 0 is the biggest step on the scale.
+    steps = [topics.sourceability_rung(n + 1) - topics.sourceability_rung(n)
+             for n in range(topics.SOURCEABILITY_SCALE)]
+    assert steps[0] == max(steps)
+
+
+def test_a_priced_report_is_used_over_the_hits_curve():
+    """The model pass names what each rung is worth; the keyword probe reads
+    its component off the hit count. One function has to serve both."""
+    item = candidate("why the ocean is salty")
+    item.components = {"velocity": 1.0}
+    item.sourceability = {"checked": True, "hits": 3, "component": 0.9}
+    topics.apply_sourceability(item)
+    assert item.components["footage"] == 0.9
+
+    probed_item = candidate("why the ocean is salty")
+    probed_item.components = {"velocity": 1.0}
+    probed_item.sourceability = {"checked": True, "hits": 3}
+    topics.apply_sourceability(probed_item, needed=3)
+    assert probed_item.components["footage"] == topics.SOURCEABLE_BONUS
+
+
+def test_only_a_zero_rung_reads_as_no_footage_at_all(monkeypatch):
+    """A 1 is thin, not absent, and the hard filter must not read it as a
+    zero - that is the difference between scoring down and dropping."""
+    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **kw: json.dumps([
+        {"index": 0, "footage": 1},
+        {"index": 1, "footage": 0},
+    ]))
+    reports, _ = topics.classify_sourceability(
+        [candidate("thin topic", external_id="a"),
+         candidate("absent topic", external_id="b")], needed=3,
+    )
+    assert reports[0]["hits"] == 3, "a 1 must not trip the hard filter"
+    assert reports[1]["hits"] == 0
+    assert reports[0]["component"] == topics.sourceability_rung(1)
+
+
+def test_the_footage_ratings_are_read_tolerantly():
+    """Same tolerance as the niche pass: a bare array, a fenced block and a
+    stringified number are all things the model actually returns."""
+    assert topics._parse_sourceability_json("[3, 0]") == {0: 3, 1: 0}
+    assert topics._parse_sourceability_json(
+        '```json\n[{"index": 0, "footage": "2"}]\n```') == {0: 2}
+    assert topics._parse_sourceability_json(
+        '[{"index": 0, "rating": 1}]') == {0: 1}
+
+
+def test_llm_mode_drops_a_named_subject_the_model_says_cannot_be_shot(
+        offline, monkeypatch):
+    """The hard filter's whole job, and the reason the keyword probe was
+    replaced: 'State Farm dividend' honestly retrieves farm footage."""
+    monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "llm")
+    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **kw: json.dumps([
+        {"index": 0, "footage": 3},
+        {"index": 1, "footage": 0},
+    ]))
+    install_source(monkeypatch, "reddit", [
+        candidate("why the ocean is salty", external_id="t1",
+                  rate=300, age_hours=2),
+        candidate("State Farm dividend payout is largest in company history",
+                  external_id="t2", rate=299, age_hours=2),
+    ])
+    board = topics.find_topics("", sources=("reddit",))
+    shown = [row["topic"] for row in board["candidates"]]
+    assert "why the ocean is salty" in shown
+    assert not any("State Farm" in row for row in shown)
+    assert any("no footage" in row["reason"] for row in board["rejected"])
+
+
+def test_llm_mode_keeps_an_unnamed_topic_the_model_says_cannot_be_shot(
+        offline, monkeypatch):
+    """Both signals or neither - a wrong drop silently removes a topic that
+    could have been made, so a zero alone must not decide it."""
+    monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "llm")
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        lambda *a, **kw: json.dumps([{"index": 0, "footage": 0}]))
+    install_source(monkeypatch, "reddit", [
+        candidate("why the ocean is salty", external_id="t1",
+                  rate=300, age_hours=2),
+    ])
+    board = topics.find_topics("", sources=("reddit",))
+    assert len(board["candidates"]) == 1, "a 0 rating alone must not drop it"
+
+
+def test_llm_mode_does_not_spend_a_stock_request(offline, monkeypatch):
+    """The point of the mode: the question is asked of something that can read
+    the topic, not of a keyword search."""
+    provider = FakeProvider("pexels", stock("salty-ocean-waves"))
+    monkeypatch.setattr(topics, "_ready_providers",
+                        lambda session, warnings: [provider])
+    monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "llm")
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        lambda *a, **kw: json.dumps([{"index": 0, "footage": 3}]))
+    install_source(monkeypatch, "reddit", [
+        candidate("why the ocean is salty", external_id="t1",
+                  rate=300, age_hours=2),
+    ])
+    topics.find_topics("", sources=("reddit",))
+    assert provider.searches == []
+
+
 def test_probe_query_drops_possessives():
     assert "'" not in topics.probe_query("State Farm's dividend payout")
 
@@ -609,6 +786,34 @@ def probed(topic, hits, **kwargs):
     made.sourceability = {"checked": True, "hits": hits, "sample": 8,
                           "query": topic, "provider": "fake"}
     return made
+
+
+def rated(topic, rating, **kwargs):
+    """A candidate carrying a finished model footage rating."""
+    made = candidate(topic, **kwargs)
+    made.sourceability = {"checked": True, "rating": rating,
+                          "hits": 0 if rating == 0 else 3, "sample": 3,
+                          "component": topics.sourceability_rung(rating),
+                          "query": topic, "provider": "model"}
+    return made
+
+
+def test_the_length_reads_the_rung_rather_than_the_binary_hits():
+    """Under the model pass `hits` is only ever zero or the threshold, so a
+    topic rated filler would otherwise be given the seconds of one the library
+    plainly holds."""
+    rich = topics.suggest_duration(rated("why the ocean is salty", 3))
+    stands_in = topics.suggest_duration(rated("why the ocean is salty", 2))
+    thin = topics.suggest_duration(rated("why the ocean is salty", 1))
+    assert rich["components"]["footage"] == topics.DURATION_FOOTAGE_RICH
+    assert thin["components"]["footage"] < stands_in["components"]["footage"]
+    assert stands_in["components"]["footage"] < rich["components"]["footage"]
+
+
+def test_a_probe_without_a_rung_still_reads_its_hits():
+    """The keyword probe is still selectable and still scores the old way."""
+    rich = topics.suggest_duration(probed("why the ocean is salty", 8))
+    assert rich["components"]["footage"] == topics.DURATION_FOOTAGE_RICH
 
 
 def test_a_mechanism_is_given_longer_than_a_fixture():
@@ -1203,6 +1408,11 @@ def offline(monkeypatch, tmp_path):
     # it on would spend a token per board and take a network round trip per
     # test. Tests that want it stub `call_gemini` and switch this back.
     monkeypatch.setattr(config, "TOPIC_NICHE_MATCH", "terms")
+    # And the footage pass is the third. It defaults to `llm`, so leaving it
+    # alone would send every board test to Gemini and stop the keyword probe -
+    # which most of these tests are about - from running at all. Tests for the
+    # llm mode stub `call_gemini` and switch this back.
+    monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "probe")
     monkeypatch.setattr(config, "TOPIC_SUBREDDITS", ("todayilearned",))
     return tmp_path
 
@@ -1404,6 +1614,10 @@ def test_no_provider_configured_is_a_warning_and_no_probe(offline, monkeypatch):
     monkeypatch.setattr(topics, "_new_session", lambda: FakeSession())
     monkeypatch.setattr(config, "TOPIC_USAGE_FILE", offline / "usage.json")
     monkeypatch.setattr(config, "TOPIC_PHRASE_MODE", "heuristic")
+    # The undo above dropped the fixture's pin too, and the footage pass
+    # defaults to `llm` - without this the test asks Gemini for real and the
+    # provider list it is about is never consulted.
+    monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "probe")
     monkeypatch.setattr(config, "VISUAL_PROVIDERS", ())
     install_source(monkeypatch, "reddit",
                    [candidate("why the ocean is salty", rate=300, age_hours=2)])
