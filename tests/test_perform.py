@@ -40,20 +40,29 @@ def paths(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PERFORMANCE_MIN_SAMPLES", 3)
     monkeypatch.setattr(config, "PERFORMANCE_MIN_REELS", 4)
     monkeypatch.setattr(config, "PERFORMANCE_WINDOW_HOURS", 48)
+    monkeypatch.setattr(config, "PERFORMANCE_MIN_AGE_HOURS", 24)
+    monkeypatch.setattr(config, "PERFORMANCE_SETTLE_HOURS", 36)
+    monkeypatch.setattr(config, "PERFORMANCE_METRIC", "watch_ratio")
     (tmp_path / "out").mkdir(parents=True, exist_ok=True)
     perform._CACHE.update(key=None, effects={})
     return tmp_path
 
 
 def _stamp(day: int) -> str:
-    """An ordered stamp, recent enough to be inside PERFORMANCE_WINDOW_HOURS.
+    """An ordered stamp, aged to sit inside the comparable window.
 
     The tests record their numbers the instant the reel is registered, so a
     corpus dated to a fixed day in the past would be measured weeks after
     posting and thrown out of every comparison by the freshness window - which
     is the window working, not the report failing.
+
+    The window has a floor as well as a ceiling now, so the base is far enough
+    back that the *newest* reel in the longest corpus here (twelve of them, an
+    hour apart) is still older than PERFORMANCE_MIN_AGE_HOURS. Both ends stay
+    switched on for every test rather than being turned off to make the corpus
+    fit: the ones that mean to be outside it say so a row at a time.
     """
-    base = datetime.now(timezone.utc) - timedelta(hours=30)
+    base = datetime.now(timezone.utc) - timedelta(hours=46)
     return (base + timedelta(hours=day)).isoformat(timespec="seconds")
 
 
@@ -180,6 +189,69 @@ def test_a_reel_made_before_the_structure_pass_is_not_asked_about_it(paths):
 
     assert not any(q == "structure pass" for q, _ in perform.facets(old, {}))
     assert any(q == "structure pass" for q, _ in perform.facets(new, {}))
+
+
+def test_the_takeaway_components_are_the_spoken_script_s(paths, tmp_path):
+    """Same rule as the structure columns, same reason: a rejected rewrite
+    scored too, and recording its components would label the reel with a
+    script nobody ever heard."""
+    script = tmp_path / "scripts" / "salty.json"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(json.dumps({"takeaway": {
+        "revised": False,
+        "components": {"the viewer is in the close": 0.8},
+        "revised_components": {"puts the viewer in front of it": 2.0},
+    }}), encoding="utf-8")
+
+    features = perform.features_for(
+        {"run_id": "r", "script_path": str(script.with_suffix(".txt"))}
+    )
+
+    assert features["takeaway_components"] == ["the viewer is in the close"]
+    assert features["takeaway_revised"] is False
+
+
+def test_a_reel_handed_a_take_away_is_labelled_with_the_rewrite_s(paths, tmp_path):
+    script = tmp_path / "scripts" / "salty.json"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(json.dumps({"takeaway": {
+        "revised": True,
+        "components": {},
+        "revised_components": {"puts the viewer in front of it": 2.0,
+                               "names the thing": 1.2},
+    }}), encoding="utf-8")
+
+    features = perform.features_for(
+        {"run_id": "r", "script_path": str(script.with_suffix(".txt"))}
+    )
+
+    assert features["takeaway_components"] == [
+        "puts the viewer in front of it", "names the thing"]
+    assert features["takeaway_revised"] is True
+
+
+def test_a_reel_made_before_the_take_away_pass_is_not_asked_about_it(paths):
+    """Every version 3 row says "kept" because nothing existed to rewrite it.
+    Counting those as reels that were offered a hand-over and did not need one
+    would put the whole back catalogue in the control arm of a trial it never
+    ran."""
+    old = {**_features("r1"), "features_version": 3}
+    new = _features("r2")
+
+    assert not any(q == "take-away pass" for q, _ in perform.facets(old, {}))
+    assert any(q == "take-away pass" for q, _ in perform.facets(new, {}))
+
+
+def test_take_away_components_are_not_asked_of_an_older_row(paths):
+    vocabulary = {"takeaway": ["puts the viewer in front of it"]}
+    old = {**_features("r1"), "features_version": 3}
+    new = {**_features("r2"),
+           "takeaway_components": ["puts the viewer in front of it"]}
+
+    assert not any(q.startswith("takeaway:")
+                   for q, _ in perform.facets(old, vocabulary))
+    assert ("takeaway: puts the viewer in front of it", "fired") in \
+        perform.facets(new, vocabulary)
 
 
 def test_features_read_the_run_directory_s_manifests(paths, tmp_path):
@@ -328,11 +400,89 @@ def test_a_skipped_reel_keeps_its_reason_and_drops_its_numbers(paths):
     ledger = _ledger(_features("r1"))
     ledger.record("r1", {"views": 100})
 
-    ledger.skip("r1", "the footage was of the simile")
+    ledger.skip("r1", "footage")
 
     assert ledger.entry("r1")["status"] == "skipped"
-    assert ledger.entry("r1")["skip_reason"] == "the footage was of the simile"
+    assert ledger.entry("r1")["skip_code"] == "footage"
+    assert ledger.entry("r1")["skip_reason"] == \
+        perform.SKIP_REASONS["footage"]
     assert "metrics" not in ledger.entry("r1")
+
+
+def test_a_skip_reason_is_a_code_and_a_prefix_will_do(paths):
+    ledger = _ledger(_features("r1"), _features("r2", day=1))
+
+    assert ledger.skip("r1", "claim") == []
+    assert ledger.skip("r2", "pac") == []
+
+    assert ledger.entry("r1")["skip_code"] == "claim"
+    assert ledger.entry("r2")["skip_code"] == "pacing"
+
+
+def test_free_text_is_kept_as_the_note_rather_than_thrown_away(paths):
+    """The sentence is still the better record. It is just not comparable."""
+    ledger = _ledger(_features("r1"))
+
+    warnings = ledger.skip("r1", "not good enough to post")
+
+    entry = ledger.entry("r1")
+    assert entry["skip_code"] == perform.UNLABELLED_SKIP
+    assert entry["skip_note"] == "not good enough to post"
+    assert any("not one of" in warning for warning in warnings)
+
+
+def test_an_unlabelled_rejection_votes_in_neither_table(paths):
+    """Fourteen rows said 'not good enough to post'. That is not evidence."""
+    ledger = _corpus(8)
+    for day in range(8):
+        if day % 2:
+            ledger.record(f"r{day}", {"watch_ratio": 0.5})
+        else:
+            ledger.skip(f"r{day}", "not good enough to post")
+
+    data = perform.report(ledger=ledger, min_samples=1)
+
+    assert data["skipped"] == 4
+    assert data["binned"] == 0        # none of them carries a verdict
+    assert data["unjudged"] == 4
+    assert all(row["median"] == 1.0 for row in data["kept"])
+    assert any("no reason on them" in warning for warning in data["warnings"])
+
+
+def test_a_test_run_is_not_counted_as_a_rejected_reel(paths):
+    ledger = _corpus(4)
+    ledger.record("r0", {"watch_ratio": 0.5})
+    ledger.skip("r1", "untested")
+    ledger.skip("r2", "footage")
+
+    data = perform.report(ledger=ledger, min_samples=1)
+
+    assert data["binned"] == 1        # r2 alone is a verdict on a reel
+    assert data["unjudged"] == 1
+
+
+def test_the_binned_table_says_what_keeps_going_wrong(paths):
+    ledger = _corpus(6)
+    for day, code in enumerate(("footage", "footage", "footage",
+                                "hook", "claim", "footage")):
+        ledger.skip(f"r{day}", code)
+
+    reasons = perform.skip_tally(ledger.rows())
+
+    assert reasons[0]["code"] == "footage"
+    assert reasons[0]["n"] == 4
+    assert reasons[0]["share"] == pytest.approx(0.667, abs=0.001)
+    assert reasons[0]["means"] == perform.SKIP_REASONS["footage"]
+
+
+def test_a_note_travels_with_the_code(paths):
+    ledger = _corpus(2)
+    ledger.skip("r0", "cover")
+    ledger.entry("r0")["skip_note"] = "the card gave the answer away"
+
+    reasons = perform.skip_tally(ledger.rows())
+
+    assert reasons[0]["notes"] == ["the card gave the answer away"]
 
 
 def test_an_unknown_posting_time_is_assumed_and_says_so(paths):
@@ -374,6 +524,53 @@ def test_a_corrupt_ledger_reads_as_an_empty_one(paths, tmp_path):
     (tmp_path / "performance.json").write_text("{not json", encoding="utf-8")
 
     assert perform.PerformanceLedger().rows() == []
+
+
+def test_a_version_one_row_gets_its_ratio_from_what_it_already_held(paths, tmp_path):
+    """The numbers were always there: an average watch time and a reel length."""
+    (tmp_path / "performance.json").write_text(json.dumps({
+        "version": 1,
+        "reels": {"forest-531029b5": {
+            "status": "posted",
+            "run_id": "forest-531029b5",
+            "features": {"run_id": "forest-531029b5",
+                         "created_at": _stamp(0),
+                         "spoken_seconds": 37.59},
+            "metrics": {"views": 3, "avg_watch_seconds": 89.5,
+                        "watch_through": 1.0},
+        }},
+    }), encoding="utf-8")
+
+    ledger = perform.PerformanceLedger()
+
+    assert ledger.migrated == 1
+    assert ledger.entry("forest-531029b5")["metrics"]["watch_ratio"] == \
+        pytest.approx(2.381, abs=0.001)
+
+
+def test_a_skip_written_before_the_vocabulary_is_unlabelled_not_guessed(paths, tmp_path):
+    (tmp_path / "performance.json").write_text(json.dumps({
+        "version": 1,
+        "reels": {"r1": {
+            "status": "skipped",
+            "run_id": "r1",
+            "skip_reason": "not good enough to post",
+            "features": {"run_id": "r1", "created_at": _stamp(0)},
+        }},
+    }), encoding="utf-8")
+
+    entry = perform.PerformanceLedger().entry("r1")
+
+    assert entry["skip_code"] == perform.UNLABELLED_SKIP
+    assert entry["skip_note"] == "not good enough to post"
+
+
+def test_the_migration_runs_once_and_then_leaves_the_file_alone(paths, tmp_path):
+    ledger = _ledger(_features("r1"))
+    ledger.skip("r1", "footage")
+    ledger.save()
+
+    assert perform.PerformanceLedger().migrated == 0
 
 
 # ---------------------------------------------------------------------------
@@ -495,10 +692,10 @@ def test_one_reel_that_beat_its_neighbours_stands_out(paths):
     ledger = perform.PerformanceLedger()
     for day in range(11):
         ledger.register(_features(f"r{day}", day=day))
-        ledger.record(f"r{day}", {"watch_through": 0.5})
-    ledger.record("r5", {"watch_through": 1.0})
+        ledger.record(f"r{day}", {"watch_ratio": 0.5})
+    ledger.record("r5", {"watch_ratio": 1.0})
 
-    scores = perform.ratios(ledger.rows(), "watch_through", span=6)
+    scores = perform.ratios(ledger.rows(), "watch_ratio", span=6)
 
     assert scores["r5"] == pytest.approx(2.0)
     assert scores["r4"] == pytest.approx(1.0)
@@ -597,7 +794,7 @@ def test_the_kept_table_uses_reels_that_were_never_posted(paths):
         if good:
             ledger.record(f"r{day}", {"watch_through": 0.5})
         else:
-            ledger.skip(f"r{day}", "off-niche")
+            ledger.skip(f"r{day}", "footage")
 
     data = perform.report(ledger=ledger, min_samples=3)
 
@@ -621,6 +818,127 @@ def test_a_stale_measurement_is_left_out_of_the_comparison(paths):
 
     assert "r3" not in data["ratios"]
     assert any("more than 48h" in warning for warning in data["warnings"])
+
+
+def test_a_green_measurement_is_left_out_of_the_comparison(paths):
+    """The other end of the window, and the one that was missing.
+
+    Measured live: the first reel read through the Instagram provider entered
+    the ledger 5.6 hours after it went out, with three views, and would have
+    been compared against reels read a day later as though its hook had failed.
+    """
+    ledger = _corpus(8)
+    for day in range(8):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5})
+    ledger.entry("r3")["hours_after_post"] = 5.6
+
+    data = perform.report(ledger=ledger, min_age_hours=24)
+
+    assert "r3" not in data["ratios"]
+    assert any("less than 24h" in warning for warning in data["warnings"])
+
+
+def test_a_reel_is_re_read_until_its_numbers_settle(paths):
+    """Numbers used to be taken once, and once was whenever you happened to look."""
+    ledger = _corpus(3)
+    ledger.record("r0", {"views": 3})
+    ledger.entry("r0")["hours_after_post"] = 5.6
+    ledger.record("r1", {"views": 900})
+    ledger.entry("r1")["hours_after_post"] = 96.0
+
+    unsettled = {row["run_id"] for row in ledger.unsettled(settle_hours=36)}
+
+    assert "r0" in unsettled       # read while it was still being shown
+    assert "r1" not in unsettled   # as final as this is going to make it
+    assert "r2" in unsettled       # never measured at all
+
+
+def test_a_reading_that_is_already_comparable_is_never_taken_again(paths):
+    """The defect automating the read would otherwise have introduced.
+
+    `report` compares on `hours_after_post`, the age of the latest reading. Two
+    readings from a daily job are a day apart and the comparable window is 24h
+    wide, so a reel read at 29h would be read again at 53h - comparable for
+    exactly one day and then silently not.
+    """
+    ledger = _corpus(2)
+    ledger.record("r0", {"views": 400})
+    ledger.entry("r0")["hours_after_post"] = 29.2   # inside 24-48h
+    ledger.record("r1", {"views": 3})
+    ledger.entry("r1")["hours_after_post"] = 5.6    # too early to count
+
+    unsettled = {row["run_id"] for row in ledger.unsettled(settle_hours=36)}
+
+    assert "r0" not in unsettled, "asking again could only push it out"
+    assert "r1" in unsettled, "still worth asking - nothing usable yet"
+
+
+def test_the_settle_ceiling_still_stops_the_asking(paths):
+    """The comparability guard is on top of the settle age, not instead of it."""
+    ledger = _corpus(1)
+    ledger.record("r0", {"views": 900})
+    ledger.entry("r0")["hours_after_post"] = 96.0
+
+    assert not ledger.unsettled(settle_hours=36)
+
+
+def test_re_reading_keeps_the_earlier_reading(paths):
+    ledger = _corpus(1)
+    ledger.record("r0", {"views": 3})
+    ledger.record("r0", {"views": 412})
+
+    entry = ledger.entry("r0")
+
+    assert entry["metrics"]["views"] == 412
+    assert [reading["metrics"]["views"]
+            for reading in entry["measurements"]] == [3, 412]
+
+
+def test_a_capped_watch_through_is_refused_rather_than_ranked(paths):
+    """89.5s of average watch time on a 37.59s reel is not a perfect score.
+
+    Instagram's average watch time counts replays, so a looped reel divides out
+    above 1.0 and a share of the reel cannot. Capped, that reel held the
+    highest watch-through in the ledger on three views.
+    """
+    ledger = _corpus(3)
+    for day in range(3):
+        ledger.record(f"r{day}", {"avg_watch_seconds": 20.0,
+                                  "watch_through": 0.5, "watch_ratio": 0.5})
+    ledger.record("r1", {"avg_watch_seconds": 89.5,
+                         "watch_through": 1.0, "watch_ratio": 2.38})
+
+    assert perform.saturated(ledger.entry("r1")) is True
+    assert perform.metric_value(ledger.entry("r1"), "watch_through") is None
+    assert perform.metric_value(ledger.entry("r1"), "watch_ratio") == 2.38
+
+    data = perform.report(ledger=ledger, metric="watch_through")
+    assert "r1" not in data["ratios"]
+    assert any("watch_ratio" in warning for warning in data["warnings"])
+
+
+def test_the_uncapped_ratio_still_ranks_a_looped_reel(paths):
+    ledger = _corpus(11)
+    for day in range(11):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5})
+    ledger.record("r5", {"watch_ratio": 2.38})
+
+    scores = perform.ratios(ledger.rows(), "watch_ratio", span=6)
+
+    assert scores["r5"] == pytest.approx(4.76)
+
+
+def test_a_typed_watch_through_carries_the_ratio_with_it(paths):
+    metrics, _ = perform.normalise_metrics({"watch_through": 61})
+
+    assert metrics == {"watch_through": 0.61, "watch_ratio": 0.61}
+
+
+def test_a_ratio_over_one_is_not_read_as_a_percentage(paths):
+    """238% and 2.38 are the same reading, and neither is 2.38%."""
+    metrics, _ = perform.normalise_metrics({"watch_ratio": 2.38})
+
+    assert metrics["watch_ratio"] == 2.38
 
 
 def test_an_empty_ledger_reports_what_to_do_about_it(paths):
@@ -727,23 +1045,47 @@ def test_arms_alternate_rather_than_randomise(paths):
 
 
 def test_the_hook_trial_turns_the_hook_pass_off_on_its_off_arm(paths):
-    duration, hooks, shape = perform.apply_arm({"name": "hook", "arm": "off"},
-                                               duration=40)
+    duration, hooks, shape, keep = perform.apply_arm(
+        {"name": "hook", "arm": "off"}, duration=40)
 
-    assert (duration, hooks, shape) == (40, False, None)
+    assert (duration, hooks, shape, keep) == (40, False, None, None)
     assert perform.apply_arm({"name": "hook", "arm": "on"},
-                             duration=40) == (40, None, None)
+                             duration=40) == (40, None, None, None)
 
 
 def test_the_structure_trial_turns_only_the_structure_pass_off(paths):
-    duration, hooks, shape = perform.apply_arm(
+    duration, hooks, shape, keep = perform.apply_arm(
         {"name": "structure", "arm": "off"}, duration=40)
 
     # The hook pass is left exactly where config had it: a trial varies one
     # thing, or the arms differ by two and neither can be read.
-    assert (duration, hooks, shape) == (40, None, False)
+    assert (duration, hooks, shape, keep) == (40, None, False, None)
     assert perform.apply_arm({"name": "structure", "arm": "on"},
-                             duration=40) == (40, None, None)
+                             duration=40) == (40, None, None, None)
+
+
+def test_the_takeaway_trial_turns_only_the_takeaway_pass_off(paths):
+    """The trial that makes the take-away pass falsifiable.
+
+    Its weights are a declared prior - nothing in the ledger has ever been
+    saved, so there was nothing to fit them to. An arm that turns the pass off
+    is the only thing that can ever say whether it was worth having.
+    """
+    duration, hooks, shape, keep = perform.apply_arm(
+        {"name": "takeaway", "arm": "off"}, duration=40)
+
+    assert (duration, hooks, shape, keep) == (40, None, None, False)
+    assert perform.apply_arm({"name": "takeaway", "arm": "on"},
+                             duration=40) == (40, None, None, None)
+
+
+def test_the_takeaway_trial_alternates_like_every_other(paths):
+    ledger = perform.PerformanceLedger()
+    seen = [perform.choose_arm("takeaway", ledger=ledger)["arm"]
+            for _ in range(2)]
+
+    assert seen == ["on", "on"], "nothing recorded yet, so the index sticks"
+    assert perform.TRIALS["takeaway"] == ("on", "off")
 
 
 def test_the_duration_trial_moves_one_step_either_way(paths, monkeypatch):
@@ -850,7 +1192,10 @@ def test_cli_records_numbers_against_a_reel(paths, tmp_path, capsys):
     assert perform.main(["1a2b3c", "--views", "4200", "--watched", "61"]) == 0
 
     entry = perform.PerformanceLedger().entry("ocean-1a2b3c")
-    assert entry["metrics"] == {"views": 4200, "watch_through": 0.61}
+    # watch_ratio comes along uninvited: it is the same division, and a row
+    # carrying only the capped figure cannot be ranked once it sits on the cap.
+    assert entry["metrics"] == {"views": 4200, "watch_through": 0.61,
+                                "watch_ratio": 0.61}
     assert "4,200" in capsys.readouterr().out
 
 
@@ -906,3 +1251,178 @@ def test_cli_reports_an_unknown_reel_without_a_traceback(paths, tmp_path, capsys
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Saved or sent - the distribution signal, read as a rate
+# ---------------------------------------------------------------------------
+
+def test_was_kept_is_a_yes_no_not_a_count():
+    assert perform.was_kept({"metrics": {"saves": 3, "shares": 0}}) == 1.0
+    assert perform.was_kept({"metrics": {"saves": 0, "shares": 1}}) == 1.0
+    assert perform.was_kept({"metrics": {"saves": 0, "shares": 0}}) == 0.0
+
+
+def test_was_kept_tells_a_zero_from_never_measured():
+    """0 saves is evidence. No saves column at all is not."""
+    assert perform.was_kept({"metrics": {"saves": 0, "shares": 0}}) == 0.0
+    assert perform.was_kept({"metrics": {"views": 400}}) is None
+    assert perform.was_kept({}) is None
+
+
+def test_a_metric_that_is_zero_everywhere_can_never_be_read_as_a_ratio(paths):
+    """Why PERFORMANCE_METRIC was not simply switched to `saves`.
+
+    `ratios` divides each reel by the median of its neighbours and
+    `local_baseline` refuses a median of zero. Every posted reel had 0 saves,
+    so ranking on saves would have produced an empty table - which reads
+    exactly like "measured, no effect" and is not the same thing at all.
+    """
+    ledger = _corpus(12)
+    for day in range(12):
+        ledger.record(f"r{day}", {"saves": 0, "watch_ratio": 0.5})
+
+    assert perform.ratios(ledger.rows(), "saves", 10) == {}
+    assert perform.ratios(ledger.rows(), "watch_ratio", 10), "watch still reads"
+
+
+def test_the_saved_table_reads_a_rate_where_the_ratio_table_cannot(paths):
+    ledger = _corpus(12)
+    for day in range(12):
+        ledger.record(f"r{day}", {"saves": 1 if day % 2 else 0,
+                                  "watch_ratio": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=2)
+
+    assert data["saved"], "a rate is defined even where a ratio is not"
+    assert data["ever_saved"] == 6
+
+
+def test_a_column_of_zeros_is_called_out_rather_than_read_as_no_effect(paths):
+    ledger = _corpus(12)
+    for day in range(12):
+        ledger.record(f"r{day}", {"saves": 0, "shares": 0, "watch_ratio": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=2)
+
+    assert data["ever_saved"] == 0
+    assert any("column of zeros" in warning for warning in data["warnings"])
+
+
+def test_nothing_is_said_about_zeros_once_a_reel_has_been_saved(paths):
+    ledger = _corpus(12)
+    for day in range(12):
+        ledger.record(f"r{day}", {"saves": 1 if day == 3 else 0,
+                                  "watch_ratio": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=2)
+
+    assert not any("column of zeros" in warning
+                   for warning in data["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# The cover and the tags - FEATURES_VERSION 5
+# ---------------------------------------------------------------------------
+
+def test_the_cover_source_is_recorded_once_a_cover_was_written(paths, tmp_path):
+    run_dir = tmp_path / "out" / "2026-09-09" / "forest-1a2b3c"
+    run_dir.mkdir(parents=True)
+    (run_dir / "assembly.json").write_text(json.dumps({
+        "cover": {"written": True, "source": "hook_card"},
+    }), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+
+    assert features["cover_source"] == "hook_card"
+    assert ("cover", "hook_card") in perform.facets(features, {})
+
+
+def test_a_cover_that_was_never_written_is_not_a_cover_source(paths, tmp_path):
+    """A run that failed before step 5 got there has no cover, which is not the
+    same fact as a cover taken from the footage."""
+    run_dir = tmp_path / "out" / "2026-09-09" / "forest-1a2b3c"
+    run_dir.mkdir(parents=True)
+    (run_dir / "assembly.json").write_text(json.dumps({
+        "cover": {"written": False, "source": "hook_card"},
+    }), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+
+    assert features["cover_source"] == ""
+    assert not any(question == "cover"
+                   for question, _ in perform.facets(features, {}))
+
+
+def test_a_reel_made_before_the_cover_column_is_not_asked_about_it(paths):
+    old = {**_features("r1"), "features_version": 4, "cover_source": "hook_card"}
+    new = {**_features("r2"), "cover_source": "hook_card"}
+
+    assert not any(q == "cover" for q, _ in perform.facets(old, {}))
+    assert ("cover", "hook_card") in perform.facets(new, {})
+
+
+def test_the_tags_themselves_are_recorded_not_just_how_many(paths, tmp_path):
+    """The column that makes "did #woodwideweb do anything" answerable.
+
+    Every row up to version 5 stored the count and a tally of bands, so the
+    question could not be held whatever the tags were.
+    """
+    run_dir = tmp_path / "out" / "2026-09-09" / "forest-1a2b3c"
+    run_dir.mkdir(parents=True)
+    (run_dir / "post.json").write_text(json.dumps({
+        "hashtags": ["#WoodWideWeb", "#ecology", "#earthscience"],
+    }), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+
+    assert features["hashtags"] == 3
+    assert features["hashtag_names"] == ["earthscience", "ecology",
+                                         "woodwideweb"]
+
+
+def test_two_spellings_of_one_tag_are_one_facet(paths, tmp_path):
+    """Two spellings would be two facets that each halve their own evidence."""
+    run_dir = tmp_path / "out" / "2026-09-09" / "forest-1a2b3c"
+    run_dir.mkdir(parents=True)
+    (run_dir / "post.json").write_text(json.dumps({
+        "hashtags": ["#WoodWideWeb", "woodwideweb", " #WOODWIDEWEB ", ""],
+    }), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+
+    assert features["hashtag_names"] == ["woodwideweb"]
+
+
+def test_a_tag_is_asked_as_a_question_like_any_other_component(paths):
+    vocabulary = {"hashtag": ["woodwideweb"]}
+    used = {**_features("r1"), "hashtag_names": ["woodwideweb", "ecology"]}
+    unused = {**_features("r2"), "hashtag_names": ["ecology"]}
+
+    assert ("hashtag: woodwideweb", "fired") in perform.facets(used, vocabulary)
+    assert ("hashtag: woodwideweb", "absent") in perform.facets(unused,
+                                                                vocabulary)
+
+
+def test_a_reel_made_before_the_tags_were_written_down_is_not_asked(paths):
+    """"This reel did not use #ecology" is a different fact from "nobody wrote
+    the tags down"."""
+    vocabulary = {"hashtag": ["ecology"]}
+    old = {**_features("r1"), "features_version": 4}
+
+    assert not any(q.startswith("hashtag:")
+                   for q, _ in perform.facets(old, vocabulary))
+
+
+def test_tag_effects_never_reach_step_0_s_board(paths):
+    """`measured_effects` feeds topic components back onto the board. A
+    hashtag is not a topic component and must not be scored as one."""
+    ledger = _corpus(12)
+    for day in range(12):
+        row = ledger.entry(f"r{day}")["features"]
+        row["hashtag_names"] = ["ecology"] if day % 2 else ["planetearth"]
+        ledger.record(f"r{day}", {"watch_ratio": 1.0 if day % 2 else 0.2})
+
+    effects = perform.measured_effects(ledger=ledger)
+
+    assert not any(name in ("ecology", "planetearth") for name in effects)

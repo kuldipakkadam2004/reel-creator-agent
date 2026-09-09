@@ -558,6 +558,112 @@ def test_a_repair_that_improves_to_the_last_round_is_kept_and_still_blocks(
     assert any("still stand" in w for w in report["warnings"])
 
 
+def test_every_repair_round_is_recorded_with_what_it_came_back_with(
+        monkeypatch):
+    """What the last three attempts at this pass were argued without.
+
+    When no round lands, the script left standing is the original - so
+    `remaining` describes the original, which is correct and is also why the
+    run log has only ever quoted the fault the draft *started* with. The
+    rounds in between left no trace anywhere, and every judgement about
+    whether this pass refuses too much was made from that one stale line.
+    """
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    standing = [{"sentence": "Total darkness.", "kind": "false",
+                 "problem": "one percent of the light is left"}]
+    _verify_gemini(monkeypatch, findings=standing,
+                   repaired=[_HALF_FIXED, _HALF_FIXED],
+                   recheck=[standing, standing])
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert report["blocked"] is True
+    assert report["script"] == DEEP_SEA, "the original is still what stands"
+    assert [a["round"] for a in report["attempts"]] == [1, 2]
+    assert all(a["script"] == _HALF_FIXED for a in report["attempts"])
+    assert all(a["remaining"] == standing for a in report["attempts"])
+    assert sum("repair round" in w for w in report["warnings"]) == 2
+
+
+def test_the_round_that_clears_it_is_recorded_too(monkeypatch):
+    """Not only failures. A round that landed is the evidence that the budget
+    is worth what it costs, and it is counted in the same place."""
+    standing = [{"sentence": "Total darkness.", "kind": "false",
+                 "problem": "one percent of the light is left"}]
+    _verify_gemini(monkeypatch, findings=standing,
+                   repaired=_FULLY_FIXED, recheck=[])
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert report["blocked"] is False
+    assert report["attempts"] == [{"round": 1, "script": _FULLY_FIXED,
+                                   "remaining": []}]
+    assert not any("repair round" in w for w in report["warnings"]), (
+        "a round that worked is not a warning")
+
+
+def test_a_refusal_carries_the_draft_and_the_report_that_refused_it(
+        monkeypatch):
+    """The evidence for a refusal is a whole script and every round spent on
+    it; the caller used to get one line of message and drop the rest. Both
+    ride on the exception now, and `run.py` writes them to
+    output/scripts/refused/ before it falls through to the next candidate."""
+    draft = ("Sunlight does not go far into the ocean. "
+             "By a thousand feet the sun is gone. "
+             "Total darkness.")
+    # The repair leaves "Total darkness." word for word, so the re-check's
+    # finding still quotes a sentence the script really has - a rewrite that
+    # touched it would clear the finding by removing what it is about.
+    repaired = draft.replace("By a thousand feet the sun is gone.",
+                             "By a thousand feet almost all of it is gone.")
+    standing = [{"sentence": "Total darkness.", "kind": "false",
+                 "problem": "one percent of the light is left"}]
+
+    def dispatch(prompt, **kwargs):
+        if "fact-check found these faults" in prompt:
+            return repaired
+        if "Find every place" in prompt:
+            return json.dumps(standing)
+        return draft
+
+    monkeypatch.setattr(script_gen, "call_gemini", dispatch)
+    with pytest.raises(script_gen.ScriptGenerationError) as caught:
+        script_gen.generate_script("the deep sea", 20,
+                                   hooks=False, structure=False)
+
+    assert caught.value.script == draft, "the draft that was refused"
+    assert caught.value.report["remaining"] == standing
+    assert caught.value.report["attempts"], "and what the rounds came back with"
+
+
+def test_a_failure_that_is_not_a_refusal_carries_no_draft(monkeypatch):
+    """`script` is empty for every other cause, so a caller can tell a script
+    that was judged and refused from one that never existed."""
+    error = script_gen.ScriptGenerationError("the API is down")
+
+    assert error.script == ""
+    assert error.report == {}
+
+
+def test_save_refused_script_keeps_the_words_and_the_rounds(monkeypatch,
+                                                            tmp_path):
+    """Two files, named the way `save_script` names its own: the draft as it
+    stood, and the report that refused it with every round inside it."""
+    monkeypatch.setattr(config, "REFUSED_DIR", tmp_path)
+    report = {"remaining": [{"sentence": "Total darkness.", "kind": "false",
+                             "problem": "one percent of the light is left"}],
+              "attempts": [{"round": 1, "script": _HALF_FIXED,
+                            "remaining": []}]}
+
+    sidecar = script_gen.save_refused_script("the deep sea", DEEP_SEA, report)
+
+    assert sidecar.suffix == ".json"
+    assert sidecar.with_suffix(".txt").read_text(
+        encoding="utf-8").strip() == DEEP_SEA
+    kept = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert kept["topic"] == "the deep sea"
+    assert kept["claims"]["attempts"][0]["script"] == _HALF_FIXED
+    assert kept["claims"]["remaining"][0]["sentence"] == "Total darkness."
+
+
 def test_the_repair_is_told_to_qualify_an_overstatement():
     """The rule the six topics discarded on 2026-09-02 all needed. The repair
     used to be told only that it must not go vague, which forbids the one
@@ -619,6 +725,64 @@ def test_something_merely_unverifiable_does_not_block(monkeypatch):
     assert len(calls) == 1, "noted, not repaired"
     assert report["blocked"] is False
     assert report["findings"], "it is still reported"
+
+
+#: The hook of the reel step 8 lost on 2026-09-06, kept verbatim in
+#: output/scripts/refused/. Its first sentence is a metaphor - a tree is not a
+#: pump - and every wording of it the repair tried was refused on the mechanics
+#: of the image rather than on anything the script was claiming.
+TREE = (
+    "This tree is a silent water pump with absolutely no moving parts. "
+    "It can lift four hundred liters of water a day, ten stories high. "
+    "The engine isn't at the bottom. It's at the top."
+)
+
+
+def test_a_metaphor_is_not_a_false_claim(monkeypatch):
+    """A hook is compressed on purpose, and read literally a compression is
+    always false of something. Blocking on that loses the topic and cannot be
+    repaired, because the sentence was never the fault."""
+    calls = _verify_gemini(monkeypatch, findings=[{
+        "sentence": "This tree is a silent water pump with absolutely no "
+                    "moving parts.",
+        "kind": "figurative",
+        "problem": "Stomata open and close; those are moving parts.",
+    }])
+    report = script_gen.verify_claims("trees", TREE)
+
+    assert len(calls) == 1, "noted, not repaired"
+    assert report["blocked"] is False
+    assert report["revised"] is False
+    assert report["findings"], "it is still reported"
+
+
+def test_an_invented_animal_still_blocks_beside_a_metaphor(monkeypatch):
+    """The carve-out is for images, not for cover. A script that is wrong
+    about something is still refused, and the repair is handed the fault that
+    blocks and not the one that does not."""
+    calls = _verify_gemini(monkeypatch, findings=[
+        {"sentence": "This tree is a silent water pump with absolutely no "
+                     "moving parts.",
+         "kind": "figurative", "problem": "stomata move"},
+        {"sentence": "It can lift four hundred liters of water a day, ten "
+                     "stories high.",
+         "kind": "false", "problem": "wrong by an order of magnitude"},
+    ])
+    report = script_gen.verify_claims("trees", TREE)
+
+    assert report["blocked"] is True, "the false claim still costs the topic"
+    faults = [c for c in calls if "fact-check found these faults" in c]
+    assert faults, "the repair was bought"
+    assert "order of magnitude" in faults[0]
+    assert "stomata move" not in faults[0], "the image is not sent for repair"
+
+
+def test_the_checker_is_offered_the_kind_it_is_meant_to_use(monkeypatch):
+    """A kind the model is never told about is a kind it never returns, and
+    the pass falls straight back to calling every metaphor false."""
+    assert "figurative" in script_gen._VERIFY_PROMPT_TEMPLATE
+    assert "figurative" in script_gen._VERIFY_KINDS
+    assert "figurative" not in script_gen._VERIFY_BLOCKING
 
 
 def test_the_claim_check_can_be_switched_off_without_calling_anything(monkeypatch):
@@ -907,6 +1071,49 @@ def test_a_bare_magnitude_is_not_a_figure():
     )
 
 
+def test_a_small_number_word_that_is_only_counting_is_not_a_figure():
+    """English uses "two" to enumerate at least as often as to measure.
+
+    Both of these fired the component on the reels as shipped. The first won
+    its script on that 0.8 alone, over a candidate carrying second person and
+    a strong opener - and it was itself restating the body, a -1.5 the bonus
+    was covering for.
+    """
+    for line in ("An autumn leaf has two kinds of colour: the old and the new.",
+                 "Chernobyl is an invoice that two countries will be paying for."):
+        assert not script_gen.says_a_number(line), line
+        assert "a number" not in script_gen.score_hook(line)["components"]
+
+
+@pytest.mark.parametrize("line", [
+    # a unit of measure
+    "These seeds can wait fifty years for a rain that lasts three days.",
+    "Almost every great desert on Earth lies at thirty degrees of latitude.",
+    "There is a traffic jam that covers seventy percent of the planet.",
+    # one figure written in two tokens, only the first of them small
+    "Every July, Earth runs five million kilometers farther from the sun.",
+    "Bacteria eat two hundred pounds of the Titanic's steel every day.",
+    "One kilogram of rust can deoxygenate ten thousand litres of seawater.",
+    # a magnitude standing on its own
+    "What you are standing on costs a thousand years for a single inch.",
+])
+def test_a_small_number_word_quantifying_something_still_counts(line):
+    """The 27 of 30 the rule must not touch - see _HOOK_MEASURE_WORDS."""
+    assert script_gen.says_a_number(line), line
+
+
+def test_the_enumeration_bonus_no_longer_outranks_a_written_hook():
+    """The leaves reel, end to end: the shipped winner loses to the better line."""
+    body = ("An autumn leaf has two kinds of colour: the old and the new. "
+            "All summer long, the leaf is a factory flooded with green "
+            "chlorophyll, hiding the colours sleeping just underneath.")
+    shipped = "An autumn leaf has two kinds of colour: the old and the new."
+    better = "This leaf was yellow all summer; you just couldn't see it."
+
+    assert (script_gen.score_hook(better, body=body)["score"]
+            > script_gen.score_hook(shipped, body=body)["score"])
+
+
 def test_a_digit_is_no_longer_the_biggest_term_in_the_scorer():
     """What the reweighting is for.
 
@@ -953,6 +1160,23 @@ def test_a_real_proper_noun_is_still_a_named_thing():
     )["components"]
 
 
+# --- what the prompt is asked for, against what the scorer pays for --------
+
+def test_the_prompt_asks_for_the_component_the_scorer_pays_most_for():
+    """Direct address is the largest single virtue `score_hook` has, and for a
+    long time nothing in the prompt asked for it: 10 of the 135 candidates on
+    disk put the viewer in the sentence, and 4 of those 10 won their script -
+    a 40% win rate against a field of 16%. The scorer cannot choose what it is
+    never shown, so the ask and the weight have to move together."""
+    assert '"you", "your"' in script_gen._HOOK_PROMPT_TEMPLATE
+
+    plain = script_gen.score_hook("Rain carries salt from the rocks to the sea.")
+    viewer = script_gen.score_hook("Rain carries salt from the rocks to your sea.")
+    figure = script_gen.score_hook("Rain carries 50 tonnes of salt to the sea.")
+
+    assert viewer["score"] - plain["score"] > figure["score"] - plain["score"], (
+        "the prompt asks for a viewer because the scorer pays more for one "
+        "than for a number - re-read the ask if that stops being true")
 # --- the hook against the body it is joined to -----------------------------
 
 def test_a_hook_the_body_repeats_is_charged_for_it():
@@ -1197,6 +1421,41 @@ def test_a_clause_break_still_wins_over_the_dangling_trim():
     assert script_gen.hook_card_text(
         "It is not what you think, and the reason is stranger", max_words=6
     ) == "It is not what you think"
+
+
+def test_a_card_never_ends_on_a_bare_figure():
+    """The shipped Chernobyl card. A number is the start of a quantity and
+    never the end of a thought, so a card ending on one has been guillotined
+    mid-measurement - and popping it uncovers the "in" that was holding it up.
+    """
+    assert script_gen.hook_card_text(
+        "They entombed the reactor in 400,000 cubic meters of concrete."
+    ) == "They entombed the reactor"
+
+
+def test_a_figure_with_its_unit_is_left_alone():
+    """The rule is about a number cut off from what it counts, not about
+    numbers. Both of these are finished thoughts and both must survive."""
+    assert script_gen.hook_card_text(
+        "The Inca built 100,000 miles of road without the wheel."
+    ) == "The Inca built 100,000 miles"
+    assert script_gen.hook_card_text(
+        "The ocean contains 50 quadrillion tons of salt."
+    ) == "The ocean contains 50 quadrillion tons"
+
+
+def test_a_magnitude_word_is_not_a_bare_figure():
+    """"millions" ends on a noun and reads fine where "400,000" cannot.
+    Measured over the 29 openings on disk: a magnitude rule fires once, on a
+    card that is good."""
+    assert script_gen.hook_card_text(
+        "This baked sand holds millions of years of rain."
+    ) == "This baked sand holds millions"
+
+
+def test_the_bare_figure_trim_still_respects_the_floor():
+    """Only ever shortens, and never below the two-word floor."""
+    assert script_gen.hook_card_text("Only 400,000") == "Only 400,000"
 
 
 def test_an_empty_hook_yields_an_empty_card():
@@ -1688,6 +1947,18 @@ SAYS_IT_TWICE = (
     "You can still read the proof."
 )
 
+#: The same script with its repeat taken out - and, crucially, opening on the
+#: line it was given. A rewrite that comes back on a different opening is
+#: dropped whole, so a fixture that changes one tests the opening guard by
+#: accident instead of the rule it was written for.
+SAYS_IT_TWICE_REWRITTEN = (
+    "This desert was once a seabed. "
+    "Layer after layer of shell and mud pressed down into stone. "
+    "Each layer holds a different million years. "
+    "But the river did not pile that rock up, it took it away. "
+    "The seabed is still there, in the wall."
+)
+
 
 def test_a_sentence_reworded_and_said_again_is_caught_without_a_flip():
     """The failure the seesaw check was built too narrowly to see.
@@ -1729,7 +2000,7 @@ def test_a_script_that_repeats_itself_is_rewritten_however_well_it_scores(
     fired, which is arithmetic between two constants and not a decision.
     """
     monkeypatch.setattr(config, "STRUCTURE_MIN_SCORE", -10.0)
-    fake_rewrite(monkeypatch, SHAPELY)
+    fake_rewrite(monkeypatch, SAYS_IT_TWICE_REWRITTEN)
     report = script_gen.choose_structure("canyons", SAYS_IT_TWICE)
 
     assert report["score"] >= config.STRUCTURE_MIN_SCORE  # nothing is owed
@@ -1909,16 +2180,21 @@ def test_a_rewrite_that_ignores_the_word_budget_is_dropped(monkeypatch):
     assert any("word budget" in w for w in report["warnings"])
 
 
-def test_a_rewrite_that_changed_the_opening_has_it_put_back(monkeypatch):
+def test_a_rewrite_that_changed_the_opening_is_dropped(monkeypatch):
     """The opening was handed over as fixed. A model that rewrote it anyway has
-    thrown away the line the hook pass scored five candidates to choose."""
+    thrown away the line the hook pass scored five candidates to choose - and
+    written every sentence after it to follow the one it deleted, which is why
+    the whole rewrite goes rather than the opening being pasted back over it.
+    The Chernobyl reel shipped on a paste: the body kept the bridge the hook
+    pass had written for a different second sentence out of it, and "Not even
+    close." went to air answering nothing."""
     fake_rewrite(monkeypatch, SHAPELY.replace(
         "Every raindrop carries salt to the sea.",
         "Something else entirely happens first."))
     report = script_gen.choose_structure("salt", SHAPELESS, 20)
 
-    assert report["revised"] is True
-    assert report["revised_script"].startswith("Every raindrop carries salt")
+    assert report["revised"] is False
+    assert report["revised_script"] == ""
     assert any("changed the opening" in w for w in report["warnings"])
 
 
@@ -1988,7 +2264,14 @@ def test_a_rewrite_goes_through_the_same_scrubber_as_the_narration(monkeypatch):
 # --- and the whole of step 2 ------------------------------------------------
 
 def _staged_gemini(monkeypatch, calls: list[str]):
-    """The three calls step 2 can make, told apart by their prompts."""
+    """The four calls step 2 can make, told apart by their prompts.
+
+    Both rewrite passes open on "Rewrite the narration", so they are separated
+    on the clause after it. Told apart only by that shared prefix, the
+    take-away pass would be handed the structure pass's rewrite, score it the
+    same as the incumbent, and reject it - which is a pass doing nothing while
+    looking like a pass doing its job.
+    """
     hook = "Rain is the reason your ocean tastes of salt."
     rewritten = (
         f"{hook} "
@@ -1997,11 +2280,21 @@ def _staged_gemini(monkeypatch, calls: list[str]):
         "But the water leaves again as vapour, and the salt cannot follow. "
         "That is what every rainfall quietly adds to your ocean."
     )
+    handed = (
+        f"{hook} "
+        "Rivers pick up minerals as they run. "
+        "They carry them down and leave them there. "
+        "But the water leaves again as vapour, and the salt cannot follow. "
+        "Next time you taste sea spray, you are tasting a mountain. "
+        "That is what every rainfall quietly adds to your ocean."
+    )
 
     def dispatch(prompt, **kwargs):
         calls.append(prompt)
         if "replacement opening lines" in prompt:
             return json.dumps([{"hook": hook, "card": "Rain made it salty"}])
+        if "left holding something" in prompt:
+            return handed
         if "Rewrite the narration" in prompt:
             return rewritten
         return ("Salt gets into the sea somehow. "
@@ -2019,13 +2312,62 @@ def test_generate_script_shapes_the_script_around_the_hook_it_chose(monkeypatch)
     calls: list[str] = []
     hook, rewritten = _staged_gemini(monkeypatch, calls)
     result = script_gen.generate_script("why the ocean is salty", 20,
-                                        verify=False)
+                                        takeaway=False, verify=False)
 
     assert len(calls) == 3, "scriptwriter, hook pass, structure pass"
     assert hook in calls[2], "the rewrite was given the chosen hook to keep"
     assert result["script"] == rewritten
     assert result["structure"]["revised"] is True
     assert result["hook"]["replaced"] is True
+
+
+def test_a_disobedient_rewrite_cannot_cost_the_script_its_bridge(monkeypatch):
+    """The Chernobyl failure, end to end.
+
+    The hook pass does not only swap sentence one: it mends sentence two so the
+    new opening runs into the body. A rewrite that comes back on its own
+    opening has thrown that mend away, and pasting the chosen opening back over
+    it cannot put it back - sentence two of the rewrite was written to follow
+    the sentence the paste just deleted. So the whole rewrite goes and the
+    mended script stands, however well the rewrite scored.
+
+    The shipped reel that proved it opened on a concrete sarcophagus, lost the
+    bridge that set up its rebuttal, and said "Not even close." to nothing.
+    """
+    hook = "Rain is the reason your ocean tastes of salt."
+    bridge = "And that rain is only the start of it."
+
+    def dispatch(prompt, **kwargs):
+        if "replacement opening lines" in prompt:
+            return json.dumps([{"hook": hook, "card": "Rain made it salty",
+                                "bridge": bridge}])
+        if "Rewrite the narration" in prompt:
+            # Long enough to clear the word band and well enough shaped to
+            # beat the incumbent, so the only thing standing between it and
+            # the script is the opening it was told to keep.
+            return ("Something else entirely happens first. "
+                    "Rivers pick up minerals as they run over bare rock and "
+                    "old soil. "
+                    "They carry that load all the way down and leave it "
+                    "standing in the sea. "
+                    "But the water leaves again as vapour, and the salt it "
+                    "carried cannot follow. "
+                    "That is what every rainfall quietly adds to your ocean.")
+        return ("Salt gets into the sea somehow. "
+                "Rivers do their work quietly. "
+                "Nobody counts them. "
+                "Fish are unbothered by all of it.")
+
+    monkeypatch.setattr(script_gen, "call_gemini", dispatch)
+    result = script_gen.generate_script("why the ocean is salty", 20,
+                                        verify=False)
+
+    assert result["hook"]["bridge"] == bridge, "the mend was worth making"
+    assert result["structure"]["revised"] is False
+    assert result["script"].startswith(hook)
+    assert bridge in result["script"], "the mend survived the structure pass"
+    assert any("changed the opening" in w
+               for w in result["structure"]["warnings"])
 
 
 def test_generate_script_reports_the_shape_it_left_the_script_in(monkeypatch):
@@ -2042,7 +2384,8 @@ def test_generate_script_can_skip_the_structure_pass(monkeypatch):
     calls: list[str] = []
     _staged_gemini(monkeypatch, calls)
     result = script_gen.generate_script("salt", 20, hooks=False,
-                                        structure=False, verify=False)
+                                        structure=False, takeaway=False,
+                                        verify=False)
 
     assert len(calls) == 1, "only the scriptwriter call"
     assert result["structure"]["mode"] == "off"
@@ -2063,3 +2406,391 @@ def test_a_structure_pass_that_fails_still_yields_a_script(monkeypatch):
 
     assert result["script"].startswith("Salt gets into the sea somehow.")
     assert result["structure"]["mode"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# The take-away
+# ---------------------------------------------------------------------------
+
+#: Shaped and paid off, and hands the viewer nothing - which is the whole
+#: corpus this pass was built against.
+_KEEPS_NOTHING = (
+    "The ocean holds more salt than every lake on Earth. "
+    "Rivers pick up minerals as they run over bare rock. "
+    "They carry them down and leave them in the sea. "
+    "But the water leaves again as vapour, and the salt cannot follow. "
+    "The ocean has no drain."
+)
+
+
+def test_score_takeaway_pays_for_putting_the_viewer_in_front_of_it():
+    script = (_KEEPS_NOTHING
+              + " Next time you taste sea spray, you are tasting a mountain.")
+    report = script_gen.score_takeaway(script)
+
+    assert "puts the viewer in front of it" in report["components"]
+    assert report["score"] >= config.TAKEAWAY_MIN_SCORE
+
+
+def test_score_takeaway_pays_for_naming_the_thing():
+    script = _KEEPS_NOTHING + " The process is called weathering."
+    report = script_gen.score_takeaway(script)
+
+    assert "names the thing" in report["components"]
+
+
+def test_score_takeaway_pays_for_the_viewer_in_the_close():
+    script = _KEEPS_NOTHING + " It is the reason your bath water stings."
+    report = script_gen.score_takeaway(script)
+
+    assert "the viewer is in the close" in report["components"]
+
+
+def test_score_takeaway_scores_the_corpus_shape_at_nothing():
+    """The measurement the pass exists for, kept as a test.
+
+    A well-shaped script that hands nothing over must score zero. If this
+    starts passing on its own, a component has been added that pays for
+    something every script already does, and the pass has stopped separating
+    anything.
+    """
+    report = script_gen.score_takeaway(_KEEPS_NOTHING)
+
+    assert report["score"] == 0.0
+    assert report["components"] == {}
+
+
+def test_the_impersonal_you_is_not_a_take_away():
+    """"You hear the rumble" is the impersonal "one", not this viewer.
+
+    The deep-ocean reel is the real sentence: "So you don't hear nothing. You
+    hear the rumble of a volcano erupting on the other side of the planet."
+    Nobody watching is going to hear that volcano. Before the auxiliary was
+    required this was the only script in the corpus the rule fired on.
+    """
+    impersonal = _KEEPS_NOTHING + " You hear the rumble of a volcano."
+    personal = _KEEPS_NOTHING + " You'll hear it yourself in any quiet bay."
+
+    assert "puts the viewer in front of it" not in \
+        script_gen.score_takeaway(impersonal)["components"]
+    assert "puts the viewer in front of it" in \
+        script_gen.score_takeaway(personal)["components"]
+
+
+def test_score_takeaway_survives_an_empty_script():
+    report = script_gen.score_takeaway("")
+
+    assert report["score"] == 0.0
+    assert "nothing to hand over" in report["components"]
+
+
+def test_takeaway_faults_name_what_is_missing():
+    faults = script_gen.takeaway_faults(
+        script_gen.score_takeaway(_KEEPS_NOTHING)["components"])
+
+    assert "never puts the viewer in front of the thing" in faults
+    assert "never names what it is describing" in faults
+
+
+def test_takeaway_faults_say_something_when_everything_fired():
+    faults = script_gen.takeaway_faults(
+        {"puts the viewer in front of it": 2.0,
+         "names the thing": 1.2,
+         "the viewer is in the close": 0.8})
+
+    assert faults == "nothing measurable - tighten it"
+
+
+def test_choose_takeaway_off_never_calls_the_model(monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("the pass is off and called the model anyway")
+
+    monkeypatch.setattr(script_gen, "call_gemini", explode)
+    report = script_gen.choose_takeaway("salt", _KEEPS_NOTHING, 20, mode="off")
+
+    assert report["mode"] == "off"
+    assert report["revised"] is False
+    assert report["score"] == 0.0
+
+
+def test_choose_takeaway_leaves_a_script_that_already_hands_something_over(
+        monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("bought a rewrite for a script that scored")
+
+    monkeypatch.setattr(script_gen, "call_gemini", explode)
+    script = (_KEEPS_NOTHING
+              + " Next time you taste sea spray, you are tasting a mountain.")
+    report = script_gen.choose_takeaway("salt", script, 20, mode="llm")
+
+    assert report["revised"] is False
+    assert report["score"] >= config.TAKEAWAY_MIN_SCORE
+
+
+def test_choose_takeaway_takes_a_rewrite_that_hands_something_over(monkeypatch):
+    handed = (
+        "The ocean holds more salt than every lake on Earth. "
+        "Rivers pick up minerals as they run over bare rock. "
+        "They carry them down and leave them in the sea. "
+        "But the water leaves again as vapour, and the salt cannot follow. "
+        "Next time you taste sea spray, you are tasting a mountain. "
+        "The ocean has no drain."
+    )
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        lambda *a, **k: handed)
+    report = script_gen.choose_takeaway("salt", _KEEPS_NOTHING, 20, mode="llm")
+
+    assert report["revised"] is True
+    assert report["revised_script"] == handed
+    assert report["revised_score"] > report["score"]
+
+
+def test_choose_takeaway_keeps_the_original_when_the_rewrite_gains_nothing(
+        monkeypatch):
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        lambda *a, **k: _KEEPS_NOTHING)
+    report = script_gen.choose_takeaway("salt", _KEEPS_NOTHING, 20, mode="llm")
+
+    assert report["revised"] is False
+    assert any("kept the original" in w for w in report["warnings"])
+
+
+def test_a_take_away_may_not_be_bought_by_wrecking_the_ending():
+    """The guard the structure pass does not need and this one does.
+
+    Everything this rewrite is asked for lands in the closing sentences, which
+    is exactly where `score_structure` measures the payoff. A rewrite that
+    hands the viewer something and drops the ending to do it has traded the
+    line they would have remembered for the thing they were meant to keep.
+    """
+    # Hands something over, and ends on a line with nothing to do with the
+    # opening - so the take-away score rises and the shape score falls.
+    wrecked = (
+        "The ocean holds more salt than every lake on Earth. "
+        "Rivers pick up minerals as they run over bare rock. "
+        "Next time you taste sea spray, you are tasting a mountain. "
+        "Anyway, plenty of unrelated weather happens above all of this, and "
+        "some of it arrives without any warning whatsoever for anyone. "
+        "Clouds do their own thing entirely."
+    )
+    before = script_gen.score_structure(_KEEPS_NOTHING)["score"]
+    after = script_gen.score_structure(wrecked)["score"]
+    assert after < before, "the fixture must actually damage the shape"
+    assert script_gen.score_takeaway(wrecked)["score"] > \
+        script_gen.score_takeaway(_KEEPS_NOTHING)["score"]
+
+
+def test_choose_takeaway_refuses_a_rewrite_that_damaged_the_shape(monkeypatch):
+    wrecked = (
+        "The ocean holds more salt than every lake on Earth. "
+        "Rivers pick up minerals as they run over bare rock. "
+        "Next time you taste sea spray, you are tasting a mountain. "
+        "Anyway, plenty of unrelated weather happens above all of this, and "
+        "some of it arrives without any warning whatsoever for anyone. "
+        "Clouds do their own thing entirely."
+    )
+    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **k: wrecked)
+    report = script_gen.choose_takeaway("salt", _KEEPS_NOTHING, 20, mode="llm")
+
+    assert report["revised"] is False
+    assert any("shape fell" in w for w in report["warnings"])
+
+
+def test_choose_takeaway_refuses_a_rewrite_off_the_word_budget(monkeypatch):
+    monkeypatch.setattr(
+        script_gen, "call_gemini",
+        lambda *a, **k: ("The ocean holds more salt than every lake on Earth. "
+                         "Next time you taste it, you are tasting a mountain."))
+    report = script_gen.choose_takeaway("salt", _KEEPS_NOTHING, 20, mode="llm")
+
+    assert report["revised"] is False
+    assert any("word budget" in w for w in report["warnings"])
+
+
+def test_choose_takeaway_leaves_a_script_too_short_to_hand_anything_over(
+        monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("rewrote a script with no room to rewrite")
+
+    monkeypatch.setattr(script_gen, "call_gemini", explode)
+    report = script_gen.choose_takeaway("salt", "Salt is heavy. It sinks.",
+                                        20, mode="llm")
+
+    assert report["revised"] is False
+    assert any("too short" in w for w in report["warnings"])
+
+
+def test_revise_takeaway_drops_a_rewrite_that_changed_the_opening(monkeypatch):
+    monkeypatch.setattr(
+        script_gen, "call_gemini",
+        lambda *a, **k: ("Something else entirely opens this reel now. "
+                         "Next time you taste sea spray, you taste a mountain. "
+                         "The ocean has no drain."))
+    result = script_gen.revise_takeaway("salt", _KEEPS_NOTHING, 20)
+
+    assert result["script"] == ""
+    assert any("changed the opening" in w for w in result["warnings"])
+
+
+def test_a_take_away_pass_that_fails_still_yields_a_script(monkeypatch):
+    def dispatch(prompt, **kwargs):
+        raise script_gen.ScriptGenerationError("503 unavailable")
+
+    monkeypatch.setattr(script_gen, "call_gemini", dispatch)
+    report = script_gen.choose_takeaway("salt", _KEEPS_NOTHING, 20, mode="llm")
+
+    assert report["mode"] == "failed"
+    assert report["revised"] is False
+    assert any("take-away pass failed" in w for w in report["warnings"])
+
+
+def test_generate_script_runs_the_take_away_pass_after_the_structure_pass(
+        monkeypatch):
+    """Order matters the other way round here.
+
+    The take-away pass writes into the ending the structure pass just built,
+    so it has to see that ending. Reversed, the structure pass would rewrite
+    the hand-over away with nothing watching for it.
+    """
+    calls: list[str] = []
+    _staged_gemini(monkeypatch, calls)
+    result = script_gen.generate_script("why the ocean is salty", 20,
+                                        verify=False)
+
+    assert len(calls) == 4, "scriptwriter, hook, structure, take-away"
+    assert "left holding something" in calls[3]
+    assert result["takeaway"]["revised"] is True
+    assert "puts the viewer in front of it" in \
+        result["takeaway"]["revised_components"]
+    assert "Next time you taste sea spray" in result["script"]
+
+
+def test_generate_script_can_skip_the_take_away_pass(monkeypatch):
+    calls: list[str] = []
+    _staged_gemini(monkeypatch, calls)
+    result = script_gen.generate_script("salt", 20, hooks=False,
+                                        structure=False, takeaway=False,
+                                        verify=False)
+
+    assert result["takeaway"]["mode"] == "off"
+    assert result["takeaway"]["revised"] is False
+
+
+# ---------------------------------------------------------------------------
+# The card and the claim check
+# ---------------------------------------------------------------------------
+
+_CARD_BODY = ("Fungal threads link the roots of separate trees. "
+              "They trade sugar for minerals along those threads. "
+              "But the oldest tree pays in more than sugar. "
+              "Next time you walk a wood, look for the stumps still alive. "
+              "It feeds its children as it dies.")
+
+
+def _claim_check_gemini(monkeypatch, *, hook: str, card: str,
+                        finding: dict | None, repaired: str | None):
+    """Step 2 with a fact-check that rejects the hook and repairs the script.
+
+    The scriptwriter opens on a deliberately flat line so the hook pass
+    actually promotes `hook` and carries `card` with it. Offered a candidate
+    identical to the one already there, the pass keeps the incumbent - and then
+    the card under test is the mechanical cut, not the one the model wrote.
+    """
+    flat = "Trees are connected underground in some way."
+    written = f"{flat} {_CARD_BODY}"
+    promoted = f"{hook} {_CARD_BODY}"
+
+    def dispatch(prompt, **kwargs):
+        if "replacement opening lines" in prompt:
+            return json.dumps([{"hook": hook, "card": card}])
+        if "The narration, one sentence per line:" in prompt:
+            return json.dumps([finding] if finding else [])
+        if "Rewrite the narration" in prompt:      # structure and take-away
+            return promoted
+        return written
+
+    monkeypatch.setattr(script_gen, "call_gemini", dispatch)
+    if repaired is not None:
+        monkeypatch.setattr(
+            script_gen, "revise_claims",
+            lambda script, findings: {"script": repaired, "warnings": []})
+    return promoted
+
+
+def test_a_rejected_claim_does_not_survive_on_the_card(monkeypatch):
+    """The forest-roots failure, end to end.
+
+    The card is cut from the opening the hook pass chose, and the claim check
+    runs after that - so a claim the checker threw out of the narration was
+    still burned over the reel, the cover and the alt text, where it is the
+    most-read text in the whole thing.
+    """
+    hook = "A network smarter than you is under this forest."
+    repaired = f"Beneath this forest hides a vast, hidden network. {_CARD_BODY}"
+    _claim_check_gemini(
+        monkeypatch, hook=hook, card="A network smarter than you",
+        finding={"sentence": hook, "kind": "false",
+                 "problem": "a mycorrhizal network is not smarter than a human"},
+        repaired=repaired)
+
+    result = script_gen.generate_script("how a forest talks through its roots",
+                                        40)
+
+    assert result["claims"]["revised"] is True
+    assert "smarter than you" not in result["hook_card"]
+    assert result["hook_card"] in repaired
+    # The hook pass's own report still says what it chose - the card that
+    # reaches step 5 is the thing that changed, not the history of it.
+    assert result["hook"]["card"] == "A network smarter than you"
+
+
+def test_the_re_cut_card_is_recorded_as_a_warning(monkeypatch):
+    hook = "A network smarter than you is under this forest."
+    _claim_check_gemini(
+        monkeypatch, hook=hook, card="A network smarter than you",
+        finding={"sentence": hook, "kind": "false", "problem": "not true"},
+        repaired=f"Beneath this forest hides a hidden network. {_CARD_BODY}")
+
+    result = script_gen.generate_script("forests", 40)
+
+    assert any("card was re-cut" in warning
+               for warning in result["claims"]["warnings"])
+
+
+def test_a_card_is_left_alone_when_the_opening_survived_the_check(monkeypatch):
+    """A repair that only touched the body leaves the card exactly as true as
+    the sentence it was cut from, and re-cutting would throw away a card the
+    model wrote for a mechanical one for nothing."""
+    hook = "Under your feet, this forest is talking."
+    # The opening is word for word the one the hook pass chose; the repair
+    # rewrote the sentence it was told about and nothing else.
+    body_fix = (f"{hook} Fungal threads link the roots of separate trees. "
+                "Some sugar moves along those threads. "
+                "But the oldest tree pays in more than sugar. "
+                "Next time you walk a wood, look for the stumps still alive. "
+                "It feeds its children as it dies.")
+    _claim_check_gemini(
+        monkeypatch, hook=hook, card="Forests talk",
+        finding={"sentence": "They trade sugar for minerals along those "
+                             "threads.",
+                 "kind": "false", "problem": "overstated"},
+        repaired=body_fix)
+
+    result = script_gen.generate_script("forests", 40)
+
+    assert result["claims"]["revised"] is True
+    assert result["hook_card"] == "Forests talk"
+    assert not any("card was re-cut"
+                   for warning in result["claims"]["warnings"]
+                   if "card was re-cut" in warning)
+
+
+def test_a_card_is_left_alone_when_the_check_found_nothing(monkeypatch):
+    hook = "Under your feet, this forest is talking."
+    _claim_check_gemini(monkeypatch, hook=hook, card="Forests talk",
+                        finding=None, repaired=None)
+
+    result = script_gen.generate_script("forests", 40)
+
+    assert result["claims"]["revised"] is False
+    assert result["hook_card"] == "Forests talk"

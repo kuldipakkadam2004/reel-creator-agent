@@ -27,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest  # noqa: E402
 
 import config  # noqa: E402
-from pipeline import assemble, caption, run, script_gen, topics, tts, visuals  # noqa: E402
+from pipeline import (assemble, caption, perform, run, script_gen,  # noqa: E402
+                      topics, tts, visuals)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +190,10 @@ def steps(tmp_path, monkeypatch):
     # by the suite must not land in the ledger a real account is measured by.
     monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "performance.json")
     monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "off")
+    # Off by default here for the same reason: with a PERFORMANCE_PROVIDER set
+    # in a developer's own .env this would put the suite on the network and
+    # ask Instagram about a real account once per test.
+    monkeypatch.setattr(config, "RUN_FETCH_INSIGHTS", False)
     monkeypatch.setattr(config, "RUN_ONCE_PER_DAY", True)
     monkeypatch.setattr(config, "RUN_TOPIC_ATTEMPTS", 2)
     monkeypatch.setattr(config, "RUN_TOPIC_MIN_SCORE", 0.0)
@@ -810,3 +815,106 @@ def test_cli_status_says_so_when_nothing_has_run(steps, capsys):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Reading the numbers on what is already out
+# ---------------------------------------------------------------------------
+
+def _fetching(monkeypatch, calls: list, *, recorded: int = 1,
+              warnings: list[str] | None = None, boom: Exception | None = None):
+    """Turn the daily read on with a provider that answers without a network."""
+    monkeypatch.setattr(config, "RUN_FETCH_INSIGHTS", True)
+    monkeypatch.setattr(perform, "load_provider", lambda: (lambda *a, **k: {}))
+
+    def fetch(**kwargs):
+        calls.append(kwargs)
+        if boom is not None:
+            raise boom
+        return recorded, list(warnings or [])
+
+    monkeypatch.setattr(perform, "fetch", fetch)
+
+
+def test_a_run_reads_the_numbers_on_the_reels_already_out(steps, monkeypatch):
+    calls: list = []
+    _fetching(monkeypatch, calls)
+
+    record = run.run_pipeline()
+
+    assert len(calls) == 1, "the day's reading happened once"
+    assert record["status"] == "ok"
+
+
+def test_the_reading_happens_even_on_a_day_that_makes_no_reel(steps, monkeypatch):
+    """The reading is about reels posted on earlier days.
+
+    Behind the once-per-day guard, a reel posted the evening before a skipped
+    day would fall out of its 24-48h window unread - which is the whole failure
+    this is here to stop.
+    """
+    calls: list = []
+    _fetching(monkeypatch, calls)
+    run.run_pipeline()          # takes the day
+    calls.clear()
+
+    record = run.run_pipeline()  # the guard turns this one away
+
+    assert record["status"] == "skipped"
+    assert len(calls) == 1, "the guard skipped the reel, not the reading"
+
+
+def test_a_provider_that_fails_costs_a_warning_not_the_reel(steps, monkeypatch):
+    calls: list = []
+    _fetching(monkeypatch, calls,
+              boom=perform.PerformanceError("instagram: 429 rate limited"))
+
+    record = run.run_pipeline()
+
+    assert record["status"] == "ok", "the reel is the job, the numbers are not"
+    assert any("insights" in w and "429" in w for w in record["warnings"])
+
+
+def test_the_reading_s_own_warnings_reach_the_run(steps, monkeypatch):
+    calls: list = []
+    _fetching(monkeypatch, calls,
+              warnings=["r1: no usable numbers in the answer"])
+
+    record = run.run_pipeline()
+
+    assert any("insights: r1: no usable numbers" in w
+               for w in record["warnings"])
+
+
+def test_no_provider_configured_reads_nothing_and_says_nothing(steps, monkeypatch):
+    """Typing the numbers in by hand is a choice, not a fault - it must not
+    warn on every run for the rest of time."""
+    calls: list = []
+    _fetching(monkeypatch, calls)
+    monkeypatch.setattr(perform, "load_provider", lambda: None)
+
+    record = run.run_pipeline()
+
+    assert calls == []
+    assert not any("insights" in w for w in record["warnings"])
+
+
+def test_the_daily_read_can_be_turned_off(steps, monkeypatch):
+    calls: list = []
+    _fetching(monkeypatch, calls)
+    monkeypatch.setattr(config, "RUN_FETCH_INSIGHTS", False)
+
+    run.run_pipeline()
+
+    assert calls == []
+
+
+def test_a_dry_run_reads_no_numbers(steps, monkeypatch):
+    """A preview makes no network calls of its own and makes none here."""
+    calls: list = []
+    _fetching(monkeypatch, calls)
+
+    record = run.run_pipeline(dry_run=True)
+
+    assert record["status"] == "skipped"
+    assert calls == []

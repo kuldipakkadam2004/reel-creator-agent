@@ -1194,6 +1194,75 @@ def test_take_topic_persists(tmp_path):
     assert topics.TopicLedger(tmp_path / "usage.json").was_used("reddit:abc")
 
 
+def test_a_refused_script_is_remembered_against_its_topic(ledger):
+    """It was not, and the same topic bought the same Pro call five times."""
+    item = candidate("what the sound of the deep ocean actually is")
+    ledger.record_board([item])
+
+    ledger.mark_refused(item.key, item.topic)
+
+    assert ledger.refusals(item.key) == 1
+    assert not ledger.was_used(item.key), "a refusal is not a reel"
+
+
+def test_a_topic_refused_to_the_limit_is_dropped_not_merely_priced(ledger,
+                                                                   monkeypatch):
+    monkeypatch.setattr(config, "TOPIC_MAX_REFUSALS", 2)
+    item = candidate("what the sound of the deep ocean actually is")
+
+    ledger.mark_refused(item.key, item.topic)
+    assert not ledger.was_refused_out(item.key)
+
+    ledger.mark_refused(item.key, item.topic)
+    assert ledger.was_refused_out(item.key)
+
+
+def test_refusals_can_be_switched_off_entirely(ledger, monkeypatch):
+    monkeypatch.setattr(config, "TOPIC_MAX_REFUSALS", 0)
+    item = candidate("why the ocean is salty")
+    ledger.mark_refused(item.key, item.topic)
+
+    assert ledger.was_refused_out(item.key) is False
+
+
+def test_one_refusal_costs_a_retry_and_five_do_not_cost_five(ledger):
+    """Charged once however many times, so it cannot stack into a deadlock.
+
+    Board #41 deadlocked on two penalties priced independently. What ends a
+    topic here is the count, which is a filter and cannot reach the score.
+    """
+    item = candidate("why the ocean is salty")
+
+    once = topics.score_candidate(item, refused=1)["components"]
+    many = topics.score_candidate(item, refused=5)["components"]
+
+    assert sum(once.values()) == sum(many.values())
+    assert topics.REFUSED_PENALTY in once.values()
+
+
+def test_a_refusal_survives_the_pruning_that_forgets_a_passed_over_topic(tmp_path):
+    ledger = topics.TopicLedger(tmp_path / "usage.json")
+    refused = candidate("why the ocean is salty", external_id="refused")
+    passed = candidate("how volcanoes form", external_id="passed")
+    ledger.record_board([refused, passed])
+    ledger.mark_refused(refused.key, refused.topic)
+
+    ledger._data["boards"] = topics.LEDGER_KEEP_BOARDS + 50
+    ledger._prune()
+
+    # Forgetting it is buying the refusal a second time.
+    assert refused.key in ledger._data["topics"]
+    assert passed.key not in ledger._data["topics"]
+
+
+def test_refuse_topic_persists(tmp_path):
+    ledger = topics.TopicLedger(tmp_path / "usage.json")
+    assert topics.refuse_topic("evergreen:deep-ocean", "the deep ocean",
+                               ledger=ledger) == []
+    assert topics.TopicLedger(tmp_path / "usage.json").refusals(
+        "evergreen:deep-ocean") == 1
+
+
 # ---------------------------------------------------------------------------
 # The niche pass
 # ---------------------------------------------------------------------------
@@ -1572,6 +1641,45 @@ def test_a_topic_already_made_never_comes_back(offline, monkeypatch):
 
     assert [c["topic"] for c in board["candidates"]] == ["how volcanoes form"]
     assert board["rejected"][0]["reason"] == "already made into a reel"
+
+
+def test_a_topic_the_fact_check_keeps_refusing_leaves_the_board(offline,
+                                                                monkeypatch):
+    """Five Pro calls went on one line before the board could remember this."""
+    monkeypatch.setattr(config, "TOPIC_MAX_REFUSALS", 2)
+    item = candidate("what the sound of the deep ocean actually is",
+                     rate=300, age_hours=2)
+    ledger = topics.TopicLedger(offline / "usage.json")
+    ledger.mark_refused(item.key, item.topic)
+    ledger.mark_refused(item.key, item.topic)
+    ledger.save()
+
+    install_source(monkeypatch, "reddit", [
+        item, candidate("how volcanoes form", external_id="v1",
+                        rate=100, age_hours=2),
+    ])
+    board = topics.find_topics("", sources=("reddit",))
+
+    assert [c["topic"] for c in board["candidates"]] == ["how volcanoes form"]
+    assert "refused" in board["rejected"][0]["reason"]
+
+
+def test_one_refusal_lets_a_topic_back_on_the_board_carrying_the_cost(
+        offline, monkeypatch):
+    """A refusal is evidence about a draft as much as about the topic."""
+    monkeypatch.setattr(config, "TOPIC_MAX_REFUSALS", 2)
+    item = candidate("what the sound of the deep ocean actually is",
+                     rate=300, age_hours=2)
+    ledger = topics.TopicLedger(offline / "usage.json")
+    ledger.mark_refused(item.key, item.topic)
+    ledger.save()
+
+    install_source(monkeypatch, "reddit", [item])
+    board = topics.find_topics("", sources=("reddit",))
+
+    assert [c["topic"] for c in board["candidates"]] == [item.topic]
+    listed = board["candidates"][0]["components"]
+    assert any("refused" in name for name in listed), listed
 
 
 def test_a_named_subject_with_no_footage_is_dropped(offline, monkeypatch):

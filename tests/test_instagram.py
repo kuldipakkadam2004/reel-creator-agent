@@ -65,6 +65,7 @@ def credentials(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "INSTAGRAM_ACCESS_TOKEN", "token-abc")
     monkeypatch.setattr(config, "INSTAGRAM_USER_ID", "17800000000000000")
     monkeypatch.setattr(config, "INSTAGRAM_MATCH_HOURS", 96)
+    monkeypatch.setattr(config, "INSTAGRAM_API_HOST", "")
     monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "performance.json")
     monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path / "out")
     monkeypatch.setenv("INSTAGRAM_ACCESS_TOKEN", "token-abc")
@@ -81,6 +82,45 @@ def _post(media_id: str, caption: str, when: datetime) -> dict:
 
 def _insight(name: str, value):
     return {"name": name, "values": [{"value": value}]}
+
+
+# ---------------------------------------------------------------------------
+# Which of Meta's two hosts is asked
+# ---------------------------------------------------------------------------
+
+def _asked_host(session) -> str:
+    url = session.asked[0][0]
+    return "/".join(url.split("/")[:3])
+
+
+def test_an_instagram_login_token_goes_to_the_instagram_host(credentials,
+                                                             monkeypatch):
+    monkeypatch.setattr(config, "INSTAGRAM_ACCESS_TOKEN", "IGAAPMOD8Yxt5BZA")
+    session = FakeSession({"/": {"id": "178", "username": "reels"}})
+
+    instagram.account(session)
+
+    assert _asked_host(session) == "https://graph.instagram.com"
+
+
+def test_a_facebook_login_token_goes_to_the_facebook_host(credentials,
+                                                          monkeypatch):
+    monkeypatch.setattr(config, "INSTAGRAM_ACCESS_TOKEN", "EAAGm0PX4ZCpsBA")
+    session = FakeSession({"/": {"id": "178", "username": "reels"}})
+
+    instagram.account(session)
+
+    assert _asked_host(session) == "https://graph.facebook.com"
+
+
+def test_the_host_can_be_named_outright(credentials, monkeypatch):
+    monkeypatch.setattr(config, "INSTAGRAM_ACCESS_TOKEN", "IGAAPMOD8Yxt5BZA")
+    monkeypatch.setattr(config, "INSTAGRAM_API_HOST", "graph.example.com")
+    session = FakeSession({"/": {"id": "178", "username": "reels"}})
+
+    instagram.account(session)
+
+    assert _asked_host(session) == "https://graph.example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +205,26 @@ def test_a_refusal_of_even_the_core_metrics_gives_up_quietly(credentials):
 
     assert metrics == {}
     assert warnings
+
+
+def test_a_refusal_listing_what_is_valid_is_read_the_right_way_round(credentials):
+    """The live shape of this: Meta names the metrics it *would* have taken."""
+    session = FakeSession({"/insights": [
+        {"error": {"message":
+                   "metric[1] must be one of the following values: "
+                   "impressions, shares, comments, likes, saved, reach, "
+                   "ig_reels_avg_watch_time, views", "code": 100}},
+        {"data": [_insight("views", 13), _insight("reach", 6),
+                  _insight("ig_reels_avg_watch_time", 20120)]},
+    ]})
+
+    metrics, warnings = instagram._insights(session, "1791")
+
+    # Read the wrong way round this drops the seven good names and keeps the
+    # one bad one, and the fetch ends up with the core four at best.
+    assert metrics == {"views": 13, "reach": 6, "avg_watch_seconds": 20120}
+    assert any("plays" in warning for warning in warnings)
+    assert len(session.asked) == 2
 
 
 def test_plays_and_views_both_land_on_views(credentials):
@@ -272,6 +332,30 @@ def test_watching_a_loop_twice_does_not_read_as_two_hundred_percent(credentials)
     assert metrics["watch_through"] == 1.0
 
 
+def test_the_loop_that_the_cap_hides_is_kept_beside_it(credentials):
+    """Measured: 89.5s of average watch time on a 37.59s reel.
+
+    A share of the reel cannot exceed 1.0, so the cap is right for what
+    `watch_through` means - and it made that reel, which had three views, the
+    best-scoring reel in the ledger. The uncapped division is what the report
+    ranks on.
+    """
+    metrics = instagram.derive_watch_through(
+        {"avg_watch_seconds": 89500}, {"spoken_seconds": 37.59}
+    )
+
+    assert metrics["watch_through"] == 1.0
+    assert metrics["watch_ratio"] == pytest.approx(2.381, abs=0.001)
+
+
+def test_below_the_cap_the_two_watch_numbers_are_the_same(credentials):
+    metrics = instagram.derive_watch_through(
+        {"avg_watch_seconds": 20000}, {"spoken_seconds": 40.0}
+    )
+
+    assert metrics["watch_through"] == metrics["watch_ratio"] == 0.5
+
+
 def test_without_the_reel_s_length_there_is_no_watch_through(credentials):
     metrics = instagram.derive_watch_through(
         {"avg_watch_seconds": 32000}, {"spoken_seconds": None}
@@ -283,6 +367,106 @@ def test_without_the_reel_s_length_there_is_no_watch_through(credentials):
 
 def test_a_post_with_no_watch_time_keeps_its_other_metrics(credentials):
     assert instagram.derive_watch_through({"reach": 12}, {}) == {"reach": 12}
+
+
+# ---------------------------------------------------------------------------
+# One post is one reel
+# ---------------------------------------------------------------------------
+
+def _row(tmp_path: Path, run_id: str, *, made: datetime,
+         caption: str = "") -> dict:
+    run_dir = tmp_path / "out" / made.strftime("%Y-%m-%d") / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if caption:
+        (run_dir / "post.txt").write_text(caption, encoding="utf-8")
+    return {"run_id": run_id, "run_dir": str(run_dir),
+            "created_at": made.isoformat(timespec="seconds"),
+            "spoken_seconds": 50.0}
+
+
+def test_a_reel_that_was_never_posted_does_not_borrow_the_numbers(credentials,
+                                                                  tmp_path):
+    """The measured failure: 7 posts, 12 reels, 5 wearing somebody else's."""
+    monday = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    rows = {
+        "posted-1": _row(tmp_path, "posted-1", made=monday,
+                         caption="This is Louisiana being born."),
+        "shelved-1": _row(tmp_path, "shelved-1", made=monday - timedelta(hours=17)),
+        "shelved-2": _row(tmp_path, "shelved-2", made=monday - timedelta(hours=2)),
+    }
+    posts = [_post("1792", "This is Louisiana being born. #delta",
+                   monday + timedelta(hours=8))]
+
+    found = instagram.assign(rows, posts)
+
+    assert found["posted-1"]["media_id"] == "1792"
+    assert found["posted-1"]["how"] == "caption"
+    assert found["shelved-1"]["media_id"] == ""
+    assert found["shelved-2"]["media_id"] == ""
+
+
+def test_a_caption_takes_its_post_back_off_a_nearer_guess(credentials, tmp_path):
+    made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    rows = {
+        "guesser": _row(tmp_path, "guesser", made=made + timedelta(hours=1)),
+        "author": _row(tmp_path, "author", made=made,
+                       caption="A single inch of soil."),
+    }
+    posts = [_post("1792", "A single inch of soil. #soil",
+                   made + timedelta(hours=6)),
+             _post("1793", "something else entirely",
+                   made + timedelta(hours=30))]
+
+    found = instagram.assign(rows, posts)
+
+    assert found["author"]["media_id"] == "1792"
+    # The guess is made after the caption, out of what is left.
+    assert found["guesser"]["media_id"] == "1793"
+    assert found["guesser"]["how"] == "timestamp"
+
+
+def test_two_reels_on_one_topic_do_not_both_claim_the_post(credentials,
+                                                            tmp_path):
+    made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    rows = {
+        "retry": _row(tmp_path, "retry", made=made - timedelta(days=3),
+                      caption="The sound of the deep ocean."),
+        "kept": _row(tmp_path, "kept", made=made,
+                     caption="The sound of the deep ocean."),
+    }
+    posts = [_post("1792", "The sound of the deep ocean. #ocean",
+                   made + timedelta(hours=4))]
+
+    found = instagram.assign(rows, posts)
+
+    # Identical captions, so the reel made nearest the post is the one posted.
+    assert found["kept"]["media_id"] == "1792"
+    assert found["retry"]["media_id"] == ""
+
+
+def test_a_pin_holds_its_post_against_a_caption(credentials, tmp_path):
+    made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    rows = {
+        "pinned": _row(tmp_path, "pinned", made=made),
+        "author": _row(tmp_path, "author", made=made, caption="Whale song."),
+    }
+    posts = [_post("1792", "Whale song. #whales", made + timedelta(hours=4))]
+
+    found = instagram.assign(rows, posts, {"pinned": "1792"})
+
+    assert found["pinned"]["media_id"] == "1792"
+    assert found["pinned"]["how"] == "pinned"
+    assert found["author"]["media_id"] == ""
+
+
+def test_when_the_post_went_up_comes_back_with_the_match(credentials, tmp_path):
+    made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    posted = made + timedelta(hours=6)
+    rows = {"r1": _row(tmp_path, "r1", made=made, caption="Whale song.")}
+
+    found = instagram.assign(rows, [_post("1792", "Whale song.", posted)])
+
+    assert found["r1"]["posted_at"] == posted.isoformat(timespec="seconds")
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +570,109 @@ def test_the_provider_plugs_into_step_9(credentials, tmp_path, monkeypatch):
     assert entry["status"] == "posted"
     assert entry["metrics"]["views"] == 4200
     assert entry["source"] == "provider"
+
+
+def test_step_9_keeps_what_the_provider_wrote_about_the_match(credentials,
+                                                             tmp_path,
+                                                             monkeypatch):
+    """The provider saves the trail, then step 9 saves the numbers.
+
+    Both write the same file. Step 9 read it before the provider ran, so
+    without the merge its save reverts the media id, the how, and the posting
+    time - and a timestamp guess stops being auditable at all.
+    """
+    made = datetime(2026, 8, 24, 17, 0, tzinfo=timezone.utc)
+    posted = made + timedelta(hours=18)
+    features = _features(tmp_path, made=made, caption="Snailfish live deep.")
+    ledger = perform.PerformanceLedger()
+    ledger.register(features)
+    ledger.save()
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("views", 4200)]},
+           posts=[_post("1792", "Snailfish live deep.", posted)])
+
+    perform.fetch(ledger=ledger, provider=instagram.fetch)
+
+    entry = perform.PerformanceLedger().entry("ocean-1a2b3c")
+    assert entry["media_id"] == "1792"
+    assert entry["matched_by"] == "caption"
+    assert entry["permalink"].endswith("1792")
+    # And the post's own time is when it was posted, not when the reel was made.
+    assert entry["posted_at"] == posted.isoformat(timespec="seconds")
+    assert entry["posted_at_assumed"] is False
+
+
+def test_a_reel_read_again_keeps_the_newer_numbers(credentials, tmp_path,
+                                                   monkeypatch):
+    """The defect this closes: read once at six hours, judged on it forever."""
+    made = datetime.now(timezone.utc) - timedelta(hours=6)
+    features = _features(tmp_path, made=made, caption="Snailfish live deep.")
+    ledger = perform.PerformanceLedger()
+    ledger.register(features)
+    ledger.save()
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("views", 3)]},
+           posts=[_post("1792", "Snailfish live deep.", made)])
+    perform.fetch(ledger=ledger, provider=instagram.fetch)
+
+    # A day later, the same reel, and the provider is asked again because the
+    # reading it has is younger than the settle age.
+    ledger = perform.PerformanceLedger()
+    assert [row["run_id"] for row in ledger.unsettled()] == ["ocean-1a2b3c"]
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("views", 412)]},
+           posts=[_post("1792", "Snailfish live deep.", made)])
+    perform.fetch(ledger=ledger, provider=instagram.fetch)
+
+    entry = perform.PerformanceLedger().entry("ocean-1a2b3c")
+    assert entry["metrics"]["views"] == 412
+    assert [reading["metrics"]["views"]
+            for reading in entry["measurements"]] == [3, 412]
+
+
+def test_a_guessed_match_is_not_promoted_to_pinned_by_a_re_read(credentials,
+                                                                tmp_path,
+                                                                monkeypatch):
+    """A timestamp match is a guess, and a guess has to stay auditable."""
+    made = datetime.now(timezone.utc) - timedelta(hours=6)
+    features = _features(tmp_path, made=made, caption="Snailfish live deep.")
+    ledger = perform.PerformanceLedger()
+    ledger.register(features)
+    ledger.save()
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("views", 3)]},
+           posts=[_post("1792", "something else entirely",
+                        made + timedelta(hours=1))])
+    perform.fetch(ledger=ledger, provider=instagram.fetch)
+    assert perform.PerformanceLedger().entry("ocean-1a2b3c")["matched_by"] \
+        == "timestamp"
+
+    ledger = perform.PerformanceLedger()
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("views", 412)]},
+           posts=[_post("1792", "something else entirely",
+                        made + timedelta(hours=1))])
+    perform.fetch(ledger=ledger, provider=instagram.fetch)
+
+    entry = perform.PerformanceLedger().entry("ocean-1a2b3c")
+    assert entry["matched_by"] == "timestamp"
+    assert entry["metrics"]["views"] == 412
+
+
+def test_two_reels_are_never_handed_the_same_numbers(credentials, tmp_path,
+                                                     monkeypatch):
+    made = datetime(2026, 8, 24, 17, 0, tzinfo=timezone.utc)
+    posted = _features(tmp_path, made=made, caption="Snailfish live deep.")
+    shelved = _row(tmp_path, "canyon-9f9f9f9f", made=made - timedelta(hours=4))
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("views", 4200)]},
+           posts=[_post("1792", "Snailfish live deep.",
+                        made + timedelta(hours=18))])
+
+    out = instagram.fetch(["canyon-9f9f9f9f", "ocean-1a2b3c"],
+                          {"canyon-9f9f9f9f": shelved, "ocean-1a2b3c": posted})
+
+    assert list(out) == ["ocean-1a2b3c"]
 
 
 # ---------------------------------------------------------------------------

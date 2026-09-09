@@ -66,7 +66,11 @@ from pipeline import script_gen, tagvolume  # noqa: E402
 #: Bumped when the shape of post.json changes, so step 7 can tell.
 #: 2 added "hashtag_volumes" - the post count behind every tag.
 #: 3 added "alt_text" and "alt" - the description of step 5's cover frame.
-POST_VERSION = 3
+#: 4 added "hashtag_rejected" - the tags that were priced and thrown out. They
+#: used to exist only as a sentence in the log, which made the estimator's
+#: rejections the one part of the tag pipeline nobody could check or seed
+#: against. `python pipeline/tagvolume.py --worklist` reads this field.
+POST_VERSION = 4
 
 #: Written into the run directory. The `captions.*` files beside them are step
 #: 5's burned-in subtitles - deliberately a different word.
@@ -1027,7 +1031,8 @@ def band_pool(pool: dict, volumes: dict) -> tuple[dict, list[str]]:
 
 def select_hashtags(tiers: dict, *, count: int, always=(), banned_tags=(),
                     banned_words=(), recent=(),
-                    volumes: dict | None = None
+                    volumes: dict | None = None,
+                    rejected: list | None = None
                     ) -> tuple[list[str], dict, list[str]]:
     """Pick the final tag set: mixed across bands, deduped, freshest first.
 
@@ -1040,6 +1045,15 @@ def select_hashtags(tiers: dict, *, count: int, always=(), banned_tags=(),
     are dropped, and the rest are filled into the mix by the band they measure
     at rather than the tier they were labelled with. `volumes` lets the caller
     pass readings it has already taken; otherwise they are looked up here.
+
+    `rejected` is an out-list, filled with what was dropped and why. Nothing
+    used to survive the drop but a sentence in the log: 9 of 19 tags went in
+    one run and the only record of which ones was a warning nobody can query.
+    That is the wrong way round - the estimator's rejections are the exact
+    thing worth auditing, because it prices a tag by how ordinary its words
+    are and a subject it has no vocabulary for reads as a subject full of
+    coinages. Written into post.json, they become a seeding worklist
+    (`python pipeline/tagvolume.py --worklist`).
     """
     warnings: list[str] = []
     banned_set = {str(t).lower().lstrip("#") for t in banned_tags}
@@ -1150,6 +1164,23 @@ def select_hashtags(tiers: dict, *, count: int, always=(), banned_tags=(),
     if banding and len(chosen) < count and dead and config.TAG_VOLUME_RELAX < 1:
         warnings += _relax_floor(dead, volumes or {}, count=count,
                                  chosen=chosen, add=add)
+
+    if rejected is not None:
+        # After _relax_floor, so a tag put back to fill the block is not
+        # recorded as dropped. `seen` holds everything that made it in.
+        for tag in dict.fromkeys(dropped):
+            rejected.append({"tag": tag, "reason": "banned", "count": None,
+                             "source": ""})
+        for tag in dict.fromkeys(dead):
+            if tag.lower() in seen:
+                continue
+            reading = _reading(volumes or {}, tag)
+            rejected.append({
+                "tag": tag,
+                "reason": "below the volume floor",
+                "count": reading.count if reading else None,
+                "source": reading.source if reading else "",
+            })
 
     if dropped:
         warnings.append("dropped banned tag(s): "
@@ -1667,6 +1698,7 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         )
         warnings += volume_warnings
 
+    rejected_tags: list[dict] = []
     tags, tag_tiers, tag_warnings = select_hashtags(
         draft.hashtags, count=count,
         always=config.POST_HASHTAGS_ALWAYS,
@@ -1674,6 +1706,7 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         banned_words=config.POST_BANNED_WORDS,
         recent=recent,
         volumes=volumes,
+        rejected=rejected_tags,
     )
     warnings += tag_warnings
 
@@ -1748,6 +1781,7 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
             for tag in tags
             if volumes.get(tag) or volumes.get(tag.lower())
         },
+        "hashtag_rejected": rejected_tags,
         "hashtag_placement": placement,
         "first_comment": first_comment,
         # Goes in Instagram's "Write alt text" field, not the caption. Empty

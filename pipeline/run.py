@@ -422,6 +422,40 @@ def _collect(record: dict, step: str, warnings) -> None:
         record["warnings"].append(f"{step}: {warning}")
 
 
+def _read_insights(record: dict) -> None:
+    """Ask step 9 for the numbers on the reels already out there. Never raises.
+
+    Runs before the once-per-day guard, and that is the point: this reading is
+    about reels posted on earlier days, so a day that makes no reel is still a
+    day one of them has to be asked about. Behind the guard, a reel posted the
+    evening before a skipped day would fall out of its window unread.
+
+    Nothing here can cost a reel. The numbers are bookkeeping and the reel is
+    the job, so a provider that is down, rate-limited or misconfigured leaves a
+    warning on the run and the pipeline carries on.
+    """
+    if not config.RUN_FETCH_INSIGHTS:
+        return
+    # No provider is a choice, not a fault - the numbers can be typed in by
+    # hand - so it is not worth a warning on every run for the rest of time.
+    try:
+        if perform.load_provider() is None:
+            return
+    except Exception:
+        return
+
+    stamp = datetime.now().strftime("%H:%M:%S")
+    print(f"{stamp}  [-/{len(STEPS)}] insights  reading what is already out",
+          flush=True)
+    try:
+        recorded, warnings = perform.fetch()
+    except Exception as exc:  # a provider is third-party code
+        record["warnings"].append(f"insights: {_one_line(exc)}")
+        return
+    _collect(record, "insights", warnings)
+    print(f"          {recorded} reel(s) re-read", flush=True)
+
+
 def _one_line(text) -> str:
     """An error boiled down to something a ledger column can hold.
 
@@ -570,6 +604,12 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
 
     prune_logs()
 
+    # --- what the reels already out there did ------------------------------
+    # Ahead of the guards on purpose: see `_read_insights`. A dry run is a
+    # preview and makes no network calls of its own, so it makes none here.
+    if not dry_run:
+        _read_insights(record)
+
     # --- guards, before anything is spent ---------------------------------
     guard = config.RUN_ONCE_PER_DAY if once_per_day is None else once_per_day
     if guard and not force and not dry_run:
@@ -646,7 +686,7 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
             print(f"\nfalling through to candidate {index} of {len(queue)}: "
                   f"{candidate['topic']}")
         attempt = {"topic": candidate["topic"], "status": "failed",
-                   "failed_at": "", "error": ""}
+                   "failed_at": "", "error": "", "refused_path": ""}
         record["attempts"].append(attempt)
         try:
             _make_reel(record, candidate, duration=duration)
@@ -655,6 +695,45 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
             attempt.update(failed_at=step, error=str(exc))
             last_error = f"{step}: {exc}"
             print(f"error: {last_error}", file=sys.stderr)
+
+            # A draft the fact-check refused is evidence, and this is the last
+            # moment it exists - the next candidate overwrites nothing but
+            # nothing keeps it either. Its warnings come with it: the repair
+            # rounds are recorded inside the claim report, which step 2 only
+            # folds into the run when the script survives, so a refusal used
+            # to be the one outcome whose reasoning never reached the log.
+            _collect(record, step, (getattr(exc, "report", None) or {})
+                     .get("warnings"))
+            refused = getattr(exc, "script", "")
+            if refused:
+                try:
+                    kept = script_gen.save_refused_script(
+                        candidate["topic"], refused,
+                        getattr(exc, "report", None) or {})
+                except OSError as write_error:
+                    _collect(record, step,
+                             [f"the refused draft could not be kept "
+                              f"({write_error})"])
+                else:
+                    attempt["refused_path"] = str(kept)
+                    print(f"  the refused draft is kept in {kept}")
+
+                # And the board is told, which it never used to be. A topic is
+                # marked `used` at the first moment money has gone on it, and a
+                # refused draft never reaches that line - so the whole cost of
+                # a refusal was the -0.6 for having been on a board, and the
+                # same topic came back to buy the same Pro call again. "What
+                # the sound of the deep ocean actually is" did it five times.
+                key = candidate.get("key") or ""
+                if key:
+                    _collect(record, "topics",
+                             topics.refuse_topic(key, candidate["topic"]))
+                    seen = topics.TopicLedger().refusals(key)
+                    limit = config.TOPIC_MAX_REFUSALS
+                    print(f"  the board will remember this refusal"
+                          + (f" - {seen} of {limit}, and it is dropped at "
+                             f"{limit}" if limit > 0 else ""))
+
             record["warnings"].append(
                 f"{step}: gave up on \"{candidate['topic']}\" - {_one_line(exc)}"
             )
@@ -695,12 +774,12 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
     # choice the pipeline was otherwise making the same way every day.
     trial = perform.choose_arm()
     if trial:
-        target, hooks, shape = perform.apply_arm(trial, duration=target)
+        target, hooks, shape, keep = perform.apply_arm(trial, duration=target)
         record["trial"] = trial
         _announce(2, "script", f"trial \"{trial['name']}\": this reel takes "
                                f"the \"{trial['arm']}\" arm")
     else:
-        hooks = shape = None
+        hooks = shape = keep = None
 
     # --- step 2: the script -----------------------------------------------
     started = time.monotonic()
@@ -709,7 +788,8 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
               f"{topic_text} ({target or config.SCRIPT_DEFAULT_SECONDS}s)")
     script = script_gen.save_script(
         script_gen.generate_script(topic_text, target,
-                                   hooks=hooks, structure=shape)
+                                   hooks=hooks, structure=shape,
+                                   takeaway=keep)
     )
     record["script_path"] = script["script_path"]
     record["steps"]["script"] = round(time.monotonic() - started, 1)
@@ -720,10 +800,10 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
         _announce(2, "script", f"shape rewritten, {structure['score']:g} -> "
                                f"{structure['revised_score']:g}")
 
-    # All three of step 2's passes report rather than raise, so their warnings
+    # All four of step 2's passes report rather than raise, so their warnings
     # are the only trace of a hook that was kept, a rewrite that was thrown
     # away or a fact-check that could not be reached. They were being dropped.
-    for pass_name in ("hook", "structure", "claims"):
+    for pass_name in ("hook", "structure", "takeaway", "claims"):
         _collect(record, "script", (script.get(pass_name) or {}).get("warnings"))
 
     claims = script.get("claims") or {}
@@ -897,8 +977,11 @@ def _print_summary(record: dict) -> None:
         short = record["run_id"].rsplit("-", 1)[-1]
         print(f"RECORD  : python pipeline/perform.py {short} "
               f"--views N --watched N")
-        print(f"          python pipeline/perform.py {short} "
-              f"--skipped \"why it did not go out\"")
+        # One word, from a fixed list. "not good enough to post" was written
+        # into fourteen rows here and answered nothing; a code names the step
+        # to go and change.
+        print(f"          python pipeline/perform.py {short} --skipped "
+              + "|".join(list(perform.SKIP_REASONS)[:6]))
     if record["warnings"]:
         print(RULE)
         print("WARNINGS")

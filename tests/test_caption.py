@@ -243,6 +243,47 @@ def test_a_tag_too_small_to_be_found_is_dropped():
     assert any("too few posts" in w for w in warnings)
 
 
+def test_a_thrown_out_tag_leaves_a_record_and_not_just_a_sentence():
+    """9 of 19 went in one run and the only trace was a warning."""
+    tiers = {"broad": ["OceanLife"], "mid": ["DeepSeaFish"],
+             "niche": ["Piezophile"]}
+    volumes = {"OceanLife": vol("OceanLife", 4_000_000),
+               "DeepSeaFish": vol("DeepSeaFish", 200_000),
+               "Piezophile": vol("Piezophile", 180)}
+    rejected: list[dict] = []
+
+    caption.select_hashtags(tiers, count=3, volumes=volumes,
+                            rejected=rejected)
+
+    assert [row["tag"] for row in rejected] == ["Piezophile"]
+    assert rejected[0]["count"] == 180
+    assert "floor" in rejected[0]["reason"]
+
+
+def test_a_tag_put_back_to_fill_the_block_is_not_recorded_as_dropped(monkeypatch):
+    monkeypatch.setattr(config, "TAG_VOLUME_RELAX", 0.1)
+    tiers = {"broad": [], "mid": [], "niche": ["DeepSeaFish", "Piezophile"]}
+    volumes = {"DeepSeaFish": vol("DeepSeaFish", 200_000),
+               "Piezophile": vol("Piezophile", 180)}
+    rejected: list[dict] = []
+
+    tags, _, _ = caption.select_hashtags(tiers, count=2, volumes=volumes,
+                                         rejected=rejected)
+
+    if "Piezophile" in tags:
+        assert rejected == []
+
+
+def test_a_banned_tag_is_recorded_as_banned_not_as_too_small():
+    tiers = {"broad": ["OceanLife"], "mid": [], "niche": []}
+    rejected: list[dict] = []
+
+    caption.select_hashtags(tiers, count=2, always=("sponsored",),
+                            banned_tags=("sponsored",), rejected=rejected)
+
+    assert [(r["tag"], r["reason"]) for r in rejected] == [("sponsored", "banned")]
+
+
 def test_a_tag_is_placed_by_what_it_measures_not_by_what_it_was_called():
     # The model filed a four-million-post tag under "niche". It is not niche.
     tiers = {"broad": [], "mid": [], "niche": ["Bioluminescence", "LavaTubes"]}
@@ -340,6 +381,11 @@ def test_banding_off_leaves_the_generator_s_tiers_alone(monkeypatch):
 
 
 def test_the_post_records_what_every_tag_measured_at(monkeypatch, tmp_path):
+    # About what the volume reader wrote down, so the spine is pinned off
+    # rather than left to whatever .env happens to carry: an always-on tag
+    # is deliberately never priced, and at this count a spine would take
+    # every slot and leave no measured tag to record.
+    monkeypatch.setattr(config, "POST_HASHTAGS_ALWAYS", ())
     stub_draft(monkeypatch, Draft(
         hook="Hook.", body=["Body."],
         hashtags={"broad": ["OceanLife"], "mid": ["DeepSeaFish"],

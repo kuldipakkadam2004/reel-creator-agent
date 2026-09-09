@@ -150,7 +150,17 @@ class StubProvider(visuals.Provider):
 
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
-    """Point every on-disk location at tmp_path and install the stub provider."""
+    """Point every on-disk location at tmp_path and install the stub provider.
+
+    The relevance screener is pinned offline here, and that is not tidying: on
+    a machine with a GEMINI_API_KEY in .env it defaults to "llm", so three of
+    the CLI tests below were making real model calls - 40 to 49 seconds each,
+    real quota, on every run of the suite. It also meant the tests exercised a
+    different path depending on whether a key happened to be present, which is
+    the one thing a test must never do. Every test that means to screen passes
+    `relevance_mode` explicitly and is unaffected.
+    """
+    monkeypatch.setattr(config, "VISUAL_RELEVANCE_MODE", "lexical")
     monkeypatch.setattr(config, "VISUALS_CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(config, "VISUALS_RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(config, "VISUALS_USAGE_FILE", tmp_path / "usage.json")

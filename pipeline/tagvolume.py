@@ -40,6 +40,17 @@ reject and to rank, never reported as fact: every estimated figure is labelled
 
 Standalone use, to see what it makes of a set of tags:
     python pipeline/tagvolume.py Piezophile DeepSeaFish OceanLife Snailfish
+
+And to correct it where it is wrong, with a count read off Instagram's own
+search screen. A seeded count is authoritative, outranks the estimator and
+never expires, so this is how the estimator stops being the only opinion:
+    python pipeline/tagvolume.py --set marinebiology=4.2M oceanlife=430K
+
+Seeding matters most where the estimator is structurally wrong rather than
+merely coarse: it prices a tag by how ordinary its words are, so tags built
+from the same shape of words collide on the same figure (#biology, #botany
+and #trees all read as 3,162,277) and a common term of art reads far smaller
+than it is. Seed the tags the account posts under and the bands become real.
 """
 
 from __future__ import annotations
@@ -635,6 +646,21 @@ class VolumeCache:
         }
         self._dirty = True
 
+    def seed(self, tag: str, count: int) -> None:
+        """Write a figure somebody read off Instagram themselves.
+
+        Deliberately not `put`: no `at` stamp, so no TTL ever discards it. A
+        provider answer is a reading that goes stale on its own; a hand-seeded
+        one is a decision, and the person who made it is the one who revises
+        it. This is the only way the "measured" source is reachable without
+        hand-authoring the JSON, which is why the file did not exist.
+        """
+        self._data["tags"][str(tag).lower()] = {
+            "count": int(count),
+            "source": "measured",
+        }
+        self._dirty = True
+
     @staticmethod
     def _stale(stamp: str) -> bool:
         days = config.TAG_VOLUME_TTL_DAYS
@@ -744,15 +770,165 @@ def lookup(tags, *, cache: VolumeCache | None = None,
 
 
 # ---------------------------------------------------------------------------
-# Standalone: see what it makes of a set of tags
+# Standalone: see what it makes of a set of tags, and correct it
 # ---------------------------------------------------------------------------
+
+#: Instagram writes a tag's size as "4.2M posts", not as a figure, so that is
+#: what somebody seeding one has in front of them. Taking digits only would
+#: mean doing the multiplication by hand for every tag worth writing down,
+#: which is the kind of friction that leaves a cache file empty.
+_COUNT_SUFFIXES = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+
+
+def read_count(text: str) -> int:
+    """Read a post count as Instagram displays it: 4.2M, 430K, 9,500, 12000."""
+    raw = str(text or "").strip().lower().replace(",", "").replace("_", "")
+    if raw.endswith("posts"):
+        raw = raw[:-len("posts")].strip()
+    scale = 1
+    if raw and raw[-1] in _COUNT_SUFFIXES:
+        scale = _COUNT_SUFFIXES[raw[-1]]
+        raw = raw[:-1].strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        raise VolumeError(f"not a post count: {text!r}") from None
+    if value < 0:
+        raise VolumeError(f"a post count cannot be negative: {text!r}")
+    return int(round(value * scale))
+
+
+USAGE = (
+    "usage: python pipeline/tagvolume.py <tag> [tag ...]        # what it reads as\n"
+    "       python pipeline/tagvolume.py --set <tag>=<count>    # what it really is\n"
+    "\n"
+    "A seeded count outranks the estimator and never expires. Write it the way\n"
+    "Instagram shows it: --set marinebiology=4.2M oceanlife=430K trees=9,500"
+)
+
+
+def seed_tags(pairs: list[str]) -> int:
+    """Record hand-read counts, then print the band each tag now falls in."""
+    cache = VolumeCache()
+    written: list[tuple[str, int]] = []
+    if not pairs:
+        print(USAGE, file=sys.stderr)
+        return 2
+    for pair in pairs:
+        tag, sep, raw = pair.partition("=")
+        tag = tag.strip().lstrip("#")
+        if not sep or not tag:
+            print(f"expected <tag>=<count>, got {pair!r}", file=sys.stderr)
+            return 2
+        try:
+            count = read_count(raw)
+        except VolumeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        cache.seed(tag, count)
+        written.append((tag, count))
+
+    warnings = cache.save()
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    if warnings:
+        return 1
+
+    width = max(len(tag) for tag, _ in written) + 2
+    for tag, count in written:
+        print(f"#{tag:<{width}} {band_of(count):<10} ~{count:>12,}  measured")
+    print(f"\nwritten to {config.TAG_VOLUME_FILE}")
+    return 0
+
+
+def worklist(limit: int = 30) -> tuple[list[dict], int]:
+    """Which tags this account keeps proposing, and which are unmeasured.
+
+    Read off every post.json in the output tree rather than from a wordlist,
+    so the ranking is what this account actually posts about. Tags the
+    estimator threw out come first and are counted separately: the module's
+    own advice is to seed real counts, and until now following it meant
+    knowing which tags to seed, which nothing recorded.
+    """
+    cache = VolumeCache()
+    tally: dict[str, dict] = {}
+
+    for path in sorted(config.OUTPUT_DIR.glob("*/*/post.json")):
+        try:
+            post = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for raw in post.get("hashtags") or ():
+            tag = str(raw).lstrip("#").lower()
+            if tag:
+                tally.setdefault(tag, {"tag": tag, "used": 0, "rejected": 0})["used"] += 1
+        for entry in post.get("hashtag_rejected") or ():
+            if not isinstance(entry, dict):
+                continue
+            tag = str(entry.get("tag") or "").lstrip("#").lower()
+            if not tag or entry.get("reason") == "banned":
+                continue
+            row = tally.setdefault(tag, {"tag": tag, "used": 0, "rejected": 0})
+            row["rejected"] += 1
+            row["count"] = entry.get("count")
+
+    rows = []
+    for row in tally.values():
+        found = cache.get(row["tag"])
+        if found and found[1] == "measured":
+            continue                      # already settled by hand
+        rows.append(row)
+    # Rejected first, then whatever the account leans on most: those are the
+    # two ways a wrong number costs something.
+    rows.sort(key=lambda r: (-r["rejected"], -r["used"], r["tag"]))
+    return rows[:limit], len(tally)
+
+
+def print_worklist(limit: int = 30) -> int:
+    rows, total = worklist(limit)
+    if not total:
+        print("no post.json has been written yet - make a reel first.")
+        return 0
+    if not rows:
+        print(f"every one of the {total} tag(s) this account has used is "
+              f"seeded. Nothing to do.")
+        return 0
+
+    print(f"{len(rows)} of {total} tag(s) this account has used carry no "
+          f"measured count.")
+    print("Open Instagram's search screen, read the post count off each, and "
+          "paste them back.\n")
+    print(f"  {'tag':<26} {'thrown out':>10} {'posted with':>12}   estimated")
+    for row in rows:
+        est = row.get("count")
+        print(f"  #{row['tag']:<25} {row['rejected']:>10} {row['used']:>12}   "
+              + (f"~{est:,}" if isinstance(est, int) else "-"))
+    print("\n  python pipeline/tagvolume.py --set "
+          + " ".join(f"{row['tag']}=?" for row in rows[:6])
+          + (" ..." if len(rows) > 6 else ""))
+    return 0
+
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
-        print("usage: python pipeline/tagvolume.py <tag> [tag ...]",
-              file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
+
+    if args[0] == "--set":
+        if len(args) < 2:
+            print(USAGE, file=sys.stderr)
+            return 2
+        return seed_tags(args[1:])
+
+    if args[0] == "--worklist":
+        try:
+            limit = int(args[1]) if len(args) > 1 else 30
+        except ValueError:
+            print("--worklist takes a count, e.g. --worklist 20",
+                  file=sys.stderr)
+            return 2
+        return print_worklist(limit)
 
     volumes, warnings = lookup(args)
     width = max(len(t.lstrip("#")) for t in args) + 2

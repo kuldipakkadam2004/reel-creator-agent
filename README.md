@@ -37,7 +37,7 @@ And once you have posted one, tell it how that went:
 ```bash
 python pipeline/perform.py                          # step 9: what needs numbers
 python pipeline/perform.py cd1bccae --views 4200 --watched 61 --saves 30
-python pipeline/perform.py cd1bccae --skipped "the footage was wrong"
+python pipeline/perform.py cd1bccae --skipped footage
 python pipeline/perform.py --report                 # what that has added up to
 ```
 
@@ -80,6 +80,9 @@ output/topics/usage.json  which topics recent boards showed, and which were made
 output/scripts/     generated narration scripts: <name>.txt (the words,
                     which step 3 speaks) + <name>.json (topic, timings and the
                     hook report, which steps 4 and 6 read)
+output/scripts/refused/  drafts the fact-check would not pass, with the report
+                    that refused them: every finding, and what each repair
+                    round came back with. Nothing downstream reads it
 output/audio/       ElevenLabs .mp3 renders
 output/<date>/<run>/  one finished reel: .mp4, captions, attribution, post text
 output/captions/hashtag_usage.json  which tags recent posts used
@@ -114,6 +117,20 @@ moved or deployed without editing code.
 Deliberately out of scope for now: the FastAPI server, and auto-posting to
 Instagram. Step 8 generates a reel a day and stops — what gets published, and
 when, is still a decision a person makes.
+
+### Tests
+
+```bash
+python -m pytest -q          # 1340 tests, about 10 seconds
+```
+
+Offline by construction: no key, no network, no ffmpeg. `.github/workflows/`
+runs exactly that line on every push, with no secrets configured — and the lack
+of secrets is the point rather than an omission. With a `GEMINI_API_KEY` in
+`.env` the visual relevance screener defaults to `llm`, and three of the step 4
+tests were quietly making real model calls at 40-49 seconds each; they pin it
+offline in their own fixture now, so the suite exercises the same path on every
+machine and costs nothing to run.
 
 ## Step 0 — topic scouting
 
@@ -200,9 +217,26 @@ does not choose, and does not know how many places are on the board.
   and both are right. A hook names something because a specific image stops a
   scroll. A topic that is mostly names is a fixture, an election or a product
   launch: it decays in hours and no stock library holds a frame of it;
-* topics shown on recent boards are scored down and ones already **made** are
-  dropped, through a ledger in `output/topics/usage.json` — the same pattern as
-  step 4's asset usage and step 6's hashtags.
+* topics shown on recent boards are scored down, ones already **made** are
+  dropped, and ones whose script the **fact-check refused** are charged for it,
+  through a ledger in `output/topics/usage.json` — the same pattern as step 4's
+  asset usage and step 6's hashtags.
+
+  The refusal half is newer than the rest, and it is worth saying why. A topic
+  is marked used at the first moment money has gone on it, which a refused
+  draft never reaches, so the entire cost of a refusal was the −0.6 for having
+  been on a board — and a refused script costs a ~150s Pro call and leaves
+  nothing behind. Measured across the logs: *"what the sound of the deep ocean
+  actually is"* was chosen and refused **five times** over 26 boards before a
+  draft survived. (The phrase pass rewords the line every run, so the log shows
+  three spellings of it; the ledger key was stable throughout, and the problem
+  was never the deduping.) A first refusal now costs `REFUSED_PENALTY` (−1.2),
+  which puts a backlog line under the floor unless it is carrying enough else
+  to be worth a second call, and `TOPIC_MAX_REFUSALS` (2) drops it. Charged
+  once however many times, and the count is a filter rather than more
+  arithmetic — [board #41](#step-0--topic-scouting) deadlocked on two penalties
+  priced independently, and a number the scorer never sees cannot do that
+  again.
 
 A source that is unconfigured, rate-limited or broken is a warning; the board
 is still produced from whatever answered. Only every source failing is fatal.
@@ -431,6 +465,26 @@ the one before it** (`turns on itself`, +0.8) pays instead: the negation is what
 separates "It doesn't" from "It has for ages", which is the same length in the
 same position and merely continues the line.
 
+**A weight can only choose from the field it is shown.** `second person` is
+the largest single virtue in the scorer at 1.0 — above `a number`, `strong
+opener` and `names something` — and for a long time nothing in the prompt
+asked for one. Of the 135 candidates on disk, 10 (7%) put the viewer in the
+sentence, and 4 of those 10 won their script: a 40% win rate against a field
+average of 16%. The scorer was not turning them down. It was shown one about
+every third run, and the runs it was not shown one look like this:
+
+```
+   2.00  They entombed the reactor in 400,000 cubic meters of concrete.
+         length +0.4, a number +0.8, strong opener +0.8
+```
+
+That won a field of five with no viewer anywhere in it. The prompt now asks
+for **one or two of the five** to put the viewer inside the fact — one or two
+rather than all five, because much of what the pass chooses between is
+material the viewer is not standing in, and a `you` reached for where the
+fact has no honest use for one buys 1.0 and spends more than that on sounding
+like an advert.
+
 **An opening is not a free-standing sentence — it is the first half of a
 join**, and for a long time nothing here had ever been shown the script. Every
 rule above scores a hook on its own, while `apply_hook` swapped sentence one
@@ -548,7 +602,16 @@ better. What comes back is kept only if it clears three checks in code:
 * the opening it was told to keep came back unchanged. It is handed over as
   fixed, so whether it *stayed* fixed is checkable rather than assumed — a
   model that rewrote it anyway has thrown away the line the hook pass scored
-  five candidates to choose, and it is put back;
+  five candidates to choose, and **the whole rewrite is dropped**. It used to
+  be repaired instead, by pasting the chosen opening back over the rewrite's
+  own. That repair is not available here: pasting swaps sentence one and
+  leaves sentence two written to follow the sentence just deleted, which is
+  the seam the hook pass carries a `bridge` to mend, reopened where there is
+  no bridge left to mend it with. The Chernobyl reel shipped that way — the
+  bridge `And the cost of that concrete was just the beginning.` was written
+  to set up a rebuttal three lines later, the rewrite dropped it, the paste
+  could not put it back, and `Not even close.` went out answering nothing.
+  Falling back leaves a worse-shaped script that still says something;
 * the length is still the one step 0 asked for. A rewrite half as long again is
   a different reel, and step 5 has already been told the old number;
 * **it scores better than the script it replaces.** Same incumbent rule as the
@@ -565,11 +628,67 @@ ending that pays off whatever the script opens with, so it has to see the
 opening the hook pass settled on; reversed, the hook pass would swap the
 opening out from under an ending written to close it.
 
+### Step 2 — the take-away
+
+The two passes above buy attention. The hook wins the first second, the shape
+holds the thirty after it. Neither asks what the viewer is *holding* when it
+stops, and the account says that is where it fails: across the seven reels
+posted to 2026-09-08, watch-through runs 0.38 to 0.68 — the retention those
+passes were built for, working — and **saves and shares are 0 on every one of
+them**. A reel nobody keeps and nobody sends is shown to nobody else, whatever
+its watch-through.
+
+What gets kept is a reel that changed what the viewer will notice tomorrow;
+what gets sent is one they can retell in a sentence. Both need the script to
+hand something over — where they will meet the thing, what it looks like when
+they do, or what it is called — so `TAKEAWAY_MODE` scores exactly that:
+
+| component | worth | what it is |
+| --- | --- | --- |
+| puts the viewer in front of it | +2.0 | `next time you…`, `you'll see it in…` |
+| names the thing | +1.2 | `it's called creep`, `they call it the Wood Wide Web` |
+| the viewer is in the close | +0.8 | second person in the last few sentences |
+
+Measured over the 29 scripts in `output/scripts/` before any of this existed:
+**1 of 29** puts the viewer in front of the thing, 3 name it, and **23 score
+nothing at all**. The endings are not bad — they are good writing that hands
+over nothing. `It's the tilt.` `The ocean has no drain.` `The green just got
+out of the way.` Every one of those closes its loop and lands short, which is
+every virtue the shape pass knows how to pay for.
+
+A 1-in-29 base rate is the hook pass's second-person finding again: a virtue
+the scorer would pay for that the prompt never asked for. So it ships as
+**both** — `PROMPT_TEMPLATE` asks for a take-away and this pass checks, because
+asking is not checking.
+
+Two things are deliberately **not** scored. There is no penalty for an ending
+that hands nothing over — absence simply scores nothing and falls under
+`TAKEAWAY_MIN_SCORE` — because the last lexicon written to judge endings here
+flagged five shipped closes to catch one bad one. And a figure with a unit is
+not paid for, though it looks like it belongs: it fires on 15 of the 29
+scripts, which describes the house style rather than separating one reel from
+another.
+
+The pass runs **after the structure pass**, and that is the mirror of the
+hook/structure argument: everything it is asked for lands in the closing
+sentences, which is exactly where the shape pass measures the payoff. So it
+writes into the ending the shape pass just built — and then re-scores that
+shape, refusing any rewrite that hands the viewer something by flattening the
+ending. A hand-over bought that way trades the line they would have remembered
+for the thing they were supposed to keep.
+
+**The weights are a prior, not a fit.** Nothing in the ledger has ever been
+saved, so there was nothing to fit them to; read them as an ordering. That is
+why `PERFORMANCE_EXPLORE=takeaway` is the trial currently running — the `off`
+arm is the only thing that can ever say whether the pass earned its place.
+`--no-takeaway` skips it.
+
 ### Step 2 — the claims
 
-Both passes above ask whether the script is *shaped* like a reel. Neither asks
-whether it is true, and until `VERIFY_MODE` nothing else in the pipeline did
-either. Two shipped reels are what that cost.
+The three passes above ask whether the script is *shaped* like a reel and
+whether it hands anything over. None of them asks whether it is true, and until
+`VERIFY_MODE` nothing else in the pipeline did either. Two shipped reels are
+what that cost.
 
 The glacier reel opens `This mountain of ice is moving at your walking speed.`
 and says, eleven sentences later, `This happens slowly. A few centimetres a
@@ -589,7 +708,7 @@ There is no such animal. P-22 was a real cougar, in Griffith Park in Los
 Angeles, and was not red. The reel invents an animal, gives it a real animal's
 name, puts it in the wrong mountains and closes by telling viewers to visit a
 **named real institution** to see it. That script is not badly shaped — it is
-well shaped, and every rule in the two passes above scores it fine.
+well shaped, and every rule in the passes above scores it fine.
 
 `VERIFY_MODE=llm` spends one Gemini call asking two questions: does the script
 disagree with itself, and does it assert anything untrue. What comes back is
@@ -600,10 +719,25 @@ still matches). A finding about a sentence that is not there is a finding about
 some other script, and acting on it means repairing a fault that was never in
 this one.
 
-Findings are `contradiction`, `false` or `unsupported`. **Only the first two
-block.** `unsupported` is the model saying it cannot confirm something, which is
-true of most interesting claims and would leave the pipeline unable to ship
-anything at all; it is reported and nothing more.
+Findings are `contradiction`, `false`, `unsupported` or `figurative`. **Only
+the first two block.** `unsupported` is the model saying it cannot confirm
+something, which is true of most interesting claims and would leave the
+pipeline unable to ship anything at all; it is reported and nothing more.
+
+`figurative` is there for the same reason, on evidence from
+`output/scripts/refused/`. A hook is compressed on purpose — *"a silent water
+pump with no moving parts"*, *"the fruit is the mother, but the seed had a
+father"* — and read literally a compression like that is always false of
+something. Given only the first three kinds, a checker told to find claims
+that are wrong had nowhere to file a metaphor, so it filed it under `false`.
+On 2026-09-06 that lost a run both of its topics: the tree hook was refused
+over stomata, the repair softened it to *"almost no moving parts"* and it was
+refused again on the same ground — no wording of that metaphor survives being
+read as mechanics. Three earlier fixes to this pass all bought the repair more
+room, and none of them could have helped, because the sentence was never the
+fault. What still blocks is the reel that invents an animal: *"the
+deep-freezing kills them instantly"* stays `false`, a literal claim about a
+process, wrong by days, that one qualifier repairs.
 
 A blocked script buys **one repair**, on the same incumbent rule the other two
 passes use — the rewrite is re-checked, and kept only if it actually cleared
@@ -618,9 +752,25 @@ and never a block. A checker that cannot be reached must not be the reason a
 reel does not exist, which is exactly where the pipeline stood before this pass
 was written. `--no-verify` skips it.
 
-The pass runs **last**, after both rewrites: it is the only one that reads the
-script for what it says rather than for how it is built, and checking before
-the other two would be checking a draft that no longer exists.
+The pass runs **last**, after all three rewrites: it is the only one that reads
+the script for what it says rather than for how it is built, and checking
+before the others would be checking a draft that no longer exists.
+
+**And the card is re-cut after it.** The on-screen `hook_card` is cut from the
+opening the hook pass chose, which is settled *before* the check runs — so a
+claim the checker threw out of the narration was still being burned over the
+reel, the cover and the alt text, where it is the most-read text in the whole
+thing. On run `how-a-forest-talks-through-its-roots-531029b5` the checker
+called `a network more complex than your own brain` false and the repair
+rewrote the narration to `hides a vast, hidden network` — and the card, the
+cover headline and the alt text all still read **A network smarter than you**.
+The overclaim ended up *more* prominent after the repair than before it.
+
+The card is now re-cut from the repaired opening, and only when that opening
+actually moved: if sentence one came through the check untouched then the card
+is exactly as true as the sentence it was cut from, and re-cutting would trade
+a card the model wrote for a mechanical one for nothing. The re-cut is recorded
+in the claim report's warnings.
 
 **What it does not do.** It is given the script and the topic, not the source
 material step 0 found. It catches a script arguing with itself and a claim the
@@ -1017,7 +1167,31 @@ nothing is generated, so whatever you put there is yours to have licensed.
   in it would be published as part of somebody's name. A sidecar with no
   settings line is read exactly as it always was. `MUSIC_BPM` is the fallback
   for a track with none of its own, and a tempo outside 30-300 is treated as a
-  typo and dropped with a warning rather than believed.
+  typo and dropped with a warning rather than believed;
+* **`bpm: none`** says the track was measured and has no constant grid in it.
+  That is a different thing from having no `bpm:` line, which means nobody has
+  looked, and the run says so differently: a bed with no pulse is not a job to
+  go and do, so it is stated once instead of asking for a number every day
+  about a file that will never have one.
+
+  The five beds in `assets/music/` were measured by fitting a constant grid to
+  their tracked beats and reading the residual — the same grid step 5 builds
+  from one number and an offset, so the test is the thing the feature actually
+  needs. Three have a tempo and two do not, and it is not a close call:
+
+  | bed | tempo | residual |
+  |---|---|---|
+  | `documentary-background` | 100 | 7.5ms |
+  | `millennium-sunset` | 120 | 7.9ms |
+  | `silent-dreams` | 120 | 14.0ms |
+  | `plathe-beatless-ambient-mix` | none | halves disagree, 135 vs 90 |
+  | `autumn-prelude` | none | 1178ms |
+
+  For scale, pure noise fits a grid to 110ms and a synthetic click track to
+  6.7ms. `documentary-background` had previously been written down as `bpm:
+  99.4` — the beat-tracker's estimate rather than a fit — and at that tempo the
+  same beats fit to **165ms**, drifting a quarter of a second out of sync
+  across a 40-second reel. It is 100.
 
 A track that ffmpeg cannot read is dropped with a warning rather than failing
 the reel, like everything else here.
@@ -1217,17 +1391,48 @@ nothing is dropped, the suspect tags are ranked last, and the run says so.
   last. Seed real counts in hashtag_volume.json to settle it.
 ```
 
-To overrule it anywhere, write the real number down:
-
-```json
-{"version": 1, "tags": {"piezophile": {"count": 412, "source": "measured"}}}
-```
-
 See what it makes of a set of tags without running anything else:
 
 ```
 python pipeline/tagvolume.py Piezophile DeepSeaFish OceanLife Snailfish
 ```
+
+And overrule it wherever it is wrong, with the figure Instagram shows on the
+tag's own search screen. A seeded count is authoritative, beats the estimator
+and never expires:
+
+```
+python pipeline/tagvolume.py --set marinebiology=4.2M oceanlife=430K trees=9,500
+```
+
+Worth an hour once, for the tags the account actually posts under — until then
+every band in every caption is a guess, and two of the estimator's failures are
+structural rather than merely coarse. Tags built from the same shape of words
+collide on one figure: `#biology`, `#botany` and `#trees` all read as 3,162,277.
+And a common term of art reads far smaller than it is — `#MarineBiology`, the
+tag named above as having millions of posts, estimates at 112,201, which files
+it in the one band a small account is told it can rank in.
+
+Which hour, though — "seed the tags the account posts under" is advice you can
+only follow if you know which those are, and the tags the estimator *threw out*
+used to leave no trace but a sentence in the log. They are recorded now, in
+`post.json` under `hashtag_rejected`, and `--worklist` reads every post back
+and ranks them: thrown out first, then whatever the account leans on most,
+skipping anything already seeded by hand.
+
+```
+python pipeline/tagvolume.py --worklist
+
+12 of 55 tag(s) this account has used carry no measured count.
+  tag                        thrown out  posted with   estimated
+  #mycorrhiza                         3            0   ~900
+  #ecology                            0            2   -
+```
+
+Those are the two ways a wrong number costs something: a tag dropped from every
+caption that mentions the subject, and a tag that goes out on every post in the
+wrong band. The `~900` is the estimate that condemned it, printed so a figure
+that is obviously wrong is obvious.
 
 ## Step 8 — the whole thing, unattended
 
@@ -1247,6 +1452,41 @@ python pipeline/run.py --status           # how the last runs went
 **It does not post anything.** The reel and its caption land in
 `output/<date>/<run id>/` and you publish them yourself. This replaces the
 typing, not the judgement about what goes out.
+
+### It reads yesterday's numbers first
+
+Before anything else, `RUN_FETCH_INSIGHTS` has step 9 ask the provider about
+every reel whose numbers are not final yet. This is not a convenience — it is
+the only way the numbers are usable at all.
+
+Step 9 can only compare a reading taken between `PERFORMANCE_MIN_AGE_HOURS`
+and `PERFORMANCE_WINDOW_HOURS` after posting. That is a **24-hour slot per
+reel**, and no hand-run schedule hits it. Read off the ledger on 2026-09-09: of
+the seven posted reels, five had been read only past 48h and one only at 5.6h —
+**six of seven sat outside the window they had to be inside**, and the 5.6h
+reading had handed the worst reel in the ledger the highest watch-ratio in it.
+
+A job that fires once every 24 hours lands inside any 24-hour span, so one
+daily read guarantees each reel is asked about at least once while the answer
+still counts. Step 8 is already the thing the scheduler runs every day.
+
+Two details that are not obvious:
+
+- **It runs before the once-per-day guard.** The reading is about reels posted
+  on *earlier* days, so a day that makes no reel is still a day one of them has
+  to be asked about. Behind the guard, a reel posted the evening before a
+  skipped day would fall out of its window unread.
+- **A reading that already counts is never taken again.** The report compares
+  on the age of the *latest* reading, and consecutive daily readings are a day
+  apart against a 24-hour-wide window — so a reel read at 29h would be read
+  again at 53h, comparable for exactly one day and then silently not. This is
+  only reachable once the read is automated, which is why it survived every
+  earlier fix.
+
+A provider that is down, rate-limited or misconfigured leaves a warning on the
+run and nothing else: the numbers are bookkeeping and the reel is the job.
+No provider configured at all is a choice rather than a fault, so it says
+nothing. `RUN_FETCH_INSIGHTS=false` turns it off.
 
 ### Which topic it makes
 
@@ -1368,7 +1608,9 @@ reel; you supply the outcome afterwards.
 ```bash
 python pipeline/perform.py                     # which reels are waiting
 python pipeline/perform.py cd1bccae --views 4200 --watched 61 --saves 30
-python pipeline/perform.py cd1bccae --skipped "footage was of the simile"
+python pipeline/perform.py cd1bccae --skipped footage
+python pipeline/perform.py cd1bccae --skipped hook --note "the card gave it away"
+python pipeline/perform.py --reasons            # the skip vocabulary
 python pipeline/perform.py --report
 ```
 
@@ -1386,19 +1628,66 @@ says so about itself rather than reading as "nothing fired".
   quality judgement you make the same day, for free, where an Instagram number
   takes 48 hours and a Meta app. `--skipped` records it, and for the first
   month it is very nearly the only signal that exists. It is also the one
-  column no API will ever supply;
+  column no API will ever supply.
+
+  It takes a **code**, from a fixed list, and that is a correction: it used to
+  take free text, on the reasoning that a sentence written the same day carries
+  more than a checkbox. It does, to a reader. It carried nothing to the report,
+  which never opened the column — and what fourteen of the nineteen binned
+  reels actually said was *"not good enough to post"*, fourteen times, which is
+  a judgement with the evidence left out. A code is comparable across reels,
+  which is the only property that matters here, and every code names a step you
+  could go and change:
+
+  | code | what it says |
+  |---|---|
+  | `footage` | the footage did not show what was being said |
+  | `hook` | the opening did not land |
+  | `claim` | something in it was wrong, or overstated |
+  | `pacing` | it dragged, or the cuts fought the read |
+  | `cover` | the cover frame or the text on it was weak |
+  | `audio` | the read, the music or the mix |
+  | `duplicate` | too close to a reel already posted |
+  | `other` | a fault, and none of the above |
+  | `untested` | never a candidate — a test run |
+
+  `--note` keeps the sentence beside the code. Anything that is not a code is
+  still accepted rather than refused — the sentence is the better record of
+  what was wrong, it is just not comparable — and lands as `unlabelled`, which
+  the report counts and prints the command to clear. Neither `unlabelled` nor
+  `untested` votes in either table: a test run was never going to be posted
+  whatever was in it, and a rejection whose reason was lost is not evidence
+  about a reel;
 * **views trend with follower count**, so nothing here compares raw numbers.
   Reel #40 beats reel #5 for reasons that have nothing to do with its hook.
   Every reel is scored as a ratio to the median of its own neighbours in time —
   equal numbers either side, so the newest reel is not scored at all until the
   reels after it exist. A baseline built only from older reels flatters
   whatever is newest, which is precisely the reel you are most curious about.
-  `PERFORMANCE_METRIC` defaults to watch-through for the same reason: it is the
-  one figure that does not simply climb with the account;
-* **a measurement has an age.** A reel read at twelve hours and one read at a
-  week are not the same measurement, and averaging them measures when you
-  happened to look. `PERFORMANCE_WINDOW_HOURS` is 48; anything older is kept
-  but not compared.
+  `PERFORMANCE_METRIC` defaults to a watch figure for the same reason: it is
+  the one that does not simply climb with the account;
+* **the watch figure is `watch_ratio`, not `watch_through`.** Instagram's
+  average watch time counts replays, so it can exceed the length of the reel —
+  89.5 seconds of average watch time on a 37.59-second reel, measured here.
+  A *share of the reel* cannot exceed 1.0, so `watch_through` is capped, and
+  the cap handed the highest score in the ledger to the reel with three views.
+  `watch_ratio` is the same division left uncapped: 2.38 stays 2.38. Below 1.0
+  the two are identical and both are stored, so switching back costs nothing.
+  A reel sitting on the cap is refused by the report rather than ranked as
+  perfect;
+* **a measurement has an age, at both ends.** A reel read at twelve hours and
+  one read at a week are not the same measurement, and averaging them measures
+  when you happened to look. `PERFORMANCE_WINDOW_HOURS` is 48 and anything
+  older is kept but not compared — and `PERFORMANCE_MIN_AGE_HOURS` is 24,
+  because a reel read the same evening it went out has not finished happening.
+  The first reel read through the provider entered the ledger 5.6 hours old
+  with three views, and that is not a verdict on its hook;
+* **numbers are read more than once.** They used to be taken once, which meant
+  whatever a reel happened to have the moment somebody ran `--fetch` was what
+  it was judged on forever. A posted reel is asked about again until its
+  reading is `PERFORMANCE_SETTLE_HOURS` (36) old, and each answer is *appended*
+  — `measurements` holds what the reel had at every age it was read at, which
+  is worth more than the last number alone.
 
 ### Without a trial there is nothing to compare
 
@@ -1423,9 +1712,15 @@ is not a comparison, and there is no second month to spend discovering that.
 
 ### Reading the report
 
-Two tables, because two different columns are being read:
+Four tables, because four different columns are being read:
 
 ```
+WHY THEY WERE BINNED  (the same-day verdict; no API involved)
+  footage      6    43%  the footage did not show what was being said
+  hook         3    21%  the opening did not land
+  claim        3    21%  something in it was wrong, or overstated
+  pacing       2    14%  it dragged, or the cuts fought the read
+
 KEPT OR BINNED  (1.00 = always posted; every reel counts)
   question                   answer         n    median   vs rest
   topic source               evergreen     11     0.91    +0.24
@@ -1434,18 +1729,52 @@ HOW THEY DID  (1.00 = an ordinary reel for this account)
   question                   answer         n    median   vs rest
   length                     40-50s        12     1.18x   +0.21
   trial: hook                on            11     1.09x   +0.14
+
+SAVED OR SENT  (1.00 = every reel got a save or a share)
+  question                   answer         n    median   vs rest
+  trial: takeaway            on            11     0.27    +0.18
 ```
 
+The first table is a tally and not a segment, deliberately. With fourteen
+rejections spread over eight codes, crossing them with the component vocabulary
+would print a table of segments of one that all look like findings — the exact
+failure the other two tables refuse. *"Six of these were binned for the
+footage"* is a small claim that is actually supported, and it points at the step
+to go and change. It is also the table that fills up first: a rejection is a
+labelled failure available the same day, where a view takes a week.
+
 Nothing below `PERFORMANCE_MIN_SAMPLES` on **both** sides of a question is read
-out — a segment of three that happened to do well is not a finding, and the
-report says how far off it is rather than printing the number anyway.
+out of the other three — a segment of three that happened to do well is not a
+finding, and the report says how far off it is rather than printing the number
+anyway.
+
+**Why SAVED OR SENT is a rate and not a metric.** Saves and shares are what the
+take-away pass exists to move, so the obvious thing is
+`PERFORMANCE_METRIC=saves` — and it is wrong in a way that looks like an
+answer. `HOW THEY DID` divides each reel by the median of its nearest
+neighbours and refuses a median of zero, so a metric that is zero on most reels
+yields **no baseline, therefore no reading, for every reel, forever** — printed
+identically to *"measured, no effect"*. It does not fix itself as saves arrive
+either: more than half the surrounding reels would need one first. So saves and
+shares are read as a yes/no and reported as a share of reels, which is defined
+at zero and moves the first time one lands. While nothing has ever been saved
+the report says so outright, so a column of zeros is never mistaken for a
+finding.
 
 Be realistic about what a daily pipeline can support. With ~20 possible
 components and one reel a day, most segments never reach a readable n. The cuts
 that fire on every reel and get there within a couple of months are **duration
-band, topic source, hook replaced or kept, structure rewritten or kept, and
-whichever trial is running** — those five plus the kept/binned table are what
-this can actually tell you.
+band, topic source, hook replaced or kept, structure rewritten or kept,
+take-away rewritten or kept, cover source, and whichever trial is running** —
+those plus the kept/binned table are what this can actually tell you.
+
+Hashtags are the exception to "~20 components": from `FEATURES_VERSION` 5 every
+tag on a post is recorded by name and asked as its own question, which is a
+great many questions and almost all of them unreadable for a long time. That is
+the point of storing them — the count and the band tally that earlier rows kept
+could not hold *"did #woodwideweb do anything"* whatever the tags were. The
+spine tags in `POST_HASHTAGS_ALWAYS` are the ones that will reach a readable n
+first, because they are the only ones on every post.
 
 ### What it changes
 
@@ -1495,19 +1824,32 @@ Setting it up is about twenty minutes of Meta dashboard, once: switch the
 account to **Professional** (a personal account has no insights API at all),
 create an app at developers.facebook.com and add the Instagram product, add
 yourself as its owner/tester, then exchange the short-lived token for a
-long-lived one and put it in `.env` with the account's numeric id. Reading your
-own account this way needs **no App Review** — Meta lets an app's own admins and
-testers exercise permissions in development mode, which is exactly one person
-reading one account.
+long-lived one and put it in `.env` with the account's numeric id — the number
+`--check` prints, not the @handle, which is not a node the API answers for.
+Reading your own account this way needs **no App Review** — Meta lets an app's
+own admins and testers exercise permissions in development mode, which is
+exactly one person reading one account.
 
-Three things about it are worth knowing before relying on it:
+Four things about it are worth knowing before relying on it:
 
+* **there are two Instagram APIs and the tokens do not cross.** Which host
+  answers depends on how the token was minted: Instagram Login tokens (they all
+  begin `IG`) are parseable only by `graph.instagram.com`, Facebook Login ones
+  (`EAA...`) only by `graph.facebook.com`. The wrong host says *Cannot parse
+  access token*, which reads exactly like a token that has lapsed and is
+  nothing of the kind — so the host follows the token, and `INSTAGRAM_API_HOST`
+  overrules it if that guess is ever wrong;
 * **matching a reel to a post is the hard half.** Instagram has never heard of
   `cd1bccae`. What it has is a caption — and step 6 wrote that caption, so the
   first line of `post.txt` is the join key and the posting time is the
   tie-break. A match made on time alone is a guess, so how it was made is
   recorded next to the numbers and `--fetch` prints which ones to check.
-  `--pin` overrules it for good;
+  `--pin` overrules it for good. The waiting reels are matched **all at once**,
+  and a post belongs to one reel: matched one at a time, the nearest later post
+  is the nearest later post for every reel made that week, and the ones that
+  were never posted each walk off with a copy of the numbers of the one that
+  was. Measured the day this was first switched on: 7 posts, 7 exact caption
+  matches, and 5 further reels handed somebody else's numbers by the fallback;
 * **the metric names churn.** `plays` became `views`, the reels metrics have
   been consolidated more than once, and which ones a media node answers for
   depends on its type and on the API version. So the request is made from a
@@ -1515,9 +1857,18 @@ Three things about it are worth knowing before relying on it:
   four metrics out of six is useful, and an exception because Meta renamed a
   field is not. `INSTAGRAM_API_VERSION` is pinned for the same reason;
 * **watch-through is derived, not reported.** Instagram gives an average watch
-  time in milliseconds; step 9 ranks on the share of the reel that got watched.
-  The reel's own length is in its features row, so the conversion is a division
-  — which is why the provider is handed the features rows and not just ids.
+  time in milliseconds; step 9 ranks on how much of the reel that was. The
+  reel's own length is in its features row, so the conversion is a division —
+  which is why the provider is handed the features rows and not just ids. Two
+  numbers come out of it, because the division does not stay under 1.0:
+  Instagram counts replays, so a looped reel reports more watch time than it
+  has reel. `watch_through` caps at 1.0 and `watch_ratio` does not, and the
+  report ranks on the second;
+* **a reel is read more than once.** `--fetch` asks about every reel with no
+  numbers *and* every posted reel whose reading is younger than
+  `PERFORMANCE_SETTLE_HOURS`, because a number taken the same evening is a
+  number taken while the reel was still being shown. Each answer is appended to
+  that reel's `measurements`, so the early reading survives the later one.
 
 The token lasts sixty days. `--refresh` mints a new one and prints it to paste
 back into `.env` — deliberately printed rather than written, because a program

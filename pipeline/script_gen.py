@@ -144,7 +144,8 @@ same length read as a metronome, however punchy each one is by itself.
 - End on a short line that answers the opening in DIFFERENT words - not a \
 restatement of it, not a summary of the script. It should run back into the \
 opening line closely enough that a viewer watching twice hears the two as \
-continuous. Do not ask the viewer to like, follow or comment.
+continuous.
+- Hand the viewer something to keep. Somewhere in the script - most naturally in the breath before the last line - put them in front of the thing itself: where they will meet it, what it looks like when they do, or what it is called. "Next time you...", "look for...", "that ring is called...". A viewer saves a reel that changed what they will notice tomorrow and sends one they can retell in a sentence; a fact they merely enjoyed, they watch and forget. This is a line of narration, not a request: do not ask the viewer to like, follow, save or comment.
 
 Output format - this matters, the text goes straight into a text-to-speech engine:
 - Return ONLY the words to be spoken.
@@ -167,7 +168,20 @@ def build_prompt(topic: str, duration_seconds: int) -> str:
 
 
 class ScriptGenerationError(RuntimeError):
-    """Raised when Gemini fails, refuses, or returns an unusable script."""
+    """Raised when Gemini fails, refuses, or returns an unusable script.
+
+    A refusal by the claim check carries `script` - the draft that was refused
+    - and `report`, the claim report that refused it. Every other cause leaves
+    both empty. They are attributes rather than text in the message because
+    the evidence for a refusal is a whole script and two repair rounds, and
+    the message is one line that a log truncates.
+    """
+
+    def __init__(self, message: str, *, script: str = "",
+                 report: dict | None = None):
+        super().__init__(message)
+        self.script = script
+        self.report = report or {}
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +454,20 @@ video is about, and never ask a question the viewer can answer with "no".
 You always return valid JSON and nothing else."""
 
 
+#: Direct address is asked for outright because `score_hook` pays it 1.0 - more
+#: than a number (0.8), a strong opener (0.8) or a named thing (0.7), making it
+#: the largest single virtue in the scorer - and for a long time nothing here
+#: asked for it. Measured over the 135 candidates on disk before this rule
+#: existed: 10 of them (7%) put the viewer in the sentence, and 4 of those 10
+#: won their script, against a 16% base rate. The scorer was not turning them
+#: down. It was rarely shown one.
+#:
+#: One or two of the five rather than all five, deliberately. The scorer still
+#: picks, and much of what it picks between is material the viewer is not
+#: standing in: a "you" reached for where the fact has no honest use for one
+#: buys 1.0 and spends more than that on sounding like an advert. Asking every
+#: line for it would also flatten the field on the one component that most
+#: often separates it.
 _HOOK_PROMPT_TEMPLATE = """\
 Topic of the video: {topic}
 
@@ -457,6 +485,11 @@ Rules for every line:
 - It is spoken aloud, so write it for the ear.
 - Be concrete: a number, an image, a named thing, a claim that sounds wrong \
 until it is explained. Something the viewer can picture or check.
+- One or two of the {count} lines should put the viewer inside the fact: \
+"you", "your", or something they stand on, breathe, own or are made of. Not \
+as an address - "have you ever" is throat-clearing and banned below - but as \
+the sentence's subject. Only where the material takes it honestly; a "you" \
+bolted onto a fact about somewhere else is worse than none.
 - No throat-clearing. Never open with "in this video", "have you ever", \
 "did you know", "let me tell you", "imagine if", "welcome to" or "today".
 - No hype adjectives: amazing, incredible, mind-blowing, insane, crazy.
@@ -515,6 +548,51 @@ _HOOK_NUMBER_RE = re.compile(r"\b\d")
 #: than figures and fold to nothing, so they are excluded for free.
 _HOOK_NUMBER_WORD_SKIP = frozenset({"one"})
 _HOOK_WORD_RE = re.compile(r"[A-Za-z0-9'’-]+")
+
+#: What a figure is stated in. A spelled-out number below a hundred is as often
+#: counting the shape of the explanation as stating a quantity - "two kinds of
+#: colour", "two countries" - and this component is here for the arresting
+#: figure, not for enumeration. So a small number word has to be quantifying
+#: something: another number word ("five million", "two hundred"), or one of
+#: these. Digits never face the test, and neither does "hundred" and up, which
+#: are magnitudes on their own.
+#:
+#: Measured over the 30 candidates on disk that fired this component: 27 state
+#: a figure, 3 do not, and every one of the 27 still fires with this rule in
+#: place. Of the 3, only "An autumn leaf has two kinds of colour" won its
+#: script - on this component alone, 0.8 against a 0.7 that had second person
+#: and a strong opener in it. Re-run that census before widening the set: the
+#: risk here is the reverse error, a real figure in a unit nobody listed.
+_HOOK_MEASURE_WORDS = frozenset({
+    # time
+    "second", "minute", "hour", "day", "week", "month", "year", "decade",
+    "century", "centuries", "millennium", "millennia", "lifetime",
+    # distance
+    "inch", "inches", "foot", "feet", "yard", "mile", "metre", "meter",
+    "kilometre", "kilometer", "km", "cm", "mm", "fathom", "furlong",
+    # mass
+    "gram", "kilogram", "kg", "pound", "ounce", "ton", "tonne",
+    # volume and area
+    "litre", "liter", "gallon", "barrel", "acre", "hectare", "cubic", "square",
+    # proportion, angle, temperature, rate
+    "percent", "degree", "celsius", "fahrenheit", "times",
+})
+
+
+def _quantifies(word: str) -> bool:
+    """Whether `word` is the sort of thing a figure gets stated in.
+
+    Another number word counts: "five million" and "two hundred" are one
+    figure written in two tokens, and only the first of them is small.
+    """
+    if not word:
+        return False
+    if _fold_number_word(word).isdigit():
+        return True
+    if word in _HOOK_MEASURE_WORDS:
+        return True
+    stem = word[:-1] if len(word) > 3 and word.endswith("s") else word
+    return stem in _HOOK_MEASURE_WORDS
 
 #: A sentence carrying a negation. Contractions are matched whole because the
 #: word pattern keeps them whole - "don't" arrives as one token, not two - and
@@ -591,6 +669,18 @@ also actually just even still really very quite almost nearly
 #: card that cannot clear it keeps the plain cut.
 _HOOK_CARD_MIN_WORDS = 2
 
+#: A bare figure, cut off from whatever it was counting. A number is the start
+#: of a quantity and never the end of a thought, so a card ending on one has
+#: been guillotined mid-measurement: "They entombed the reactor in 400,000",
+#: "A Roman messenger could cover 100".
+#:
+#: Digits only, and deliberately not the magnitude words. "This baked sand
+#: holds millions" ends on a noun and reads fine; "millions" can stand where
+#: "400,000" cannot. Measured over the 29 openings in output/scripts/ on
+#: 2026-09-09: this fires on 2 cards and both are bad, a magnitude rule would
+#: have fired on 1 and it is good.
+_HOOK_CARD_BARE_NUMBER = re.compile(r"^\d[\d,.]*$")
+
 
 def _echoes_body(hook: str, body: str) -> str:
     """The sentence near the top of `body` that restates `hook`, or "".
@@ -633,14 +723,28 @@ def says_a_number(text: str) -> bool:
     "eleven" and "11" one token, so the two passes agree about what a number
     is instead of each keeping its own opinion. It also brings the hyphenated
     compounds ("ninety-five") with it.
+
+    A spelled-out number under a hundred additionally has to be quantifying
+    something - see _HOOK_MEASURE_WORDS. English uses its small number words
+    as determiners at least as often as it uses them as figures, and counting
+    "two kinds of colour" as a statistic handed a hook 0.8 on a field whose
+    median winning margin is 0.70. That is the whole component deciding the
+    line, which is what this weight was cut from 1.5 to stop it doing.
     """
     if _HOOK_NUMBER_RE.search(text or ""):
         return True
-    for raw in _HOOK_WORD_RE.findall(text or ""):
-        word = raw.lower().strip("'’-")
+    words = [raw.lower().strip("'’-")
+             for raw in _HOOK_WORD_RE.findall(text or "")]
+    for index, word in enumerate(words):
         if word in _HOOK_NUMBER_WORD_SKIP:
             continue
-        if _fold_number_word(word).isdigit():
+        folded = _fold_number_word(word)
+        if not folded.isdigit():
+            continue
+        if int(folded) >= 100:
+            return True                  # a magnitude is a figure by itself
+        following = words[index + 1] if index + 1 < len(words) else ""
+        if _quantifies(following):
             return True
     return False
 
@@ -827,11 +931,23 @@ def _trim_dangling(words: list[str]) -> list[str]:
     Only ever shortens, never reorders or rewrites, and gives up rather than
     trimming below `_HOOK_CARD_MIN_WORDS` - at which point the plain cut is
     the lesser of the two bad options.
+
+    A bare figure counts as one of those words, and popping it often uncovers
+    another: "They entombed the reactor in 400,000" loses the number, then
+    loses the "in" holding it up, and lands on "They entombed the reactor".
+
+    What this cannot see is a trailing transitive verb - "The ground you walk
+    on hides", "This anchor chain can suffocate". Those are the other half of
+    the bad cards on disk and they need a parser rather than a word list: the
+    same word is fine at the end of one card and a cliff-edge at the end of
+    another, so no set of them can be written down. `hides` in particular is a
+    perfectly good last word when the thing doing the hiding is the subject.
     """
     kept = list(words)
     while len(kept) > _HOOK_CARD_MIN_WORDS:
         last = kept[-1].lower().strip(_HOOK_CLAUSE_END + ".!?\"'’")
-        if last not in _HOOK_CARD_DANGLING:
+        if (last not in _HOOK_CARD_DANGLING
+                and not _HOOK_CARD_BARE_NUMBER.match(last)):
             break
         kept.pop()
     return kept if len(kept) >= _HOOK_CARD_MIN_WORDS else list(words)
@@ -1623,14 +1739,24 @@ def revise_structure(topic: str, script: str,
     # The opening was handed over as fixed, so whether it came back fixed is
     # checkable rather than assumed. A model that rewrote it anyway has thrown
     # away the line the hook pass scored five candidates to choose.
-    warnings: list[str] = []
+    #
+    # The whole rewrite goes, rather than the chosen opening being pasted back
+    # over it. Pasting swaps sentence one and leaves sentence two written to
+    # follow the sentence just deleted - the seam apply_hook carries a bridge
+    # to mend, reopened here where there is no bridge left to mend it with.
+    # The Chernobyl reel shipped exactly that: the hook pass had written "And
+    # the cost of that concrete was just the beginning." to set up a rebuttal
+    # three lines later, the rewrite dropped the bridge, the paste could not
+    # put it back, and "Not even close." went out answering nothing. Falling
+    # back leaves a script that is worse-shaped and still says something, which
+    # beats better-shaped and incomprehensible.
     returned, _ = split_first_sentence(revised)
     if not _same_opening(returned, opening):
-        revised = apply_hook(revised, opening)
-        warnings.append("the rewrite changed the opening it was told to keep - "
-                        "put the chosen one back")
+        return {"script": "",
+                "warnings": ["the rewrite changed the opening it was told to "
+                             "keep - dropped it, kept the script as written"]}
 
-    return {"script": revised, "warnings": warnings}
+    return {"script": revised, "warnings": []}
 
 
 def choose_structure(topic: str, script: str,
@@ -1719,6 +1845,367 @@ def choose_structure(topic: str, script: str,
 
 
 # ---------------------------------------------------------------------------
+# The take-away
+#
+# The three passes above buy attention. The hook wins the first second, the
+# shape holds the thirty after it, the claim check keeps both honest. None of
+# them asks what the viewer is holding when it stops.
+#
+# The account says that is where it fails. Across the seven reels posted to
+# 2026-09-08, watch-through runs 0.38 to 0.68 - the retention those passes were
+# built for, working - and saves and shares are 0 on every one of them. A reel
+# nobody keeps and nobody sends is shown to nobody else, whatever its
+# watch-through.
+#
+# What gets kept is a reel that changed what the viewer will notice tomorrow;
+# what gets sent is one they can retell in a sentence. Both need the script to
+# hand something over: where they will meet the thing, what it looks like when
+# they do, or what it is called. So that is what is scored here.
+#
+# Measured over the 29 scripts in output/scripts/ on 2026-09-09, before any of
+# this existed: 1 of 29 puts the viewer in front of the thing, 3 of 29 give it
+# a name, 3 of 29 have the viewer anywhere in the close, and 23 of 29 score
+# nothing at all. The endings are not bad - they are good writing that hands
+# over nothing. "It's the tilt." "The ocean has no drain." "The green just got
+# out of the way." Every one of those closes its loop and lands short, which is
+# every virtue `score_structure` knows how to pay for.
+#
+# The one script that clears the bar is the noise-cancelling reel, on "You're
+# hearing two sounds become nothing" - a viewer wearing the thing being
+# explained. It is the only reel in the corpus whose last line is about the
+# person watching it.
+#
+# A 1-of-29 base rate is the hook pass's second-person finding again: a virtue
+# the scorer would pay for and the prompt never asked for. So the ask is in
+# PROMPT_TEMPLATE and the check is here, because asking is not checking.
+#
+# Two things are deliberately not scored. There is no penalty for an ending
+# that hands nothing over - absence simply scores nothing and falls under
+# TAKEAWAY_MIN_SCORE - because the last lexicon written to judge endings in
+# this project flagged five shipped closes to catch one bad one, and a rule
+# with that ratio is worse than no rule. And a figure with a unit is not paid
+# for, though it looks like it belongs: probed against the same corpus it fires
+# on 15 of the 29 scripts, which makes it a description of the house style
+# rather than something that separates one reel from another.
+# ---------------------------------------------------------------------------
+
+#: Sampling temperature for the rewrite. The structure pass's, for the
+#: structure pass's reason: the facts are settled and what is wanted is a way
+#: back to them, not new material.
+TAKEAWAY_TEMPERATURE = 0.8
+
+#: A script shorter than this has no room to hand anything over without
+#: spending the whole reel doing it.
+_TAKEAWAY_MIN_SENTENCES = 4
+
+#: Both apostrophes. The scriptwriter returns the typographic one and the
+#: rewrite prompts return the ASCII one, and a rule that reads only one of them
+#: scores the same sentence differently depending on which call produced it.
+_APOSTROPHE = "['’]"
+
+#: The viewer put in front of the thing itself. Every branch needs the viewer
+#: in the sentence, or an instruction aimed at them - "look for" is the one
+#: imperative here with no honest reading other than the viewer doing the
+#: looking. Bare "notice" and bare "check" were dropped after they fired on
+#: narration about what other people noticed.
+#:
+#: The perception verbs need an auxiliary in front of them, and that auxiliary
+#: is the whole difference between the two senses of "you" in English. "You'll
+#: hear it in a quiet bay" is this viewer, later, somewhere they might stand.
+#: "You hear the rumble of a volcano" is the impersonal "one" - and it is what
+#: the deep-ocean reel says. Without the auxiliary required, that reel was the
+#: single script in the corpus this rule fired on, and it fired wrongly.
+_TAKEAWAY_TRANSFER_RE = re.compile(
+    r"\b(?:"
+    r"(?:the )?next time (?:you|your)\b"
+    r"|(?:look|watch|listen) (?:for|out for)\b"
+    r"|if you (?:ever|have ever|see|find|are)\b"
+    r"|when you (?:see|find|next|walk|stand|look|hold|pass)\b"
+    r"|you(?:" + _APOSTROPHE + r"?(?:ll|ve|re|d)|\s+(?:will|have|are|can))\s+"
+    r"(?:\w+\s+){0,2}?"
+    r"(?:see|seen|seeing|hear|heard|hearing|find|found|finding|notice|"
+    r"noticed|noticing|look|looking|hold|holding|stand|standing|walk|"
+    r"walking|spot|spotted|passing)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: A handle the viewer can repeat or search. A fact without a name for its
+#: subject cannot be retold - the viewer remembers that something happens and
+#: has nothing to call it.
+_TAKEAWAY_NAME_RE = re.compile(
+    r"\b(?:"
+    r"(?:is|are|it" + _APOSTROPHE + r"?s|they" + _APOSTROPHE + r"?re|that"
+    + _APOSTROPHE + r"?s)?\s*called\b"
+    r"|known as\b"
+    r"|(?:we|they|scientists|geologists|biologists) call (?:it|them|this|that)\b"
+    r"|the name for\b"
+    r"|goes by\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: The viewer in the sentences that land. Second person anywhere is common
+#: enough to say little - 11 of the 29 scripts have one somewhere - but only 3
+#: put the viewer in the close, which is the breath the reel is remembered by.
+_TAKEAWAY_SECOND_PERSON_RE = re.compile(
+    r"\b(?:you|your|yours|yourself|you" + _APOSTROPHE + r"?(?:ll|re|ve|d))\b",
+    re.IGNORECASE,
+)
+
+
+def score_takeaway(script: str) -> dict:
+    """Score what a script hands the viewer. Higher is better.
+
+    Returns the score and the parts it was built from - the contract
+    `score_hook` and `score_structure` keep, and for the same reason: step 9
+    stores which components fired and never the arithmetic, so a run can still
+    be argued with after the weights have moved.
+
+    The weights are a prior. Nothing in the ledger has ever been saved, so
+    there is no measurement to fit them to - what is measured is only that the
+    corpus scores zero, which is why the pass exists. Read them as an ordering
+    (the transfer line matters more than a name, a name more than the viewer in
+    the close) rather than as prices.
+    """
+    sentences = split_sentences(script)
+    if not sentences:
+        return {"score": 0.0, "components": {"nothing to hand over": 0.0}}
+
+    parts: dict[str, float] = {}
+    close = " ".join(closing_sentences(sentences))
+
+    if _TAKEAWAY_TRANSFER_RE.search(script):
+        parts["puts the viewer in front of it"] = 2.0
+    if _TAKEAWAY_NAME_RE.search(script):
+        parts["names the thing"] = 1.2
+    if _TAKEAWAY_SECOND_PERSON_RE.search(close):
+        parts["the viewer is in the close"] = 0.8
+
+    return {"score": round(sum(parts.values()), 3), "components": parts}
+
+
+def takeaway_faults(components: dict) -> str:
+    """What a script fails to hand over, in words the rewrite prompt can use.
+
+    The measurement is handed to the call that has to fix it, for the reason
+    `structure_faults` gives: a rewrite told only "make this better" moves
+    whatever it feels like moving.
+    """
+    faults = []
+    if "puts the viewer in front of it" not in components:
+        faults.append(
+            "it never puts the viewer in front of the thing - nowhere does it "
+            "say where they will meet it or what it looks like when they do"
+        )
+    if "names the thing" not in components:
+        faults.append(
+            "it never names what it is describing, so a viewer has nothing to "
+            "call it when they try to repeat it"
+        )
+    if "the viewer is in the close" not in components:
+        faults.append(
+            "the closing lines are about the subject rather than about the "
+            "viewer, so the reel ends without handing anything over"
+        )
+    return "; ".join(faults) if faults else "nothing measurable - tighten it"
+
+
+_TAKEAWAY_SYSTEM_INSTRUCTION = """\
+You rewrite narration for short-form vertical video so that the viewer is left \
+holding something.
+
+You are given an opening line that has already been chosen and is not yours to \
+change. You rewrite what comes after it: the same facts, the same length, the \
+same shape - but somewhere near the end the viewer is put in front of the \
+thing itself, so that the reel changes what they notice afterwards.
+
+You return only the words to be spoken."""
+
+
+_TAKEAWAY_PROMPT_TEMPLATE = """\
+Rewrite the narration below so that the viewer is left holding something.
+
+Topic: {topic}
+
+This opening line has already been chosen. Reproduce it EXACTLY, word for \
+word, as the first sentence of your rewrite:
+"{opening}"
+
+The narration as it stands:
+{script}
+
+What it fails to hand over: {faults}
+
+Rewrite everything after the opening line so that:
+- somewhere in it - most naturally in the breath before the last line - the \
+viewer is put in front of the thing itself. Where they will meet it, what it \
+looks like when they do, or what it is called. "Next time you...", "look \
+for...", "that ring is called...".
+- it still ends on a short line that answers the opening in DIFFERENT words, \
+runs back into the opening, and does not summarise the script. The hand-over \
+goes before that line, not instead of it.
+- the turn in the middle survives, and the sentence lengths still vary: at \
+least two sentences past fifteen words, at least two under four.
+- no sentence is followed by the same sentence reworded or negated.
+
+This is a line of narration, not a request. Do not ask the viewer to like, \
+follow, save or comment, and do not tell them the fact is interesting - hand \
+them the thing and let them decide.
+
+Keep the same facts and invent no new numbers. Keep the whole thing between \
+{min_words} and {max_words} words.
+
+Output format - this matters, the text goes straight into a text-to-speech engine:
+- Return ONLY the words to be spoken, the opening line included.
+- No title, no headings, no labels such as "Hook:" or "Narrator:".
+- No stage directions, no shot descriptions, no bracketed cues, no timestamps.
+- No emoji, no markdown, no asterisks, no quotation marks around the script.
+- Write numbers and symbols the way they should be said aloud."""
+
+
+def revise_takeaway(topic: str, script: str,
+                    duration_seconds: int | None = None) -> dict:
+    """Rewrite a script's body so it hands something over. Never raises.
+
+    Returns {"script": str, "warnings": [...]}. An empty script means the
+    rewrite could not be had, which every caller reads as "keep what you have".
+    """
+    opening, _ = split_first_sentence(script)
+    if not opening:
+        return {"script": "",
+                "warnings": ["the script is empty - nothing to hand over"]}
+
+    low, high = word_band(target_duration(duration_seconds))
+    prompt = _TAKEAWAY_PROMPT_TEMPLATE.format(
+        topic=topic or "(not given)",
+        opening=opening,
+        script=script,
+        faults=takeaway_faults(score_takeaway(script)["components"]),
+        min_words=low,
+        max_words=high,
+    )
+
+    try:
+        raw = call_gemini(
+            prompt,
+            system_instruction=_TAKEAWAY_SYSTEM_INSTRUCTION,
+            temperature=TAKEAWAY_TEMPERATURE,
+        )
+    except (ScriptGenerationError, config.MissingConfigError) as exc:
+        return {"script": "",
+                "warnings": [f"the take-away pass failed ({exc}). "
+                             f"Kept the script as written."]}
+
+    revised = clean_script(raw)
+    if not revised:
+        return {"script": "",
+                "warnings": ["the take-away pass returned nothing usable. "
+                             "Kept the script as written."]}
+
+    # Same check, same reason as the structure pass: the opening was handed
+    # over as fixed, and a rewrite that changed it anyway has thrown away the
+    # line the hook pass scored five candidates to choose. The whole rewrite
+    # goes rather than the opening being pasted back over it - see
+    # `revise_structure` for what pasting cost the Chernobyl reel.
+    returned, _ = split_first_sentence(revised)
+    if not _same_opening(returned, opening):
+        return {"script": "",
+                "warnings": ["the rewrite changed the opening it was told to "
+                             "keep - dropped it, kept the script as written"]}
+
+    return {"script": revised, "warnings": []}
+
+
+def choose_takeaway(topic: str, script: str,
+                    duration_seconds: int | None = None, *,
+                    mode: str | None = None) -> dict:
+    """Score what a script hands over, and rewrite one that hands over nothing.
+
+    Never raises, and never hands back a script that is worse than the one it
+    was given on either scale it can see. A rewrite has to beat the incumbent
+    on the take-away score AND come back with its shape intact, because this
+    pass runs after the structure pass and rewrites the same sentences the
+    structure pass just fixed.
+    """
+    setting = (mode or config.TAKEAWAY_MODE or "off").strip().lower()
+    incumbent = score_takeaway(script)
+    report = {
+        "mode": setting,
+        "score": incumbent["score"],
+        "components": incumbent["components"],
+        "revised": False,
+        "revised_script": "",
+        "revised_score": None,
+        "revised_components": {},
+        "warnings": [],
+    }
+
+    if setting != "llm":
+        return report
+
+    sentences = split_sentences(script)
+    if len(sentences) < _TAKEAWAY_MIN_SENTENCES:
+        report["warnings"].append(
+            f"the script is {len(sentences)} sentence(s) - too short to hand "
+            f"anything over without spending all of it, so it was left alone"
+        )
+        return report
+
+    if incumbent["score"] >= config.TAKEAWAY_MIN_SCORE:
+        return report
+
+    result = revise_takeaway(topic, script, duration_seconds)
+    report["warnings"].extend(result["warnings"])
+    if not result["script"]:
+        report["mode"] = "failed"
+        return report
+
+    revised = result["script"]
+    scored = score_takeaway(revised)
+    report["revised_score"] = scored["score"]
+    report["revised_components"] = scored["components"]
+
+    # Length is step 0's decision, and step 5 has already been told it.
+    if duration_seconds is not None:
+        low, high = word_band(duration_seconds)
+        words = count_words(revised)
+        if not low <= words <= high:
+            report["warnings"].append(
+                f"the rewrite came back {words} words against a {low}-{high} "
+                f"word budget - kept the original"
+            )
+            return report
+
+    if scored["score"] <= incumbent["score"]:
+        report["warnings"].append(
+            f"the rewrite scored {scored['score']:g} against the original's "
+            f"{incumbent['score']:g} - kept the original"
+        )
+        return report
+
+    # The guard the structure pass does not need and this one does. Everything
+    # this rewrite is asked for lands in the closing sentences, which is
+    # exactly where `score_structure` measures whether the reel pays off its
+    # opening. A rewrite that hands the viewer something and drops the payoff
+    # to do it has traded the line they would have remembered for the thing
+    # they were supposed to keep, and there is no reason to take that trade
+    # while the original is still on the table.
+    shape_before = score_structure(script)["score"]
+    shape_after = score_structure(revised)["score"]
+    if shape_after < shape_before:
+        report["warnings"].append(
+            f"the rewrite handed something over but its shape fell from "
+            f"{shape_before:g} to {shape_after:g} - kept the original"
+        )
+        return report
+
+    report["revised_script"] = revised
+    report["revised"] = True
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1768,7 +2255,28 @@ VERIFY_TEMPERATURE = 0.2
 #: ways, is worth losing a topic over.
 _VERIFY_BLOCKING = ("contradiction", "false")
 
-_VERIFY_KINDS = _VERIFY_BLOCKING + ("unsupported",)
+#: `figurative` does not block either, for the same reason and on the same
+#: evidence. A hook is compressed on purpose - "a silent water pump with no
+#: moving parts", "the fruit is the mother, but the seed had a father" - and
+#: read literally a compression like that is always false of something. Given
+#: only the three kinds above, a checker told to find claims that are wrong had
+#: nowhere to file a metaphor, so it filed it under `false`.
+#:
+#: Measured 2026-09-06, from the drafts in output/scripts/refused/: one run lost
+#: both the topics it had this way. The tree hook was refused for saying "no
+#: moving parts" when stomata open and close; the repair softened it to "almost
+#: no moving parts" and was refused again on the same ground, because no
+#: wording of that metaphor survives being read as mechanics. The apple payoff
+#: was refused for casting the fruit as a mother - and round 2's replacement,
+#: "the fruit comes from one parent, but the seed comes from two", which is
+#: true, the flesh being maternal tissue, was refused on the checker's own
+#: misreading. Three earlier fixes all bought the repair more room. None of
+#: them could have helped: the sentence was never the fault.
+#:
+#: What still blocks is the reel that invents an animal. "The deep-freezing
+#: kills them instantly" stays `false`, and should - a literal claim about a
+#: process, wrong by days, that one qualifier repairs.
+_VERIFY_KINDS = _VERIFY_BLOCKING + ("unsupported", "figurative")
 
 #: How much of a quoted sentence has to match one in the script before
 #: the finding is believed to be about the script. Not 1.0: the quote
@@ -1804,6 +2312,14 @@ rounded to something vivid.
 events or institutions; a real name attached to the wrong thing; a figure \
 that is wrong by an order of magnitude.
 
+This narration is spoken, and it opens and closes on lines that are \
+compressed on purpose - a metaphor, an analogy, a personification. "The tree \
+is a pump." "The fruit is the mother." Read as mechanics, or as genealogy, a \
+line like that is always false of something, and that is not what it is \
+asserting. Judge each sentence by what it asserts, not by its most literal \
+reading. Where the only thing wrong is that the image has been taken \
+literally, the kind is "figurative" and not "false".
+
 Do NOT report: anything you merely cannot verify but which is plausible; \
 simplifications that are fair for a general audience; approximations that are \
 roughly right; matters of style or emphasis.
@@ -1812,7 +2328,8 @@ For each finding return:
 - "sentence": the sentence at fault, copied EXACTLY from the script above.
 - "kind": "contradiction" if the script disagrees with itself, "false" if the \
 claim is wrong, "unsupported" if it is the sort of specific claim that would \
-need a source and you do not believe it.
+need a source and you do not believe it, "figurative" if it is an image or a \
+turn of phrase that is wrong only when read literally.
 - "problem": one sentence saying what is wrong. Name the other sentence if \
 this is a contradiction.
 
@@ -2017,7 +2534,9 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
 
         mode      what ran - "llm", "off", or "failed"
         findings  what the first check found
-        remaining what is still wrong after the repair, if one was bought
+        remaining what is still wrong with the script as it now stands
+        attempts  one entry per repair round bought - the rewrite it came
+                  back with, and what the re-check still found in that
         revised   whether the script was rewritten
         script    the script as it now stands
         blocked   whether what remains is bad enough to refuse
@@ -2028,6 +2547,7 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
     """
     setting = (mode or config.VERIFY_MODE or "off").strip().lower()
     report = {"mode": setting, "findings": [], "remaining": [],
+              "attempts": [],
               "revised": False, "script": script, "blocked": False,
               "checked": True,
               "warnings": []}
@@ -2085,12 +2605,27 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
             return report
 
         still = blocking_findings(rechecked["findings"])
+        # What each round actually came back with, kept round by round. The
+        # refusal message can only describe the script that ends up standing,
+        # which when nothing lands is the original - so without this the two
+        # rounds in between leave no trace anywhere, and the run log reports
+        # the fault the draft *started* with as though it were the fault that
+        # survived. Three fixes to this pass were argued from that log.
+        report["attempts"].append({"round": attempt + 1,
+                                   "script": repair["script"],
+                                   "remaining": still})
         if not still:
             report["script"] = repair["script"]
             report["revised"] = True
             report["remaining"] = []
             report["blocked"] = False
             return report
+
+        report["warnings"].append(
+            f"repair round {attempt + 1} of {rounds} left {len(still)} "
+            f"finding(s) standing: "
+            + "; ".join(f'"{f["sentence"]}" - {f["problem"]}' for f in still)
+        )
 
         if len(still) > len(faults):
             # Going backwards: the rewrite introduced more than it fixed.
@@ -2139,6 +2674,7 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
 def generate_script(topic: str, duration_seconds: int | None = None, *,
                     hooks: str | bool | None = None,
                     structure: str | bool | None = None,
+                    takeaway: str | bool | None = None,
                     verify: str | bool | None = None) -> dict:
     """Generate a TTS-ready narration script for `topic`.
 
@@ -2150,15 +2686,17 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
             a string forces a mode ("llm" or "off").
         structure: the structure pass, on the same three-way contract against
             config.STRUCTURE_MODE.
+        takeaway: the take-away pass, on the same three-way contract against
+            config.TAKEAWAY_MODE.
         verify: the claim check, on the same three-way contract against
             config.VERIFY_MODE.
 
     Returns:
         {"topic", "script", "estimated_duration", "hook_card", "hook",
-        "structure", "claims"} - where `hook`, `structure` and `claims` are the
-        reports of what those passes decided (each score and the parts it was
-        made of) and `hook_card` is the short on-screen form step 5 burns over
-        the opening.
+        "structure", "takeaway", "claims"} - where `hook`, `structure`,
+        `takeaway` and `claims` are the reports of what those passes decided
+        (each score and the parts it was made of) and `hook_card` is the short
+        on-screen form step 5 burns over the opening.
 
     Raises:
         ValueError: the topic is empty or the duration is out of range.
@@ -2166,7 +2704,7 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
             or the script asserted something the claim check would not pass and
             could not be repaired.
 
-    No pass ever raises from inside itself: all three are improvements on a
+    No pass ever raises from inside itself: all four are improvements on a
     script that already exists, so any failure within one leaves that script
     exactly as it was. The claim check is the one that can end the run, and it
     does so here rather than in the pass, on a report the pass returns.
@@ -2174,7 +2712,9 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
     They run in this order because the structure pass builds an ending that
     pays off whatever the script opens with, and the hook pass changes what it
     opens with. Reversed, the hook pass would swap the opening out from under
-    an ending written to close it.
+    an ending written to close it. The take-away pass follows the structure
+    pass for the mirror of that reason - it writes into the ending the
+    structure pass just built, and checks afterwards that it still stands.
     """
     if not topic or not topic.strip():
         raise ValueError("topic must be a non-empty string")
@@ -2207,25 +2747,68 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
     if shape["revised"]:
         script = shape["revised_script"]
 
+    # After the shape and not before it. Both passes rewrite the same closing
+    # sentences, and the order decides which one gets the last word on them:
+    # this way the hand-over is written into an ending that already pays the
+    # opening off, and `choose_takeaway` re-scores the shape afterwards to make
+    # sure it still does. Reversed, the structure pass would rewrite the
+    # hand-over away and nothing would be watching for it.
+    keep = choose_takeaway(topic.strip(), script, duration_seconds,
+                           mode=_mode(takeaway))
+    if keep["revised"]:
+        script = keep["revised_script"]
+
     # Last, because it is the only pass that reads the script for what it says
-    # rather than for how it is built, and the two above it rewrite the words.
-    # Checking before them would be checking a draft that no longer exists.
+    # rather than for how it is built, and the three above it rewrite the
+    # words. Checking before them would be checking a draft that no longer
+    # exists.
+    spoken_before_check = script
     claims = verify_claims(topic.strip(), script, mode=_mode(verify))
     script = claims["script"]
     if claims["blocked"]:
         raise ScriptGenerationError(
             "the script did not survive its fact-check: "
             + "; ".join(f'"{f["sentence"]}" - {f["problem"]}'
-                        for f in claims["remaining"])
+                        for f in claims["remaining"]),
+            script=script,
+            report=claims,
         )
+
+    # The card was cut from the opening the hook pass chose, and the claim
+    # check runs after that - so a claim the checker threw out of the narration
+    # was still being burned over the reel, the cover and the alt text. It ends
+    # up *more* prominent after the repair than before it, because the card is
+    # the most-read text in the reel and the line it contradicts is gone.
+    #
+    # Measured on run how-a-forest-talks-through-its-roots-531029b5: the
+    # checker called "a network more complex than your own brain" false and the
+    # repair rewrote the narration to "hides a vast, hidden network" - and the
+    # card, the cover headline and the alt text all still read "A network
+    # smarter than you".
+    #
+    # Re-cut from the repaired opening, and only when the opening actually
+    # moved: if sentence one came through the check untouched then the card is
+    # exactly as true as the sentence it was cut from, and re-cutting would
+    # throw away a card the model wrote for a mechanical one for nothing.
+    card = hook["card"]
+    if claims.get("revised"):
+        before, _ = split_first_sentence(spoken_before_check)
+        after, _ = split_first_sentence(script)
+        if after and not _same_opening(before, after):
+            card = hook_card_text(after)
+            claims.setdefault("warnings", []).append(
+                "the fact-check rewrote the opening, so the on-screen card was "
+                f"re-cut from it: {card!r}"
+            )
 
     return {
         "topic": topic.strip(),
         "script": script,
         "estimated_duration": estimate_duration(script),
-        "hook_card": hook["card"],
+        "hook_card": card,
         "hook": hook,
         "structure": shape,
+        "takeaway": keep,
         "claims": claims,
     }
 
@@ -2311,6 +2894,54 @@ def save_script(result: dict, output_path: str | Path | None = None) -> dict:
     return saved
 
 
+def save_refused_script(topic: str, script: str, report: dict) -> Path:
+    """Keep a draft the claim check refused, and the report that refused it.
+
+    A refusal is the one step-2 failure whose evidence is a whole script.
+    `generate_script` raises and the caller moves to the next candidate, so
+    until now the draft, both repair rounds and every finding the re-checks
+    made went out of memory at the moment they became interesting - leaving
+    the run log's one truncated line, which quotes the fault the draft
+    *started* with, as the only record. Every judgement about whether this
+    pass refuses too much has been made from that line.
+
+    Two files under `config.REFUSED_DIR`, named as `save_script` names its
+    own so the pair reads the same way:
+
+        <stem>.txt   the draft as it stood when it was refused
+        <stem>.json  topic, findings, remaining, and the round-by-round
+                     `attempts` - each rewrite and what the re-check found
+
+    Nothing downstream reads either: this directory is for a person deciding
+    what to change about the check, and step 4 never looks in it.
+
+    Args:
+        topic: what the refused draft was about.
+        script: the draft itself.
+        report: the `verify_claims` report that refused it.
+
+    Returns:
+        The path of the .json.
+
+    Raises:
+        OSError: the files could not be written.
+    """
+    config.REFUSED_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stem = _free_stem(config.REFUSED_DIR, f"{slugify(topic, 40)}-{stamp}")
+    destination = config.REFUSED_DIR / f"{stem}.txt"
+    sidecar = destination.with_suffix(".json")
+
+    destination.write_text((script or "") + "\n", encoding="utf-8")
+    sidecar.write_text(
+        json.dumps({"topic": topic, "refused_at": stamp,
+                    "script": script, "claims": report},
+                   indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return sidecar
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2334,6 +2965,12 @@ def _print_result(result: dict, target: int) -> None:
                    if shape.get("revised")
                    else f"{shape['score']:g} - left as written")
         print(f"SHAPE   : {verdict}")
+    keep = result.get("takeaway") or {}
+    if keep.get("mode") in ("llm", "failed"):
+        verdict = (f"rewritten, {keep['score']:g} -> {keep['revised_score']:g}"
+                   if keep.get("revised")
+                   else f"{keep['score']:g} - left as written")
+        print(f"KEEP    : {verdict}")
     if result.get("hook_card"):
         print(f"CARD    : {result['hook_card']}")
     if result.get("script_path"):
@@ -2366,7 +3003,22 @@ def _print_result(result: dict, target: int) -> None:
             print(f" {mark}{score:>6.2f}  {label}")
             print(f"         {detail}")
         print(rule)
-    for warning in list(hook.get("warnings", [])) + list(shape.get("warnings", [])):
+    if keep.get("mode") in ("llm", "failed"):
+        print("KEEP   (what the viewer is left holding - scored here)")
+        columns = (("as written", keep["score"], keep["components"]),)
+        if keep.get("revised_components"):
+            columns += (("rewritten", keep["revised_score"],
+                         keep["revised_components"]),)
+        for label, score, components in columns:
+            mark = "*" if (label == "rewritten") == bool(keep.get("revised")) else " "
+            detail = ", ".join(f"{name} {value:+g}"
+                               for name, value in components.items()) or "nothing fired"
+            print(f" {mark}{score:>6.2f}  {label}")
+            print(f"         {detail}")
+        print(rule)
+    for warning in (list(hook.get("warnings", []))
+                    + list(shape.get("warnings", []))
+                    + list(keep.get("warnings", []))):
         print(f"note: {warning}", file=sys.stderr)
     if result.get("script_path"):
         # The exact next command, so the path never has to be retyped.
@@ -2415,6 +3067,10 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the structure pass and keep the script's own shape",
     )
     parser.add_argument(
+        "--no-takeaway", action="store_true",
+        help="skip the take-away pass and keep whatever the script hands over",
+    )
+    parser.add_argument(
         "--no-verify", action="store_true",
         help="skip the claim check and publish whatever the script asserts",
     )
@@ -2426,6 +3082,7 @@ def main(argv: list[str] | None = None) -> int:
             args.topic, duration,
             hooks=False if args.no_hook else None,
             structure=False if args.no_structure else None,
+            takeaway=False if args.no_takeaway else None,
             verify=False if args.no_verify else None,
         )
         if not args.no_save:

@@ -1,1 +1,3 @@
 "Silent dreams" by zero-project (CC BY 3.0)
+bpm: 120
+beat_offset: 0.313

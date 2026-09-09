@@ -1,0 +1,55 @@
+# The suite is offline by construction: no key, no network, no ffmpeg. That is
+# what makes it worth running on every push rather than nightly - 1281 tests in
+# about twenty seconds, and a red tick before anyone pulls.
+#
+# Deliberately no secrets. Nothing here needs GEMINI_API_KEY or an Instagram
+# token, and adding them would change what the tests exercise: with a key in
+# .env the relevance screener defaults to "llm" and calls a real model, which
+# is why tests/test_visuals.py pins it offline in its own fixture.
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A second push supersedes the first: the older run is telling you about code
+  # nobody has any more.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Refuse a committed .env
+        # .gitignore covers it, and this is the check that notices the day
+        # somebody adds it with -f. A key in the history is a key to rotate.
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked by git - it holds the API keys"
+            exit 1
+          fi
+
+      - name: Tests
+        run: python -m pytest -q

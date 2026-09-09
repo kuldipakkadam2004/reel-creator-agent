@@ -2506,6 +2506,9 @@ class Track:
     duration: float = 0.0
     bpm: float = 0.0
     beat_offset: float = 0.0
+    #: Somebody measured this track and found no constant grid in it. Not the
+    #: same as bpm 0.0, which means nobody has looked.
+    beatless: bool = False
 
     @property
     def name(self) -> str:
@@ -2522,6 +2525,7 @@ class Track:
             "ducking": bool(config.MUSIC_DUCKING),
             "bpm": self.bpm,
             "beat_offset": self.beat_offset,
+            "beatless": self.beatless,
         }
 
 
@@ -2531,6 +2535,16 @@ class Track:
 _SIDECAR_META_RE = re.compile(
     r"^(bpm|beat_offset|offset) ?[:=] ?([0-9]+(?:[.][0-9]+)?)$", re.I
 )
+
+#: "bpm: none" - measured, and there is no constant grid in this track to snap
+#: to. Distinct from *no* bpm line, which means nobody has looked yet, and the
+#: distinction is the point: an ambient bed with no pulse cannot be fixed by
+#: writing a number, so the run should say the bed is beatless once rather than
+#: printing "add a bpm line" every day forever about a file that will never
+#: have one. Measured on assets/music/: fitting a constant grid to the tracked
+#: beats gives a residual of 7-14ms on the three beds that have a tempo and
+#: 39-2018ms on the two that do not, against 110ms for pure noise.
+_SIDECAR_BEATLESS_RE = re.compile(r"^(bpm|beat_offset|offset) ?[:=] ?none$", re.I)
 
 
 def _read_sidecar(path: Path) -> tuple[str, dict[str, float]]:
@@ -2559,6 +2573,13 @@ def _read_sidecar(path: Path) -> tuple[str, dict[str, float]]:
     for raw in text.splitlines():
         line = " ".join(raw.split())
         if not line:
+            continue
+        if _SIDECAR_BEATLESS_RE.match(line):
+            # Kept out of the credit for the same reason a number is, and
+            # recorded as a settings line rather than dropped: "somebody looked
+            # and there is no grid" is the answer to a question the run would
+            # otherwise ask again tomorrow.
+            meta["beatless"] = 1.0
             continue
         found = _SIDECAR_META_RE.match(line)
         if not found:
@@ -2589,6 +2610,7 @@ def _music_track(path: Path) -> Track:
         credit_required=bool(credit),
         bpm=meta.get("bpm", 0.0),
         beat_offset=meta.get("beat_offset", 0.0),
+        beatless=bool(meta.get("beatless")),
     )
 
 
@@ -2752,11 +2774,22 @@ def prepare_track(track: Track | None, warnings: list[str]) -> Track | None:
     # reel shipped so far reports 0 cuts on beat for exactly this reason: no
     # sidecar states a tempo and MUSIC_BPM is 0.
     if config.SHOT_SNAP_TO_BEAT and not track.bpm:
-        warnings.append(
-            f"cutting on the beat is on, but no tempo is known for "
-            f"{track.name!r} - add a \"bpm: <n>\" line to "
-            f"{Path(track.name).stem}.txt (or set MUSIC_BPM) to switch it on"
-        )
+        if track.beatless:
+            # A different sentence, because it is a different situation and
+            # only one of them is a thing to go and do. This bed was measured
+            # and has no constant grid; asking for a tempo line every day would
+            # be asking for a number that cannot be measured off the audio.
+            warnings.append(
+                f"cutting on the beat is on, and {track.name!r} is marked "
+                f"beatless - the cuts fall on the words instead"
+            )
+        else:
+            warnings.append(
+                f"cutting on the beat is on, but no tempo is known for "
+                f"{track.name!r} - add a \"bpm: <n>\" line to "
+                f"{Path(track.name).stem}.txt (or \"bpm: none\" if it has no "
+                f"pulse, or set MUSIC_BPM) to switch it on"
+            )
     return track
 
 

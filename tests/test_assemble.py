@@ -1411,6 +1411,59 @@ def test_the_settings_syntax_is_forgiving_about_spacing(music_dir):
     assert track.credit == "Someone"
 
 
+def test_a_track_can_say_it_has_no_pulse_at_all(music_dir):
+    """"bpm: none" is measured; no bpm line at all is nobody having looked.
+
+    Two of the five beds in assets/music/ have no constant grid in them - a
+    line fit to their tracked beats leaves 39-2018ms of residual against
+    7-14ms for the three that do, and 110ms for pure noise. No number can fix
+    that, so the sidecar says so and the run stops asking.
+    """
+    track_file(music_dir, "a.mp3",
+               credit='"Plathe (Beatless Ambient Mix)" by POA (CC BY 3.0)\n'
+                      "bpm: none\n")
+    track = assemble.available_tracks()[0]
+
+    assert track.beatless is True
+    assert track.bpm == 0.0
+    assert track.credit == '"Plathe (Beatless Ambient Mix)" by POA (CC BY 3.0)'
+    assert "bpm" not in track.credit.lower()
+
+
+def test_a_beatless_track_is_not_asked_for_a_tempo_every_run(music_dir,
+                                                             monkeypatch):
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_BEAT", True)
+    monkeypatch.setattr(config, "MUSIC_BPM", 0.0)
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 90.0)
+    track_file(music_dir, "a.mp3", credit="Someone\nbpm: none\n")
+
+    warnings: list[str] = []
+    track = assemble.prepare_track(assemble.available_tracks()[0], warnings)
+
+    assert track.bpm == 0.0
+    assert any("beatless" in warning for warning in warnings)
+    assert not any("add a" in warning for warning in warnings)
+
+
+def test_a_track_nobody_has_measured_is_still_asked_for_a_tempo(music_dir,
+                                                                monkeypatch):
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_BEAT", True)
+    monkeypatch.setattr(config, "MUSIC_BPM", 0.0)
+    monkeypatch.setattr(assemble, "probe_audio", lambda path: 90.0)
+    track_file(music_dir, "a.mp3", credit="Someone")
+
+    warnings: list[str] = []
+    assemble.prepare_track(assemble.available_tracks()[0], warnings)
+
+    assert any("no tempo is known" in warning for warning in warnings)
+
+
+def test_a_beatless_track_snaps_nothing(music_dir):
+    track = assemble.Track(path=Path("a.mp3"), beatless=True)
+
+    assert assemble.beat_grid(track, 6.0) == []
+
+
 def test_the_grid_runs_from_the_reels_first_frame():
     """The bed is fed in with -stream_loop and trimmed from 0, so the track's
     first sample is the reel's first frame and beat one is t=0."""

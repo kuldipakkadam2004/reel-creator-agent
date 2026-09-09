@@ -6,8 +6,14 @@ became and read its insights. It cannot publish, and it is not asked to.
 
     PERFORMANCE_PROVIDER=pipeline.instagram.fetch
 
-Four things about it are worth knowing before you rely on it:
+Five things about it are worth knowing before you rely on it:
 
+* **there are two Instagram APIs and the tokens do not cross.** A token minted
+  through Instagram Login (they all begin `IG`) is parseable only by
+  graph.instagram.com, one from the Facebook Login flow (`EAA...`) only by
+  graph.facebook.com, and the wrong host answers "Cannot parse access token" -
+  which reads exactly like a token that has lapsed and is nothing of the kind.
+  So the host follows the token, and `INSTAGRAM_API_HOST` overrules it;
 * **it reads your own account and nothing else.** The Graph API's media node
   only answers for the account the token belongs to. There is no path here to
   anyone else's numbers, and none is wanted;
@@ -15,7 +21,9 @@ Four things about it are worth knowing before you rely on it:
   `cd1bccae`. What it has is a caption, and step 6 wrote that caption - so the
   first line of `post.txt` is the join key, and the timestamp is the tie-break.
   Neither is certain, so a match is always reported with how it was made and
-  can be overruled by hand with `--pin`;
+  can be overruled by hand with `--pin`. All the waiting reels are matched at
+  once and a post is one reel: the reels that were never posted would otherwise
+  each take a copy of the numbers of the one that was;
 * **the metric names churn.** `plays` became `views`, the reels-specific
   metrics have been consolidated more than once, and which ones a media node
   answers for depends on its type and on the API version. So the request is
@@ -44,6 +52,7 @@ Standalone use:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -86,8 +95,26 @@ class InstagramAuthError(InstagramError):
     """The token is missing, expired, or not entitled to what was asked."""
 
 
+#: Meta runs two Instagram APIs and the tokens are not interchangeable. A token
+#: minted through **Instagram Login** (they all begin "IG") is parseable only by
+#: graph.instagram.com; one from the **Facebook Login** flow ("EAA...") only by
+#: graph.facebook.com. The wrong host answers "Cannot parse access token",
+#: which reads like a token that has lapsed and is nothing of the kind - so the
+#: host follows the token unless INSTAGRAM_API_HOST overrules it.
+INSTAGRAM_LOGIN_HOST = "https://graph.instagram.com"
+FACEBOOK_LOGIN_HOST = "https://graph.facebook.com"
+
+
+def _host() -> str:
+    configured = (config.INSTAGRAM_API_HOST or "").strip().rstrip("/")
+    if configured:
+        return configured if "//" in configured else f"https://{configured}"
+    token = (config.INSTAGRAM_ACCESS_TOKEN or "").strip()
+    return INSTAGRAM_LOGIN_HOST if token.startswith("IG") else FACEBOOK_LOGIN_HOST
+
+
 def _base() -> str:
-    return f"https://graph.facebook.com/{config.INSTAGRAM_API_VERSION}"
+    return f"{_host()}/{config.INSTAGRAM_API_VERSION}"
 
 
 def _session():
@@ -186,6 +213,32 @@ def media(session=None, *, limit: int | None = None) -> list[dict]:
     return [item for item in (body.get("data") or []) if isinstance(item, dict)]
 
 
+def _refused(message: str, wanted: list[str]) -> list[str]:
+    """Which of the metrics asked for this API version would not answer.
+
+    Meta says this two ways round. Sometimes it names the offender - "(#100)
+    ig_reels_avg_watch_time is not valid for this media product type" - and the
+    refused metric is the one the message mentions. Sometimes it names every
+    metric it *would* have taken - "metric[1] must be one of the following
+    values: impressions, shares, ..." - and then reading the message for names
+    it mentions is exactly backwards: it would drop the seven good metrics and
+    keep the one bad one. So the enumerated form is detected and inverted.
+
+    Inverting also prunes faster than Meta complains. It reports one offending
+    index per call, and the whole valid list is enough to drop all of them at
+    once instead of a round trip each.
+    """
+    allowed = re.search(r"must be one of the following values:\s*(.+)",
+                        message, re.IGNORECASE | re.DOTALL)
+    if allowed:
+        names = {name.strip(" .'\"") for name
+                 in re.split(r"[,\s]+", allowed.group(1))}
+        names.discard("")
+        if names:
+            return [name for name in wanted if name not in names]
+    return [name for name in wanted if name in message]
+
+
 def _insights(session, media_id: str) -> tuple[dict, list[str]]:
     """Insights for one post, with refused metrics dropped rather than fatal.
 
@@ -205,7 +258,7 @@ def _insights(session, media_id: str) -> tuple[dict, list[str]]:
         except InstagramAuthError:
             raise
         except InstagramError as exc:
-            refused = [name for name in wanted if name in str(exc)]
+            refused = _refused(str(exc), wanted)
             if not refused:
                 # Nothing identifiable in the message: fall back to the metrics
                 # that have survived every version of this API, once.
@@ -272,51 +325,151 @@ def _normalise(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+NO_MATCH = {"media_id": "", "how": "", "permalink": "", "posted_at": ""}
+
+
+def _found(post: dict, how: str) -> dict:
+    return {"media_id": post.get("id") or "", "how": how,
+            "permalink": post.get("permalink") or "",
+            "posted_at": post.get("timestamp") or ""}
+
+
+def _caption_hit(features: dict, post: dict) -> bool:
+    """Whether this post opens with the words step 6 wrote for this reel."""
+    hook = _normalise(caption_of(features))
+    if not hook:
+        return False
+    caption = _normalise(post.get("caption") or "")
+    return bool(caption) and (caption.startswith(hook) or hook in caption)
+
+
+def _gap(features: dict, post: dict):
+    """How long after the reel was made this post went up, or None.
+
+    None for a post outside INSTAGRAM_MATCH_HOURS and for one that predates the
+    reel - a reel is posted after it is made, never before, so a post older
+    than the reel is some other post that happens to be nearby.
+    """
+    made = perform._parse_stamp(features.get("created_at"))
+    when = perform._parse_stamp(post.get("timestamp"))
+    if not made or not when or when < made:
+        return None
+    gap = when - made
+    window = timedelta(hours=max(1, config.INSTAGRAM_MATCH_HOURS))
+    return gap if gap <= window else None
+
+
+def _distance(features: dict, post: dict):
+    """Absolute time between a reel and a post, for ranking caption matches."""
+    made = perform._parse_stamp(features.get("created_at"))
+    when = perform._parse_stamp(post.get("timestamp"))
+    if not made or not when:
+        return timedelta.max
+    return abs(when - made)
+
+
 def match(features: dict, posts: list[dict]) -> dict:
     """Which post this reel became, and how sure that is.
 
-    Returns {"media_id", "how", "permalink"} - `how` being "caption" for a
-    match on the words step 6 wrote, "timestamp" for the nearest post inside
-    INSTAGRAM_MATCH_HOURS, or "" for no match at all. The how is carried
-    through to the ledger because "we guessed by time" and "the caption is
-    identical" are not the same claim and should not be recorded as one.
+    Returns {"media_id", "how", "permalink", "posted_at"} - `how` being
+    "caption" for a match on the words step 6 wrote, "timestamp" for the
+    nearest post inside INSTAGRAM_MATCH_HOURS, or "" for no match at all. The
+    how is carried through to the ledger because "we guessed by time" and "the
+    caption is identical" are not the same claim and should not be recorded as
+    one.
+
+    This answers for one reel in isolation. `assign` is what `fetch` uses, and
+    is the one to reach for whenever there is more than one reel in play.
     """
-    hook = _normalise(caption_of(features))
-    if hook:
-        for post in posts:
-            caption = _normalise(post.get("caption") or "")
-            if caption and (caption.startswith(hook) or hook in caption):
-                return {"media_id": post.get("id") or "", "how": "caption",
-                        "permalink": post.get("permalink") or ""}
-
-    made = perform._parse_stamp(features.get("created_at"))
-    if not made:
-        return {"media_id": "", "how": "", "permalink": ""}
-
-    window = timedelta(hours=max(1, config.INSTAGRAM_MATCH_HOURS))
-    best, best_gap = None, window
     for post in posts:
-        # A reel is posted after it is made, never before, and a post that
-        # predates the reel is some other post that happens to be nearby.
-        when = perform._parse_stamp(post.get("timestamp"))
-        if not when or when < made:
+        if _caption_hit(features, post):
+            return _found(post, "caption")
+
+    best, best_gap = None, None
+    for post in posts:
+        gap = _gap(features, post)
+        if gap is None:
             continue
-        gap = when - made
-        if gap <= best_gap:
+        if best_gap is None or gap <= best_gap:
             best, best_gap = post, gap
-    if best is None:
-        return {"media_id": "", "how": "", "permalink": ""}
-    return {"media_id": best.get("id") or "", "how": "timestamp",
-            "permalink": best.get("permalink") or ""}
+    return _found(best, "timestamp") if best is not None else dict(NO_MATCH)
+
+
+def assign(features_by_run: dict, posts: list[dict],
+           pinned: dict | None = None) -> dict:
+    """Match every waiting reel at once, letting no post be claimed twice.
+
+    `match` cannot see the other reels, which is right when a caption settles
+    it and badly wrong when nothing does: the nearest later post is the nearest
+    later post for *every* reel made that week, so the reels that were never
+    posted all end up wearing the numbers of the one that was. Measured on this
+    account the day the provider was first switched on: 7 posts, 7 exact
+    caption matches, and 5 further reels handed a copy of somebody else's
+    numbers by the fallback.
+
+    A post is one reel. So pins are honoured first, then the captions - which
+    are evidence rather than a guess - and the timestamp fallback is left to
+    divide up whatever is still unclaimed, closest gap first and one reel each.
+    """
+    claimed: dict[str, str] = {}
+    out: dict[str, dict] = {}
+
+    for run_id, media_id in (pinned or {}).items():
+        if not media_id or run_id not in features_by_run:
+            continue
+        post = next((p for p in posts if (p.get("id") or "") == media_id), None)
+        out[run_id] = (_found(post, "pinned") if post else
+                       {**NO_MATCH, "media_id": media_id, "how": "pinned"})
+        claimed[media_id] = run_id
+
+    # Two runs of the same topic write near-identical first lines, so even a
+    # caption can collide. The reel made nearest the post is the one posted.
+    hits = [(run_id, post) for run_id, features in features_by_run.items()
+            if run_id not in out
+            for post in posts if _caption_hit(features, post)]
+    hits.sort(key=lambda pair: _distance(features_by_run[pair[0]], pair[1]))
+    for run_id, post in hits:
+        media_id = post.get("id") or ""
+        if run_id in out or media_id in claimed:
+            continue
+        out[run_id] = _found(post, "caption")
+        claimed[media_id] = run_id
+
+    guesses = []
+    for run_id, features in features_by_run.items():
+        if run_id in out:
+            continue
+        for post in posts:
+            gap = _gap(features, post)
+            if gap is not None:
+                guesses.append((gap, run_id, post))
+    guesses.sort(key=lambda triple: (triple[0], triple[1]))
+    for _, run_id, post in guesses:
+        media_id = post.get("id") or ""
+        if run_id in out or media_id in claimed:
+            continue
+        out[run_id] = _found(post, "timestamp")
+        claimed[media_id] = run_id
+
+    return {run_id: out.get(run_id) or dict(NO_MATCH)
+            for run_id in features_by_run}
 
 
 def derive_watch_through(metrics: dict, features: dict) -> dict:
-    """Turn an average watch time into the fraction of the reel watched.
+    """Turn an average watch time into how much of the reel that was.
 
     Instagram reports milliseconds watched; step 9 ranks on what share of the
     reel that was. The reel's own length is in its features row, so the
     conversion is division - and it is done here rather than in the ledger
     because it is this provider's unit problem, not step 9's.
+
+    Two numbers come out of the one division, because the division does not
+    stay under 1.0. Instagram's average watch time counts replays: the first
+    reel read through this provider reported 89.5 seconds of average watch time
+    on a 37.59-second reel, which is a real reading of a looped reel and not a
+    bad one. `watch_through` is a *share of the reel* and so is capped, which
+    made that the best score in the ledger; `watch_ratio` is the same division
+    left alone, and is what the report ranks on. Below the cap they are equal.
     """
     out = dict(metrics)
     millis = out.pop("avg_watch_seconds", None)
@@ -327,7 +480,9 @@ def derive_watch_through(metrics: dict, features: dict) -> dict:
 
     length = features.get("spoken_seconds")
     if length and float(length) > 0:
-        out["watch_through"] = round(min(1.0, seconds / float(length)), 4)
+        ratio = seconds / float(length)
+        out["watch_ratio"] = round(ratio, 4)
+        out["watch_through"] = round(min(1.0, ratio), 4)
     return out
 
 
@@ -351,14 +506,15 @@ def fetch(run_ids, features_by_run: dict) -> dict:
     ledger = perform.PerformanceLedger()
     out: dict[str, dict] = {}
 
-    for run_id in run_ids:
-        features = features_by_run.get(run_id) or {}
-        entry = ledger.entry(run_id)
+    features_by_run = {run_id: features_by_run.get(run_id) or {}
+                       for run_id in run_ids}
+    pinned = {run_id: ledger.entry(run_id).get("media_id") or ""
+              for run_id in run_ids}
+    found_by_run = assign(features_by_run, posts, pinned)
 
-        pinned = entry.get("media_id") or ""
-        found = ({"media_id": pinned, "how": "pinned",
-                  "permalink": entry.get("permalink") or ""} if pinned
-                 else match(features, posts))
+    for run_id in run_ids:
+        features = features_by_run[run_id]
+        found = found_by_run.get(run_id) or dict(NO_MATCH)
         if not found["media_id"]:
             continue
 
@@ -385,7 +541,18 @@ def fetch(run_ids, features_by_run: dict) -> dict:
         record = ledger.reels.setdefault(run_id, {"run_id": run_id})
         record["media_id"] = found["media_id"]
         record["permalink"] = found["permalink"]
-        record["matched_by"] = found["how"]
+        # On a re-read the media id comes from the ledger, so `assign` reports
+        # it as pinned whatever settled it the first time. Keep what did: a
+        # timestamp match is a guess, and quietly promoting it to "pinned" on
+        # the second fetch would hide the one row worth checking. A hand pin
+        # is written by `pin` and survives because nothing overwrites it.
+        if found["how"] != "pinned" or not record.get("matched_by"):
+            record["matched_by"] = found["how"]
+        # When the post went up, which is not when the reel was made - step 9
+        # assumes the latter when nobody says otherwise, and the age of a
+        # measurement is what decides whether two of them compare.
+        if found["posted_at"]:
+            record["posted_at"] = found["posted_at"]
         out[run_id] = metrics
 
     ledger.save()
@@ -459,16 +626,23 @@ def _print_media(limit: int) -> int:
 
 def _print_fetch() -> int:
     ledger = perform.PerformanceLedger()
-    waiting = ledger.pending()
+    # Not just the reels with no numbers: a posted reel is re-read until its
+    # reading has settled, because a number taken the same evening is a number
+    # taken while the reel was still being shown.
+    waiting = ledger.unsettled()
     if not waiting:
-        print("nothing is waiting for numbers.")
+        print("nothing is waiting for numbers, and nothing read recently "
+              "enough to be worth reading again.")
         return 0
+    again = sum(1 for row in waiting if row.get("status") == "posted")
 
     recorded, warnings = perform.fetch(ledger=ledger, provider=fetch)
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
-    print(f"recorded {recorded} of {len(waiting)} waiting reel(s).")
+    print(f"recorded {recorded} of {len(waiting)} reel(s)"
+          + (f" - {again} of them re-read, their numbers not yet "
+             f"{config.PERFORMANCE_SETTLE_HOURS}h old." if again else "."))
     guessed = [run_id for run_id, entry in ledger.reels.items()
                if entry.get("matched_by") == "timestamp"]
     if guessed:
@@ -480,7 +654,8 @@ def _print_fetch() -> int:
     if unmatched > 0:
         print(f"\n{unmatched} could not be matched to a post. If they were "
               f"never posted, say so - it is the more useful record:")
-        print(f"  python pipeline/perform.py <run> --skipped \"why\"")
+        print(f"  python pipeline/perform.py <run> --skipped "
+              + "|".join(list(perform.SKIP_REASONS)[:4]) + "|...")
     return 0
 
 

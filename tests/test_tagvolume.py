@@ -273,5 +273,162 @@ def test_no_provider_configured_means_no_provider():
     assert tagvolume.load_provider("") is None
 
 
+# ---------------------------------------------------------------------------
+# Writing a count down
+#
+# The cache was reachable only by hand-authoring its JSON, which is why it did
+# not exist and every band in every post was an estimate. These cover the path
+# that makes it reachable, and the one thing that matters about it: a seeded
+# figure outranks the estimator and no TTL ever takes it back.
+# ---------------------------------------------------------------------------
+
+def test_a_count_is_read_the_way_instagram_prints_it():
+    assert tagvolume.read_count("4.2M") == 4_200_000
+    assert tagvolume.read_count("430K") == 430_000
+    assert tagvolume.read_count("9,500") == 9_500
+    assert tagvolume.read_count("12000") == 12_000
+    # what you get if the whole label is pasted in rather than retyped
+    assert tagvolume.read_count("1.2M posts") == 1_200_000
+
+
+@pytest.mark.parametrize("raw", ["", "lots", "-5", "4.2Q"])
+def test_a_count_that_is_not_a_count_is_refused(raw):
+    # Better a refusal than a zero: a tag seeded at 0 reads as dead for ever.
+    with pytest.raises(tagvolume.VolumeError):
+        tagvolume.read_count(raw)
+
+
+def test_a_seeded_entry_carries_no_timestamp(tmp_path):
+    path = tmp_path / "vol.json"
+    cache = tagvolume.VolumeCache(path)
+    cache.seed("MarineBiology", 4_200_000)
+    assert cache.save() == []
+
+    entry = json.loads(path.read_text(encoding="utf-8"))["tags"]["marinebiology"]
+    assert entry == {"count": 4_200_000, "source": "measured"}
+    assert "at" not in entry             # a TTL must never reach this
+
+
+def test_a_seeded_count_moves_the_tag_into_the_band_it_belongs_in(tmp_path):
+    # The estimator prices a tag by how ordinary its words are, so a common
+    # term of art reads far smaller than it is: #MarineBiology estimates into
+    # the low hundreds of thousands, which is the one band a small account is
+    # told it can rank in. This is what seeding is for.
+    cache = tagvolume.VolumeCache(tmp_path / "vol.json")
+    before, _ = tagvolume.lookup(["MarineBiology"], cache=cache)
+    assert before["MarineBiology"].source == "estimate"
+
+    cache.seed("MarineBiology", 4_200_000)
+    after, _ = tagvolume.lookup(["MarineBiology"], cache=cache)
+
+    assert after["MarineBiology"].source == "measured"
+    assert after["MarineBiology"].band != before["MarineBiology"].band
+
+
+def test_the_set_flag_writes_counts_and_leaves_everything_else_estimated(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TAG_VOLUME_FILE", tmp_path / "vol.json")
+
+    assert tagvolume.main(["--set", "marinebiology=4.2M", "#trees=9,500"]) == 0
+
+    volumes, _ = tagvolume.lookup(["marinebiology", "trees", "botany"])
+    assert volumes["marinebiology"].count == 4_200_000
+    assert volumes["trees"].count == 9_500          # the leading # is not part
+    assert volumes["botany"].source == "estimate"   # untouched, still a guess
+
+
+@pytest.mark.parametrize("pair", ["marinebiology", "=42", "marinebiology=lots"])
+def test_a_malformed_pair_writes_nothing_at_all(pair, tmp_path, monkeypatch):
+    # Half a seeding run is worse than none: the operator would have no way of
+    # knowing which of the tags they typed had landed.
+    path = tmp_path / "vol.json"
+    monkeypatch.setattr(config, "TAG_VOLUME_FILE", path)
+
+    assert tagvolume.main(["--set", pair]) == 2
+    assert not path.exists()
+
+    # and the same when a good pair precedes the bad one - the cache is saved
+    # once, after every pair has parsed, so a run either lands or it does not
+    assert tagvolume.main(["--set", "oceanlife=430K", pair]) == 2
+    assert not path.exists()
+
+
+def test_the_bare_usage_line_mentions_both_modes(capsys):
+    assert tagvolume.main([]) == 2
+    printed = capsys.readouterr().err
+    assert "--set" in printed and "<tag> [tag ...]" in printed
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# The seeding worklist
+# ---------------------------------------------------------------------------
+
+def _post(directory: Path, day: str, run: str, *, tags=(), rejected=()) -> None:
+    run_dir = directory / day / run
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "post.json").write_text(json.dumps({
+        "hashtags": ["#" + t for t in tags],
+        "hashtag_rejected": [{"tag": t, "reason": "below the volume floor",
+                              "count": n, "source": "estimate"}
+                             for t, n in rejected],
+    }), encoding="utf-8")
+
+
+@pytest.fixture()
+def output_tree(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(config, "TAG_VOLUME_FILE", tmp_path / "volumes.json")
+    (tmp_path / "out").mkdir()
+    return tmp_path / "out"
+
+
+def test_the_worklist_ranks_what_was_thrown_out_first(output_tree):
+    """Following "seed real counts" used to mean knowing which tags to seed."""
+    _post(output_tree, "2026-09-08", "a", tags=("ecology", "planetearth"),
+          rejected=(("mycorrhiza", 900), ("suzannesimard", 120)))
+    _post(output_tree, "2026-09-09", "b", tags=("ecology",),
+          rejected=(("mycorrhiza", 900),))
+
+    rows, total = tagvolume.worklist()
+
+    assert total == 4      # ecology is one tag, used twice
+    assert rows[0]["tag"] == "mycorrhiza"
+    assert rows[0]["rejected"] == 2
+    assert rows[0]["count"] == 900
+    # Then whatever the account leans on most.
+    assert [r["tag"] for r in rows[2:]] == ["ecology", "planetearth"]
+    assert rows[2]["used"] == 2
+
+
+def test_a_tag_already_seeded_by_hand_is_off_the_worklist(output_tree):
+    _post(output_tree, "2026-09-08", "a", tags=("ecology", "planetearth"))
+    cache = tagvolume.VolumeCache()
+    cache.seed("ecology", 4_200_000)
+    cache.save()
+
+    rows, total = tagvolume.worklist()
+
+    assert total == 2
+    assert [r["tag"] for r in rows] == ["planetearth"]
+
+
+def test_a_banned_tag_is_not_something_to_go_and_measure(output_tree):
+    run_dir = output_tree / "2026-09-08" / "a"
+    run_dir.mkdir(parents=True)
+    (run_dir / "post.json").write_text(json.dumps({
+        "hashtags": ["#ecology"],
+        "hashtag_rejected": [{"tag": "sponsored", "reason": "banned"}],
+    }), encoding="utf-8")
+
+    rows, _ = tagvolume.worklist()
+
+    assert [r["tag"] for r in rows] == ["ecology"]
+
+
+def test_the_worklist_says_so_when_there_is_nothing_to_read(output_tree, capsys):
+    assert tagvolume.print_worklist() == 0
+    assert "make a reel first" in capsys.readouterr().out

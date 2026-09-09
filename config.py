@@ -65,6 +65,14 @@ CAPTIONS_DIR = OUTPUT_DIR / "captions"
 #: like it.
 LOGS_DIR = OUTPUT_DIR / "logs"
 
+#: Drafts the claim check refused, and the report that refused them. A refused
+#: script is the only artefact of a failed run that cannot be reconstructed -
+#: step 2 raises and the caller drops it - and three separate attempts to fix
+#: step 2's refusal rate were argued from the run log alone, which quotes the
+#: finding the draft *started* with and never what the repairs came back with.
+#: Kept here so the fourth attempt can read the evidence instead of the log.
+REFUSED_DIR = SCRIPTS_DIR / "refused"
+
 _MANAGED_DIRS = (
     ASSETS_DIR,
     VISUALS_DIR,
@@ -75,6 +83,7 @@ _MANAGED_DIRS = (
     SFX_DIR,
     OUTPUT_DIR,
     SCRIPTS_DIR,
+    REFUSED_DIR,
     AUDIO_DIR,
     TOPICS_DIR,
     VIDEO_DIR,
@@ -395,6 +404,19 @@ TOPIC_HISTORY_RUNS = get_env_int("TOPIC_HISTORY_RUNS", 20)
 #: Cross-run ledger backing the setting above.
 TOPIC_USAGE_FILE = TOPICS_DIR / "usage.json"
 
+#: Refusals a topic is allowed before the board stops offering it. A script the
+#: fact-check refuses costs a ~150s Pro call and produces nothing, and until
+#: this existed the board had no memory of it at all: "what the sound of the
+#: deep ocean actually is" was chosen and refused five times over 26 boards.
+#:
+#: Two rather than one, because a refusal is evidence about a *draft* as much
+#: as about the topic - that same line passed on the sixth attempt, and the
+#: repair rounds it goes through now did not exist for the first four. The
+#: first refusal is priced (topics.REFUSED_PENALTY) rather than banned; the
+#: second ends it. 0 turns the whole thing off and refusals stop being
+#: recorded.
+TOPIC_MAX_REFUSALS = get_env_int("TOPIC_MAX_REFUSALS", 2)
+
 #: The evergreen backlog: on-niche topics written by hand, read by the
 #: `evergreen` source as the floor under a thin board.
 #:
@@ -557,6 +579,43 @@ STRUCTURE_MODE = get_env("STRUCTURE_MODE", "llm")
 #: ceiling, where every component fires) to spend a call on nearly every reel;
 #: drop it below 0 to keep the scoring as a report and never act on it.
 STRUCTURE_MIN_SCORE = get_env_float("STRUCTURE_MIN_SCORE", 2.0)
+
+# --- what the viewer keeps --------------------------------------------------
+# The three passes above buy attention: the hook wins the first second, the
+# shape holds the next thirty, the claim check keeps them honest. None of them
+# asks what the viewer is left holding when it ends, and the account says that
+# is where it fails — across the 7 reels posted to 2026-09-08 every one has 0
+# saves and 0 shares, with watch-through between 0.38 and 0.68. Retention is
+# not the problem. Nothing is worth keeping.
+#
+# Measured over the 29 scripts in output/scripts/ on 2026-09-09: 1 of 29 ever
+# tells the viewer where they will meet the thing themselves, 3 of 29 give the
+# phenomenon a name they could repeat, and 23 of 29 do neither and score
+# nothing. The endings are good writing and land nothing transferable: "It's
+# the tilt.", "The ocean has no drain.", "The green just got out of the way."
+#
+# That 1-in-29 is the same shape as the hook pass's second-person finding: a
+# virtue the scorer would pay for and the prompt never asked for. So this ships
+# as both — PROMPT_TEMPLATE asks for a take-away, and this pass checks, because
+# asking is not checking.
+
+#: llm - the script is scored for what it hands the viewer, and one that hands
+#:       them nothing buys exactly one rewrite of its body
+#: off - score it and report, act on nothing
+TAKEAWAY_MODE = get_env("TAKEAWAY_MODE", "llm")
+
+#: The score at or above which no rewrite is bought. Set at the weight of the
+#: transfer line alone (2.0), so one sentence putting the viewer in front of
+#: the thing clears it outright, and so does a name plus the viewer in the
+#: close (1.2 + 0.8). Anything less buys the rewrite.
+#:
+#: On the corpus this threshold was set against, 28 of the 29 scripts would buy
+#: a call — only the noise-cancelling reel clears it, at 2.8. That is not the
+#: threshold being wrong, it is the measurement above: they were written to a
+#: prompt that never asked for a take-away. Judge the firing rate on scripts
+#: written after this shipped, not before it, and if it is still near 100% then
+#: the prompt is being ignored and that is the thing to fix — not this number.
+TAKEAWAY_MIN_SCORE = get_env_float("TAKEAWAY_MIN_SCORE", 2.0)
 
 # --- the claims -------------------------------------------------------------
 # The two passes above ask whether the script is shaped like a reel. Neither
@@ -1561,6 +1620,22 @@ REQUIRED_TELEGRAM = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
 #: real one. `--force` overrides it for a deliberate second reel.
 RUN_ONCE_PER_DAY = get_env_bool("RUN_ONCE_PER_DAY", True)
 
+#: Read the numbers on the reels already out there at the start of every run.
+#:
+#: Step 9 can only compare readings taken between PERFORMANCE_MIN_AGE_HOURS and
+#: 48h after posting, and `--fetch` was run by hand. Read off the ledger on
+#: 2026-09-09: of the 7 posted reels, 5 had been read only past 48h and 1 only
+#: at 5.6h - so 6 of 7 sat outside the window they had to be inside, and the
+#: 5.6h reading gave the worst reel in the ledger a watch_ratio of 2.38, the
+#: highest score in it. That is not a fetch anyone forgot to run: a 24-hour
+#: window per reel cannot be hit by hand on any schedule a person keeps.
+#:
+#: A job that fires once every 24 hours lands inside any 24-hour span, so one
+#: daily read guarantees every reel is asked about at least once while its
+#: answer still counts. That is the whole argument for doing it here - step 8
+#: is already the thing the scheduler runs every day.
+RUN_FETCH_INSIGHTS = get_env_bool("RUN_FETCH_INSIGHTS", True)
+
 #: How many topics off the board a single run may try before giving up on the
 #: day. The second attempt exists for one failure in particular: step 4 coming
 #: back with no footage, which does not mean the pipeline is broken - it means
@@ -1609,12 +1684,26 @@ REQUIRED_RUN = REQUIRED_SCRIPT_GEN + REQUIRED_TTS
 #: alone, so pruning a run directory does not cost you its history.
 PERFORMANCE_FILE = OUTPUT_DIR / "performance.json"
 
-#: The number a reel is judged on. Watch-through is the default because it is
-#: the one metric that does not simply climb with the follower count: an
-#: account that doubles its reach doubles every reel's views whatever was in
-#: them, and a ledger ranking on views would spend a year discovering that
-#: later reels do better than earlier ones.
-PERFORMANCE_METRIC = get_env("PERFORMANCE_METRIC", "watch_through")
+#: The number a reel is judged on. Watch time is the default because it is the
+#: one metric that does not simply climb with the follower count: an account
+#: that doubles its reach doubles every reel's views whatever was in them, and
+#: a ledger ranking on views would spend a year discovering that later reels do
+#: better than earlier ones.
+#:
+#: `watch_ratio` rather than `watch_through`, and the difference is the whole
+#: reason this default moved. Instagram's average watch time counts replays, so
+#: a looped reel reports more watch time than it has reel - 89.5s of watching
+#: on a 37.6s reel, measured. `watch_through` is a share of the reel and is
+#: therefore capped at 1.0, which turned that into a perfect score for the
+#: worst-performing reel in the ledger; `watch_ratio` is the same division left
+#: uncapped, so 2.38 stays 2.38 and the ranking keeps working above the cap.
+#: Below 1.0 they are the same number. Both are stored on every reel.
+#: Never `saves` or `shares`, however much they are the metrics that matter:
+#: `ratios` divides by the median of the nearest reels and `local_baseline`
+#: refuses a median of zero, so a metric that is zero on most reels reads as an
+#: empty table rather than as an answer. `was_kept` reads those two as a rate
+#: instead, in the report's SAVED OR SENT table.
+PERFORMANCE_METRIC = get_env("PERFORMANCE_METRIC", "watch_ratio")
 
 #: How many reels either side of one being scored make up its baseline. Every
 #: figure in the report is a ratio to the median of a reel's own neighbours in
@@ -1635,6 +1724,24 @@ PERFORMANCE_MIN_SAMPLES = get_env_int("PERFORMANCE_MIN_SAMPLES", 8)
 #: measurement, and averaging them measures when you happened to look. 0 turns
 #: the window off and compares everything.
 PERFORMANCE_WINDOW_HOURS = get_env_int("PERFORMANCE_WINDOW_HOURS", 48)
+
+#: The other end of that window, and the one that was missing. A reel read six
+#: hours after it went out has not finished happening: measured live, the first
+#: reel to be read this way entered the ledger at three views and would have
+#: been scored against reels read a day later as though its hook had failed.
+#: A reading younger than this is kept and shown, and is not compared with
+#: anything. 0 compares everything, however green.
+PERFORMANCE_MIN_AGE_HOURS = get_env_int("PERFORMANCE_MIN_AGE_HOURS", 24)
+
+#: How old a *reading* has to be before the provider stops re-reading the reel.
+#: Numbers were taken once and never again, so whatever the reel happened to
+#: have at the moment somebody ran --fetch is what it was judged on forever.
+#: Under this age a posted reel is asked about again and the newer answer wins;
+#: the older ones are kept in `measurements` rather than overwritten, because
+#: how a reel got to its numbers is worth more than the number.
+#: Sits inside PERFORMANCE_WINDOW_HOURS on purpose - re-reading past the window
+#: would spend calls producing readings the report then refuses to compare.
+PERFORMANCE_SETTLE_HOURS = get_env_int("PERFORMANCE_SETTLE_HOURS", 36)
 
 #: Whether the ledger may put a "measured" component on step 0's board. Off,
 #: because the honest use of this for a long while is a report a person reads.
@@ -1683,6 +1790,15 @@ INSTAGRAM_ACCESS_TOKEN = get_env("INSTAGRAM_ACCESS_TOKEN")
 INSTAGRAM_USER_ID = get_env("INSTAGRAM_USER_ID")
 
 REQUIRED_INSTAGRAM = ("INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_USER_ID")
+
+#: Which of Meta's two hosts answers for the token, or empty to work it out
+#: from the token itself. They are not interchangeable: a token minted through
+#: Instagram Login (those all begin "IG") is only parseable by
+#: graph.instagram.com, and one from the Facebook Login flow ("EAA...") only by
+#: graph.facebook.com. Sending either to the other host is answered with
+#: "Cannot parse access token", which reads exactly like an expired token and
+#: is not one - hence the default is to follow the token rather than ask.
+INSTAGRAM_API_HOST = get_env("INSTAGRAM_API_HOST", "")
 
 #: Graph API version, pinned rather than left to float onto Meta's newest.
 #: The metric names are exactly what churns between versions, so an
@@ -1898,6 +2014,9 @@ def _report() -> None:
         ("STRUCTURE_MODE", f"{STRUCTURE_MODE}"
                            + (f", rewritten below {STRUCTURE_MIN_SCORE:g}"
                               if STRUCTURE_MODE == "llm" else "")),
+        ("TAKEAWAY_MODE", f"{TAKEAWAY_MODE}"
+                           + (f", rewritten below {TAKEAWAY_MIN_SCORE:g}"
+                              if TAKEAWAY_MODE == "llm" else "")),
         ("VERIFY_MODE", f"{VERIFY_MODE}"
                         + (f", false claims and self-contradictions refuse "
                            f"the script, up to {VERIFY_REPAIR_ROUNDS} repair "
@@ -1939,6 +2058,9 @@ def _report() -> None:
                      if POST_ALT_ENABLED else "off"),
         ("RUN_GUARD", "one reel per day" if RUN_ONCE_PER_DAY
                       else "off - every run makes another reel"),
+        ("RUN_INSIGHTS", "read at the start of every run"
+                         if RUN_FETCH_INSIGHTS
+                         else "off - numbers are read by hand"),
         ("RUN_TOPIC_PICK",
          f"top of the board, up to {RUN_TOPIC_ATTEMPTS} topic(s) per run"
          + (f", score >= {RUN_TOPIC_MIN_SCORE:g}" if RUN_TOPIC_MIN_SCORE

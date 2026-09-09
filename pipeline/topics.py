@@ -266,6 +266,32 @@ EVERGREEN_PENALTY = -1.8
 #: documents wanting.
 EVERGREEN_SCOUTED_PENALTY = -0.6
 
+#: A topic whose script the fact-check refused, and which the board offered
+#: again anyway.
+#:
+#: Measured across the logs to 2026-09-08: "what the sound of the deep ocean
+#: actually is" was chosen and refused **five times** - the phrase pass rewords
+#: it every run, so the log shows three spellings, but the ledger key is stable
+#: and it sat on 26 boards before a draft finally survived. Every one of those
+#: five costs a ~150s Pro call, and nothing recorded that the last one failed:
+#: a topic is marked `used` only once money has gone on it (run.py), which a
+#: refused draft never reaches, so the whole cost of a refusal was a single
+#: EVERGREEN_SCOUTED_PENALTY of -0.6 for having been on a board.
+#:
+#: Priced against the ceiling documented on EVERGREEN_PENALTY, not in the
+#: abstract - the mistake board #41 was built out of. A clean backlog line
+#: lands at 1.3 and one carrying curiosity at 1.8, so -1.2 puts a
+#: once-refused line under a RUN_TOPIC_MIN_SCORE of 1.0 unless it is carrying
+#: enough else to be worth the second call. That is the intent: a refusal is
+#: evidence about the topic, not proof - the deep-ocean line did eventually
+#: pass - so it costs a retry rather than banning one.
+#:
+#: Charged **once**, however many times a topic has been refused, so it cannot
+#: stack its way into another deadlock. What ends a topic is the count instead:
+#: at TOPIC_MAX_REFUSALS it is dropped from the board outright, the same
+#: treatment `used` gets, where a filter cannot interact with the arithmetic.
+REFUSED_PENALTY = -1.2
+
 # --- sourceability ----------------------------------------------------------
 # The check that makes step 0 belong to *this* pipeline rather than being a
 # generic trend reader.
@@ -1923,7 +1949,8 @@ def _parse_rfc822(raw: str):
 
 def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None,
                     banned: tuple[str, ...] = (), max_age_hours: float | None = None,
-                    seen: bool = False, on_niche: bool | None = None) -> dict:
+                    seen: bool = False, on_niche: bool | None = None,
+                    refused: int = 0) -> dict:
     """Score one candidate. Higher is better.
 
     Returns the score and the parts it was built from. Sourceability is not
@@ -1933,6 +1960,10 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
     `on_niche` is the niche pass's verdict where there is one. Left at None the
     subject is judged on shared words alone, which is what the standalone
     scorer and every caller without a Gemini key gets.
+
+    `refused` is how many drafts for this topic the fact-check has thrown away.
+    It is charged once whatever the count, and the count itself is a filter in
+    `find_topics` rather than more arithmetic here.
     """
     topic = candidate.topic or candidate.title
     lowered = topic.lower()
@@ -1998,6 +2029,13 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
         parts["from the backlog"] = EVERGREEN_PENALTY
     elif seen:
         parts["on a recent board"] = SCOUTED_PENALTY
+
+    if refused > 0:
+        # Named for what it is, so the board argues its own case: this topic
+        # has already been written and thrown away, and that is the reason it
+        # is below a line it would otherwise beat.
+        parts[f"a draft was refused ({refused}x)" if refused > 1
+              else "a draft was refused"] = REFUSED_PENALTY
 
     return {"score": round(sum(parts.values()), 3), "components": parts}
 
@@ -2467,19 +2505,55 @@ class TopicLedger:
         if topic:
             entry["topic"] = topic
 
+    def refusals(self, key: str) -> int:
+        """How many times a script for this topic was refused outright."""
+        try:
+            return int(self.entry(key).get("refusals") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def was_refused_out(self, key: str) -> bool:
+        """Refused enough times that the board should stop offering it.
+
+        A filter rather than a penalty, deliberately. Board #41 deadlocked
+        because two penalties priced independently stacked past a source's
+        ceiling, and a count that cannot be added to a score cannot do that
+        to a later board.
+        """
+        limit = config.TOPIC_MAX_REFUSALS
+        return limit > 0 and self.refusals(key) >= limit
+
+    def mark_refused(self, key: str, topic: str = "") -> None:
+        """Note that a script for this topic was written and thrown away.
+
+        The gap this closes: a topic is marked `used` at the first moment money
+        has gone on it, which a refused draft never reaches, so the board's
+        entire memory of a refusal was that the topic had been *shown*.
+        """
+        entry = self._data["topics"].setdefault(key, {"used": False, "boards": 0})
+        entry["refusals"] = self.refusals(key) + 1
+        entry["refused_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        entry["last_refusal_board"] = self.board_index
+        if topic:
+            entry["topic"] = topic
+
     def _prune(self) -> None:
         """Forget candidates last seen many boards ago, keeping what was made.
 
         A ledger that only grows is a ledger nobody ever reads. What was made
         into a reel is kept whatever its age - that entry is the record that
-        stops a topic being made twice, and it never expires.
+        stops a topic being made twice, and it never expires. A topic that cost
+        a refused script is kept for the same reason: forgetting it is buying
+        the refusal a second time, which is the whole thing the count exists to
+        stop.
         """
         cutoff = self.board_index - LEDGER_KEEP_BOARDS
         if cutoff <= 0:
             return
         self._data["topics"] = {
             key: entry for key, entry in self._data["topics"].items()
-            if entry.get("used") or int(entry.get("last_board") or 0) > cutoff
+            if entry.get("used") or entry.get("refusals")
+            or int(entry.get("last_board") or 0) > cutoff
         }
 
     def save(self) -> list[str]:
@@ -2931,6 +3005,13 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
             rejected.append({**candidate.as_dict(),
                              "reason": "already made into a reel"})
             continue
+        if ledger.was_refused_out(candidate.key):
+            rejected.append({
+                **candidate.as_dict(),
+                "reason": f"the fact-check refused "
+                          f"{ledger.refusals(candidate.key)} script(s) for this",
+            })
+            continue
         fresh.append(candidate)
 
     # The niche pass, before scoring because the subject is one of the things
@@ -2947,6 +3028,7 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
         result = score_candidate(
             candidate, niche_terms=niche_terms, banned=banned,
             seen=ledger.seen_recently(candidate.key), on_niche=verdict,
+            refused=ledger.refusals(candidate.key),
         )
         candidate.score = result["score"]
         candidate.components = result["components"]
@@ -3148,6 +3230,22 @@ def take_topic(key: str, topic: str = "", *, ledger: TopicLedger | None = None) 
     """
     ledger = ledger if ledger is not None else TopicLedger()
     ledger.mark_used(key, topic)
+    return ledger.save()
+
+
+def refuse_topic(key: str, topic: str = "",
+                 *, ledger: TopicLedger | None = None) -> list[str]:
+    """Note that a script for this topic was written and refused.
+
+    The counterpart to `take_topic`, and the one that was missing. A refusal
+    costs a Pro call and leaves nothing behind, so a board with no memory of it
+    buys the same refusal again - five times over, for the topic that prompted
+    this. Returns warnings.
+    """
+    if config.TOPIC_MAX_REFUSALS <= 0 or not key:
+        return []
+    ledger = ledger if ledger is not None else TopicLedger()
+    ledger.mark_refused(key, topic)
     return ledger.save()
 
 
