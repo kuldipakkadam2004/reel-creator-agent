@@ -716,6 +716,64 @@ def test_a_beat_with_nothing_honest_falls_back_to_the_neutral_shot(monkeypatch):
     assert any("rather than a contradicting one" in w for w in warnings)
 
 
+def test_a_beat_no_provider_answered_still_reaches_the_neutral_shot(monkeypatch):
+    """"beat 8 had 0 hits and its 7.0s was absorbed by beat 7."
+
+    Nothing found at all is a different failure from found-and-wrong, and it
+    used to be handled by not handling it: the screen skipped any beat with an
+    empty shortlist, so the beats with no footage were the only ones that could
+    not reach the fallback that exists for having no footage. Their seconds
+    went to a neighbour instead, and three of the reels binned to 2026-09-09
+    were binned for it.
+    """
+    beat = _inca_beat()
+    served = {
+        # The primary query answers nothing at all - not a wrong shot, nothing.
+        "historical laborers": [],
+        "Andes mountain landscape": [
+            _described(36, "snow-covered-andes-peaks-at-dawn"),
+        ],
+    }
+    provider = _query_aware_provider(served)(session=None)
+
+    plans = {0: []}
+    warnings = []
+    notes = visuals._screen_beats(
+        plans, [beat], "how the Inca built roads without the wheel", [provider],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, warnings,
+    )
+
+    assert [row[1].provider_id for row in plans[0]] == ["v36"]
+    assert any("neutral shot" in note for note in notes[0])
+    # And it says which failure it was: "nothing matches the narration" would
+    # send whoever reads this to the screen instead of to the providers.
+    assert any("no provider returned anything for" in w for w in warnings)
+    assert not any("nothing found matches" in w for w in warnings)
+
+
+def test_a_beat_nothing_can_fill_says_its_seconds_are_going_elsewhere(monkeypatch):
+    """The honest ending when even the neutral shot is empty.
+
+    The beat is still lost - nothing here can invent footage - but the warning
+    now says what actually happens to it downstream rather than claiming a
+    closest-available shot that does not exist.
+    """
+    beat = _inca_beat()
+    provider = _query_aware_provider({})(session=None)
+
+    plans = {0: []}
+    warnings = []
+    visuals._screen_beats(
+        plans, [beat], "how the Inca built roads without the wheel", [provider],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, warnings,
+    )
+
+    assert plans[0] == []
+    assert any("absorbed by a neighbour" in w for w in warnings)
+
+
 def test_the_neutral_shot_is_not_searched_when_the_fallback_query_works(monkeypatch):
     """It is a last resort, not a second guess.
 
@@ -2059,10 +2117,14 @@ def test_a_beat_with_no_results_is_marked_failed_but_the_run_continues(
 ):
     real_gather = visuals._gather_candidates
 
-    def nothing_for_the_first_beat(providers, beat, settings, warnings):
+    def nothing_for_the_first_beat(providers, beat, settings, warnings, **kw):
+        # **kw because beat 0 now reaches the fallback-query re-search and the
+        # neutral shot, both of which call this with `queries=`. It answers
+        # nothing to all of them: the point of this test is a beat that no
+        # query can fill, and the run surviving it.
         if beat.index == 0:
             return []
-        return real_gather(providers, beat, settings, warnings)
+        return real_gather(providers, beat, settings, warnings, **kw)
 
     monkeypatch.setattr(visuals, "_gather_candidates", nothing_for_the_first_beat)
     manifest = run_visuals()

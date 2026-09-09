@@ -2694,9 +2694,34 @@ def _screen_beats(
         warnings.extend(screen_warnings)
 
     retry: list[Beat] = []
+    #: The beats that arrived here with nothing found at all, as opposed to
+    #: something found and rejected. Only the wording downstream differs, but
+    #: "nothing matches the narration" is not true of a beat no provider
+    #: answered, and this pass is read from its warnings.
+    empty: set[int] = set()
     for index, ranked in plans.items():
         beat = by_index.get(index)
-        if beat is None or not ranked:
+        if beat is None:
+            continue
+        if not ranked:
+            # Nothing was found at all. That is a different failure from the
+            # one this pass was written for - "found it, and it shows the wrong
+            # thing" - but it wants the same two remedies, in the same order:
+            # search the fallback queries, then fall back to the neutral shot.
+            #
+            # Skipping these was how a beat with no footage reached assembly
+            # with no footage. The neutral shot below exists for exactly this
+            # case and was reachable only from a shortlist with something in it
+            # to reject, so the beats that needed it most were the ones that
+            # could not get to it: they were dropped here, and `_absorb_empty_
+            # slots` then handed their seconds to a neighbour. Measured across
+            # the ledger to 2026-09-09, that is the single commonest reason a
+            # finished reel was binned - "beat 8 had 0 hits and its 7.0s was
+            # absorbed by beat 7", "beats 5, 6 and 7 all had no usable footage
+            # and all three were absorbed into beat 4 - 12.7s of the reel on
+            # one shot".
+            retry.append(beat)
+            empty.add(index)
             continue
         head, tail = ranked[:shortlist_size], ranked[shortlist_size:]
         verdicts = _verdicts_for(head, beat, mode, llm_verdicts, floor)
@@ -2801,12 +2826,21 @@ def _screen_beats(
         # establishing shot of the subject's own world says less than the beat
         # asks for, but it cannot contradict the narration, and an
         # under-specified shot is a far cheaper error than a false one.
+        # A beat nothing was found for and a beat whose every hit was rejected
+        # both end up here, and the remedy is the same. The sentence is not:
+        # one of them has footage that shows the wrong thing, the other has no
+        # footage at all, and a warning that says the first about the second
+        # sends whoever reads it to the screen instead of to the providers.
+        trouble = ("no provider returned anything for"
+                   if beat.index in empty else "nothing found matches")
         neutral = (beat.neutral_query or "").strip()
         if not neutral:
             warnings.append(
-                f"beat {beat.index} ({beat.query!r}): nothing found matches the "
-                f"narration and there is no neutral shot to fall back on - "
-                f"using the closest available"
+                f"beat {beat.index}: {trouble} {beat.query!r} and there is no "
+                f"neutral shot to fall back on - "
+                + ("the beat has no footage and its seconds will be absorbed "
+                   "by a neighbour" if beat.index in empty
+                   else "using the closest available")
             )
             continue
 
@@ -2815,20 +2849,24 @@ def _screen_beats(
                              rejections, warnings, seen)
         if not safe:
             warnings.append(
-                f"beat {beat.index} ({beat.query!r}): nothing found matches the "
-                f"narration and the neutral shot {neutral!r} found nothing "
-                f"either - using the closest available"
+                f"beat {beat.index}: {trouble} {beat.query!r} and the neutral "
+                f"shot {neutral!r} found nothing either - "
+                + ("the beat has no footage and its seconds will be absorbed "
+                   "by a neighbour" if beat.index in empty
+                   else "using the closest available")
             )
             continue
 
         plans[beat.index] = safe + plans.get(beat.index, [])
         notes.setdefault(beat.index, []).append(
-            f"fell back to the neutral shot {neutral!r}: nothing found for "
-            f"{beat.query!r} showed the right subject"
+            f"fell back to the neutral shot {neutral!r}: {trouble} "
+            f"{beat.query!r}"
         )
         warnings.append(
-            f"beat {beat.index}: no footage matches {beat.query!r}, so the beat "
-            f"plays a neutral shot ({neutral!r}) rather than a contradicting one"
+            f"beat {beat.index}: {trouble} {beat.query!r}, so the beat plays a "
+            f"neutral shot ({neutral!r}) rather than "
+            + ("nothing at all" if beat.index in empty
+               else "a contradicting one")
         )
 
     return notes
