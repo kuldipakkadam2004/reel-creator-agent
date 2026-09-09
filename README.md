@@ -250,6 +250,42 @@ saying "only 2 candidates matched the niche" is usually a subreddit problem
 rather than a scoring one. Two or three subreddits genuinely about your subject
 beat ten large ones.
 
+**And a long list has to be read in more than one request**, or the large subs
+on it are the only ones read at all. Reddit ranks a combined `r/a+b+c` listing
+by absolute score, so the sizes in the list decide it: on [board
+#31](#step-0--topic-scouting) nine subreddits went up as one feed and the forty
+entries that came back held two of them — 33 from `r/todayilearned`, 2 from
+`r/science`, and all 33 rejected off the niche. The seven subreddits chosen
+*for* the niche returned nothing, and the board fell back to the evergreen
+backlog, as it had every day before it. `TOPIC_REDDIT_FEEDS` splits the list
+into that many feeds so a 90k-member subreddit competes against its own size
+instead of against the largest default sub on the site; rank, and so
+`velocity`, is read within each feed.
+
+The default of 2 is measured, not chosen. From a cold address: three feeds 4s
+apart lost two of them to a 429; three feeds 20s apart still lost the third;
+two feeds 20s apart both came back. So the feeds are spaced
+`FEED_GAP_SECONDS` apart, a refused feed costs only its own subreddits rather
+than the source, and **which group goes first rotates by the day** — in a
+fixed order the same subreddits are the ones missing every time, which is how
+board #62 came back holding nothing but the group that happened to be first.
+`TOPIC_REDDIT_FEEDS=1` is exactly the single combined URL this replaced.
+
+**Measured on board #65**, the first scouted after the split: `redditrss 40,
+evergreen 40` where the run before it managed `redditrss 14`, all of them from
+one subreddit. The board's top line was a live Reddit topic at **2.50** — *how
+the star-nosed mole eats so fast*, from r/Awwducational, 3 of 3 on the footage
+probe — beating every backlog line, three of the top five live and on-niche.
+Every board for the previous fortnight had been 8-of-8 backlog in a 1.3–1.9
+band. The supply problem the backlog exists to cover was, in part, nine
+subreddits of which seven were never read.
+
+The ceiling is the anonymous endpoint's, not Reddit's: `REDDIT_CLIENT_ID` +
+`REDDIT_CLIENT_SECRET` with `TOPIC_SOURCES=reddit` allows 60 requests a
+minute, and carries the upvotes and comment counts the RSS feed leaves out —
+the two largest scoring inputs. It is the single highest-value thing left
+unconfigured here.
+
 **Trends alone is a weak board**, and worth saying plainly: it is national
 general-news, so with no Reddit or YouTube credentials a run will mostly return
 fixtures and share prices, score them all negative and reject most of them for

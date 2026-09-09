@@ -1974,16 +1974,154 @@ def test_the_rank_spread_survives_being_logged(monkeypatch):
     assert scored[0] - scored[1] > 0.8
 
 
-def test_every_subreddit_goes_up_in_one_request(monkeypatch):
-    """Anonymous reads are rate limited hard, so one URL carries them all."""
+def test_the_board_reports_what_fetched_what_even_after_the_probe(
+        offline, monkeypatch):
+    """The llm probe used to overwrite the source reports with its own ratings.
+
+    `find_topics` binds `reports` to the per-source fetch summaries and returns
+    them as `sources`; the sourceability pass rebound the same name to its
+    {index: rating} dict, so a board scouted with TOPIC_SOURCEABILITY=llm came
+    back with `sources` full of probe results and `_print_board` crashed
+    iterating ints on its way to printing a board it had already built.
+    """
+    install_source(monkeypatch, "reddit", [
+        candidate("why the ocean is salty", external_id="t1",
+                  rate=300, age_hours=2),
+    ])
+    monkeypatch.setattr(
+        topics, "classify_sourceability",
+        lambda shortlist: ({i: {"rating": 3, "hits": 3, "sample": 3,
+                                "query": c.topic, "provider": "model",
+                                "checked": True, "by_provider": {},
+                                "notes": []}
+                            for i, c in enumerate(shortlist)}, []),
+    )
+
+    board = topics.find_topics("ocean", sources=("reddit",),
+                               sourceability="llm", phrases="heuristic",
+                               niche_mode="off")
+
+    assert isinstance(board["sources"], list)
+    assert board["sources"][0]["name"] == "reddit"
+    assert board["sources"][0]["ready"] is True
+    assert board["sources"][0]["fetched"] == 1
+    # The probe still ran and still reached the candidate.
+    assert board["stats"]["probed"] == 1
+    topics._print_board(board)          # used to raise TypeError
+
+
+def test_the_subreddits_go_up_in_no_more_feeds_than_configured(monkeypatch):
+    """Anonymous reads are rate limited hard, so the feed count is bounded.
+
+    Bounded, not one: one combined feed is ranked by absolute score, and the
+    largest subreddit in the list takes every place in it. TOPIC_REDDIT_FEEDS
+    is what buys the small ones a listing of their own - see
+    `RedditRssSource._groups`.
+    """
+    monkeypatch.setattr(config, "TOPIC_SUBREDDITS",
+                        ("todayilearned", "askscience", "science",
+                         "oceans", "geology", "marinebiology"))
+    monkeypatch.setattr(config, "TOPIC_REDDIT_FEEDS", 3)
+    monkeypatch.setattr(topics.RedditRssSource, "FEED_GAP_SECONDS", 0.0)
+    session = rss_session({"title": "Why is the ocean salty"})
+    topics.RedditRssSource(session).fetch("ocean", 25)
+
+    assert len(session.calls) <= config.TOPIC_REDDIT_FEEDS
+    # Every subreddit is actually read - the point of splitting at all.
+    asked = " ".join(call["url"] for call in session.calls)
+    for sub in config.TOPIC_SUBREDDITS:
+        assert sub in asked
+    # And the groups share TOPIC_PER_SOURCE rather than each taking it.
+    assert sum(call["params"]["limit"] for call in session.calls) <= 25 + len(session.calls)
+
+
+def test_one_feed_still_means_one_request(monkeypatch):
+    """TOPIC_REDDIT_FEEDS=1 is exactly the single combined URL it replaced."""
     monkeypatch.setattr(config, "TOPIC_SUBREDDITS",
                         ("todayilearned", "askscience", "science"))
+    monkeypatch.setattr(config, "TOPIC_REDDIT_FEEDS", 1)
     session = rss_session({"title": "Why is the ocean salty"})
-    source = topics.RedditRssSource(session)
-    source.fetch("ocean", 25)
+    topics.RedditRssSource(session).fetch("ocean", 25)
 
     assert len(session.calls) == 1
     assert "todayilearned+askscience+science" in session.calls[0]["url"]
+
+
+def test_a_small_subreddit_is_ranked_against_its_own_group(monkeypatch):
+    """Rank is per feed, so the top of a small sub is not buried by a big one."""
+    monkeypatch.setattr(config, "TOPIC_SUBREDDITS", ("todayilearned", "oceans"))
+    monkeypatch.setattr(config, "TOPIC_REDDIT_FEEDS", 2)
+    monkeypatch.setattr(topics.RedditRssSource, "FEED_GAP_SECONDS", 0.0)
+    session = rss_session({"title": "Why is the ocean salty"})
+    found = topics.RedditRssSource(session).fetch("ocean", 25)
+
+    # Both feeds returned a #1, and a #1 gets TOP_RATE wherever it came from.
+    assert len(session.calls) == 2
+    assert len(found) >= 1
+    assert max(c.rate for c in found) == topics.RedditRssSource.TOP_RATE
+
+
+def test_the_group_that_goes_first_rotates_by_day(monkeypatch):
+    """Whichever feed is first survives a rate limit, so it must not be fixed."""
+    groups = [("a",), ("b",), ("c",)]
+    first = {topics.RedditRssSource._rotate(groups, day=d)[0][0]
+             for d in range(3)}
+    assert first == {"a", "b", "c"}
+
+    # Same day, same order: two runs in an afternoon scout the same feeds.
+    assert (topics.RedditRssSource._rotate(groups, day=7)
+            == topics.RedditRssSource._rotate(groups, day=7))
+    # And nothing is dropped or duplicated by the rotation.
+    assert sorted(topics.RedditRssSource._rotate(groups, day=2)) == sorted(groups)
+    assert topics.RedditRssSource._rotate([]) == []
+
+
+def test_the_feeds_are_spaced_rather_than_fired_together(monkeypatch):
+    """The rate limit is per minute, so the gap is what avoids it at all.
+
+    Without this the three feeds go up back to back and are refused outright -
+    which is how splitting the list made the scout worse before it made it
+    better.
+    """
+    monkeypatch.setattr(config, "TOPIC_SUBREDDITS",
+                        ("askscience", "oceans", "geology"))
+    monkeypatch.setattr(config, "TOPIC_REDDIT_FEEDS", 3)
+    slept: list[float] = []
+    monkeypatch.setattr(topics.RedditRssSource, "FEED_GAP_SECONDS", 4.0)
+    monkeypatch.setattr("time.sleep", lambda s: slept.append(s))
+
+    session = rss_session({"title": "Why is the ocean salty"})
+    topics.RedditRssSource(session).fetch("ocean", 25)
+
+    # One gap between each pair of feeds, and none before the first.
+    assert len(session.calls) == 3
+    assert slept == [4.0, 4.0]
+
+
+def test_one_failed_feed_does_not_lose_the_others(monkeypatch):
+    """A 429 on the third group is some subreddits lost, not the source."""
+    monkeypatch.setattr(config, "TOPIC_SUBREDDITS", ("askscience", "oceans"))
+    monkeypatch.setattr(config, "TOPIC_REDDIT_FEEDS", 2)
+    monkeypatch.setattr(topics.RedditRssSource, "FEED_GAP_SECONDS", 0.0)
+    monkeypatch.setattr(topics.RedditRssSource, "RETRY_WAITS", ())
+    session = rss_session({"title": "Why is the ocean salty"})
+
+    calls = {"n": 0}
+    original = session.get
+
+    def flaky(url, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeResponse(429, body=b"")
+        return original(url, **kwargs)
+
+    session.get = flaky
+    source = topics.RedditRssSource(session)
+    found = source.fetch("ocean", 25)
+
+    assert found                        # the second group still came back
+    assert source.notes                 # and the loss is on the record
+    assert "429" in source.notes[0] or "rate limited" in source.notes[0]
 
 
 def test_a_rate_limited_feed_is_retried_and_then_explained(monkeypatch):

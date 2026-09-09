@@ -1008,6 +1008,13 @@ class Source:
     def __init__(self, session):
         self.session = session
         self.requests = 0
+        #: What went wrong without stopping the fetch. A source that reads
+        #: several feeds can lose one and still return a board, and the
+        #: difference between "fetched 40" and "fetched 40 of the 60 asked for,
+        #: because a third of the subreddits were rate limited" is not visible
+        #: anywhere else - `fetch` returning candidates is the only signal the
+        #: scout otherwise gets.
+        self.notes: list[str] = []
 
     @classmethod
     def missing_keys(cls) -> list[str]:
@@ -1452,10 +1459,29 @@ class RedditRssSource(Source):
     TOP_RATE = 300.0
     FLOOR_RATE = 5.0
 
-    #: Reddit rate limits anonymous feed reads hard - measured at 429 after
-    #: roughly three requests - so the subreddits go up as one `a+b+c` URL and
-    #: a 429 is retried rather than lost.
+    #: Reddit rate limits anonymous feed reads hard - the third request is
+    #: refused even 20s after the second - so the subreddits go up as combined
+    #: `a+b+c` URLs, at most TOPIC_REDDIT_FEEDS of them, and a 429 is retried
+    #: rather than lost.
+    #:
+    #: These waits are the recovery, not the prevention: once a limit has
+    #: started, neither is long enough to clear it. FEED_GAP_SECONDS is what
+    #: keeps the requests under it in the first place.
     RETRY_WAITS = (2.0, 5.0)
+
+    #: Seconds left between one group's feed and the next. The limit is per
+    #: minute and per address, so spacing the requests is the remedy for it;
+    #: retrying after a 429 is what happens when the spacing was not enough.
+    #:
+    #: Measured 2026-09-09 from a cold address: three feeds 4s apart lost two
+    #: of the three, and the two RETRY_WAITS were not long enough to clear a
+    #: limit once it had started. At 20s the first two feeds returned 200 and
+    #: the third was still refused - which is the measurement behind
+    #: TOPIC_REDDIT_FEEDS defaulting to 2 rather than 3.
+    #:
+    #: The scout runs once a day and step 0 already takes over a minute, so
+    #: the seconds this adds are not worth optimising away.
+    FEED_GAP_SECONDS = 20.0
 
     #: The feed gives no `stickied` flag, so the mod posts pinned to the top
     #: of every subreddit arrive looking like candidates. They are recognised
@@ -1484,6 +1510,66 @@ class RedditRssSource(Source):
             return False, "needs TOPIC_SUBREDDITS"
         return True, "ready (no key required)"
 
+    @staticmethod
+    def _groups(subreddits, most: int) -> list[tuple[str, ...]]:
+        """Split the subreddit list into at most `most` combined feeds.
+
+        One combined `a+b+c` feed is one request, which is what the rate limit
+        wants - but Reddit ranks a combined listing by absolute score, and
+        subreddit sizes here span three orders of magnitude. Measured on board
+        #31: nine subreddits went up as one feed, and the forty entries that
+        came back held two subreddits. r/todayilearned (38M members) took 33 of
+        them and r/science the other 2; r/oceans, r/marinebiology,
+        r/EarthScience, r/geology, r/askscience, r/explainlikeimfive and
+        r/Awwducational returned nothing at all. Every one of the 33 was then
+        rejected off the niche, because r/todayilearned's top of the month is
+        film trivia and sports anecdotes. The board fell back to the backlog,
+        as it does every day.
+
+        So the subreddits that were chosen *for* the niche were never actually
+        read. Splitting the list into a few feeds gives each group its own
+        forty places, and a small subreddit competes against its own size
+        rather than against the largest default sub on the site. `rank` is per
+        group for the same reason - position among comparable subreddits is
+        the honest reading of `_rate_for_rank`.
+
+        Balanced rather than one-per-request: the constraint being respected is
+        the request count, so the list is divided into `most` groups and not
+        into groups of `most`. At 1 this is exactly the old single-feed call.
+        """
+        subs = [str(name).strip() for name in subreddits if str(name).strip()]
+        if not subs:
+            return []
+        most = max(1, int(most))
+        if most >= len(subs):
+            return [(name,) for name in subs]
+        size = math.ceil(len(subs) / most)
+        return [tuple(subs[i:i + size]) for i in range(0, len(subs), size)]
+
+    @staticmethod
+    def _rotate(groups: list, day: int | None = None) -> list:
+        """The groups, reordered so a different one goes first each day.
+
+        The first feed is the one that gets the benefit of the rate limit: a
+        later one that is refused is simply not read that day. In a fixed
+        order that is always the *same* subreddits missing, which is the bug
+        this class already had in a different shape - measured on board #62,
+        where two of three feeds were refused and the board came back holding
+        nothing but the group that happened to be first.
+
+        Rotating by the day makes the loss fall on everyone in turn, so a week
+        of partial failures still reads every subreddit several times instead
+        of reading a third of them seven times. Derived from the date rather
+        than stored: there is no state to keep, and two runs on one day should
+        scout the same feeds.
+        """
+        if not groups:
+            return []
+        if day is None:
+            day = datetime.now(timezone.utc).toordinal()
+        start = day % len(groups)
+        return list(groups[start:]) + list(groups[:start])
+
     @classmethod
     def _rate_for_rank(cls, rank: int, total: int) -> float:
         """Position in the listing -> a stand-in rate.
@@ -1503,8 +1589,12 @@ class RedditRssSource(Source):
         if "[429" in str(exc):
             return SourceError(
                 "Reddit rate limited the anonymous feed read. It allows only a "
-                "few per minute from one address - raise the gap between runs, "
-                "or lower TOPIC_PER_SOURCE.",
+                "few per minute from one address, and the feeds are already "
+                "spaced FEED_GAP_SECONDS apart. Lower TOPIC_REDDIT_FEEDS to "
+                "read fewer subreddit groups per run, or set REDDIT_CLIENT_ID "
+                "+ REDDIT_CLIENT_SECRET and TOPIC_SOURCES=reddit - the "
+                "authenticated API allows 60 requests a minute and does not "
+                "have this limit.",
                 source=cls.name,
             )
         return exc
@@ -1546,7 +1636,47 @@ class RedditRssSource(Source):
                 source=self.name,
             )
 
-        body = self._fetch_feed("+".join(self.subreddits), limit)
+        groups = self._groups(self.subreddits, config.TOPIC_REDDIT_FEEDS)
+        # The groups share `limit` rather than each taking it, so raising
+        # TOPIC_REDDIT_FEEDS splits the same board between more subreddits
+        # instead of quietly fetching a multiple of what TOPIC_PER_SOURCE asked
+        # for.
+        share = max(1, math.ceil(limit / len(groups)))
+        groups = self._rotate(groups)
+
+        out: list[Candidate] = []
+        seen: set[str] = set()
+        failures: list[SourceError] = []
+        for index, group in enumerate(groups):
+            if index and self.FEED_GAP_SECONDS > 0:
+                import time
+                time.sleep(self.FEED_GAP_SECONDS)
+            try:
+                body = self._fetch_feed("+".join(group), share)
+            except SourceError as exc:
+                # One group lost is some subreddits lost, not the source. A 429
+                # on the third feed should not throw away the two that came
+                # back - that would make raising TOPIC_REDDIT_FEEDS strictly
+                # more fragile, which is the opposite of what it is for.
+                failures.append(exc)
+                continue
+            for candidate in self._parse(body, share):
+                if candidate.external_id in seen:
+                    continue        # a crosspost sitting in two of the groups
+                seen.add(candidate.external_id)
+                out.append(candidate)
+
+        if failures and not out:
+            raise failures[-1]
+        if failures:
+            self.notes.append(
+                f"{len(failures)} of {len(groups)} subreddit feed(s) failed - "
+                f"{failures[-1]}"
+            )
+        return out[:limit]
+
+    def _parse(self, body: bytes, limit: int) -> list[Candidate]:
+        """One feed's XML into candidates. `rank` is within this feed."""
         try:
             root = ElementTree.fromstring(body)
         except ElementTree.ParseError as exc:
@@ -2982,8 +3112,11 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
             continue
 
         gathered.extend(found)
+        for note in getattr(source, "notes", ()):
+            warnings.append(f"{name}: {note}")
         reports.append({"name": name, "ready": True, "fetched": len(found),
-                        "requests": source.requests, "detail": detail})
+                        "requests": source.requests, "detail": detail,
+                        "notes": list(getattr(source, "notes", ()))})
 
     if not gathered:
         raise TopicsError(
@@ -3085,10 +3218,18 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
         # keyword probe this replaced is still here and still selectable, but
         # it was measured not to separate good topics from bad at any
         # threshold - see TOPIC_SOURCEABILITY in config.py for the numbers.
-        reports, notes = classify_sourceability(shortlist)
+        # Not `reports`: that name holds the per-source fetch reports this
+        # function returns as `sources`, and rebinding it here replaced them
+        # with the probe's {index: rating} dict. `_print_board` then iterated
+        # a dict of ints looking for `entry["ready"]` and died - so every
+        # scout with TOPIC_SOURCEABILITY=llm crashed on its way to printing
+        # the board it had already built, and every last_board.json written
+        # that way recorded the probe under "sources" instead of what fetched
+        # what.
+        rated, notes = classify_sourceability(shortlist)
         warnings.extend(notes)
         for index, candidate in enumerate(shortlist):
-            report = reports.get(index)
+            report = rated.get(index)
             if not report:
                 continue
             candidate.sourceability = report

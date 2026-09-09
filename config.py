@@ -303,6 +303,31 @@ TOPIC_SUBREDDITS = get_env_list("TOPIC_SUBREDDITS", "")
 TOPIC_REDDIT_LISTING = get_env("TOPIC_REDDIT_LISTING", "top")
 TOPIC_REDDIT_WINDOW = get_env("TOPIC_REDDIT_WINDOW", "week")
 
+#: How many separate feed requests the subreddit list is read over. The
+#: subreddits are split into this many combined `a+b+c` feeds, each given its
+#: own share of TOPIC_PER_SOURCE.
+#:
+#: Not 1, which is what a single combined feed is. Reddit ranks a combined
+#: listing by absolute score, and a subreddit list picked for a niche mixes
+#: default subs with 38M members and specialist ones with 90k. Measured on
+#: board #31: nine subreddits over one feed returned forty entries from two of
+#: them - 33 from r/todayilearned and 2 from r/science - and all 33 were then
+#: rejected off the niche, because that sub's top of the month is film trivia.
+#: The seven subreddits chosen *for* the niche returned nothing, and the board
+#: fell back to the evergreen backlog, as it had every day before it.
+#:
+#: Not high, either, and 2 is measured rather than chosen. From a cold address
+#: on 2026-09-09: three feeds 4s apart lost two of them to a 429, and three
+#: feeds 20s apart still lost the third. Two feeds 20s apart both returned
+#: 200, which is what the anonymous RSS endpoint actually allows - see
+#: topics.RedditRssSource.FEED_GAP_SECONDS. Above the ceiling the extra feeds
+#: are retried, then dropped with a warning, which costs candidates rather
+#: than gaining them.
+#:
+#: Set REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET and TOPIC_SOURCES=reddit to be
+#: rid of the ceiling: the authenticated API allows 60 requests a minute.
+TOPIC_REDDIT_FEEDS = get_env_int("TOPIC_REDDIT_FEEDS", 2)
+
 #: Search terms for the youtube source. Blank falls back to TOPIC_NICHE.
 TOPIC_KEYWORDS = get_env_list("TOPIC_KEYWORDS", "")
 
@@ -1931,6 +1956,11 @@ def _report() -> None:
             if TOPIC_NICHE_MATCH == "llm"
             else "words from TOPIC_NICHE (free, much stricter)")),
         ("TOPIC_SUBREDDITS", ", ".join(TOPIC_SUBREDDITS) or "(none set)"),
+        ("TOPIC_REDDIT_FEEDS",
+         f"{TOPIC_REDDIT_FEEDS} feed(s), so "
+         f"~{-(-len(TOPIC_SUBREDDITS) // max(1, TOPIC_REDDIT_FEEDS))} "
+         f"subreddit(s) ranked against each other at a time"
+         if TOPIC_SUBREDDITS else f"{TOPIC_REDDIT_FEEDS}"),
         ("TOPIC_REDDIT_LISTING",
          f"{TOPIC_REDDIT_LISTING} of the {TOPIC_REDDIT_WINDOW}"
          if TOPIC_REDDIT_LISTING == "top" else TOPIC_REDDIT_LISTING),
