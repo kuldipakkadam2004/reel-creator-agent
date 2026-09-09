@@ -14,6 +14,7 @@ by hand - the trends feed needs no key.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -100,6 +101,17 @@ def stock(*descriptions, title=""):
         )
         for index, slug in enumerate(descriptions)
     ]
+
+
+def _numbered(prompt):
+    """The `0. topic` lines a classifier prompt lists, in order.
+
+    Lets a mocked `call_gemini` answer about a named topic instead of about a
+    position, so a test does not silently rate the wrong candidate when the
+    order the shortlist is built in changes.
+    """
+    found = re.findall(r"^\s*(\d+)\.\s*(.+)$", prompt, re.MULTILINE)
+    return [line for _, line in sorted(found, key=lambda pair: int(pair[0]))]
 
 
 def candidate(topic, **kwargs):
@@ -235,6 +247,40 @@ def test_title_case_is_a_house_style_not_a_list_of_names():
     assert topics._proper_nouns("How Mangroves Save Coastlines") == []
     # A sentence with real names in it still reads as one.
     assert topics._proper_nouns("Trevon Diggs signs with Seattle") == ["Diggs", "Seattle"]
+
+
+def _rss(subreddits):
+    return topics.RedditRssSource(FakeSession(), subreddits=tuple(subreddits))
+
+
+def test_a_starved_subreddit_is_named_rather_than_silent():
+    """A combined feed is ranked by absolute score, so a small subreddit sharing
+    a group with a large one is not read thinly - it is not read at all. That is
+    how seven of nine went unread for weeks behind a healthy-looking `fetched
+    40`."""
+    source = _rss(["todayilearned", "geology", "oceans"])
+    found = [candidate("a thing", context="r/todayilearned top #1")]
+    notes = source._starved(found)
+
+    assert len(notes) == 1
+    assert "geology" in notes[0] and "oceans" in notes[0]
+    assert "todayilearned" not in notes[0]
+
+
+def test_the_starvation_note_matches_the_subreddit_however_it_was_typed():
+    """The feed spells a subreddit the way its mods do; TOPIC_SUBREDDITS however
+    it was typed. Comparing them exactly reported every one as starved."""
+    source = _rss(["earthscience", "marinebiology"])
+    found = [candidate("a thing", context="r/EarthScience top #1"),
+             candidate("another", context="r/marinebiology top #2")]
+    assert source._starved(found) == []
+
+
+def test_nothing_is_said_when_every_subreddit_was_read():
+    source = _rss(["oceans"])
+    assert source._starved([candidate("x", context="r/oceans top #1")]) == []
+    # And an empty fetch is the failure path's business, not this one's.
+    assert source._starved([]) == []
 
 
 def test_a_short_capitalised_phrase_is_not_treated_as_title_case():
@@ -679,9 +725,15 @@ def test_llm_mode_drops_a_named_subject_the_model_says_cannot_be_shot(
     """The hard filter's whole job, and the reason the keyword probe was
     replaced: 'State Farm dividend' honestly retrieves farm footage."""
     monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "llm")
-    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **kw: json.dumps([
-        {"index": 0, "footage": 3},
-        {"index": 1, "footage": 0},
+    # Keyed off the prompt rather than off position. The shortlist is ordered
+    # by a score that no longer charges proper nouns to an unrewritten
+    # headline, so "State Farm ..." now reaches the probe above "why the ocean
+    # is salty" - and a mock that answered by index was quietly rating the
+    # wrong one, which is the model saying the named subject *is* shootable
+    # and the filter correctly keeping it.
+    monkeypatch.setattr(script_gen, "call_gemini", lambda prompt, **kw: json.dumps([
+        {"index": index, "footage": 0 if "State Farm" in line else 3}
+        for index, line in enumerate(_numbered(prompt))
     ]))
     install_source(monkeypatch, "reddit", [
         candidate("why the ocean is salty", external_id="t1",
@@ -918,6 +970,11 @@ def _rewrite_to(phrase):
     def polish(candidates, *, mode=None):
         for one in candidates:
             one.topic = phrase
+            # The real pass clears this for everything it is handed, and
+            # the re-score behind it reads the flag. A stub that left it
+            # set would have the board scoring a settled wording as
+            # though it were still a headline.
+            one.provisional = False
         return []
     return polish
 
@@ -1444,6 +1501,168 @@ def test_the_phrase_pass_is_skipped_entirely_in_heuristic_mode(monkeypatch):
 
     monkeypatch.setattr(script_gen, "call_gemini", boom)
     assert topics.polish_phrases([candidate("x")], mode="heuristic") == []
+
+
+# ---------------------------------------------------------------------------
+# Wording is settled before anything reads it
+# ---------------------------------------------------------------------------
+
+def _fake_gemini(rewrites=None, footage=3):
+    """One `call_gemini` standing in for both model passes in step 0.
+
+    Dispatches on the prompt, because the phrase pass and the footage pass go
+    through the same function and a board test now runs both.
+    """
+    def call(prompt, **kwargs):
+        lines = _numbered(prompt)
+        if "Rewrite each headline" in prompt:
+            return json.dumps([
+                {"index": index, "topic": (rewrites or {}).get(line, line)}
+                for index, line in enumerate(lines)
+            ])
+        return json.dumps([
+            {"index": index, "footage": footage} for index, _ in enumerate(lines)
+        ])
+    return call
+
+
+def test_an_unrewritten_headline_is_not_charged_for_its_shape():
+    """The three components the phrase pass exists to fix. Charging them to a
+    headline marks a candidate down for a shape it is about to lose."""
+    raw = ("TIL that Naked mole-rats can survive 18 minutes without oxygen, "
+           "a trick otherwise only seen in plants")
+    one = candidate(raw, rate=300, age_hours=2)
+
+    one.provisional = True
+    charged = topics.score_candidate(one)["components"]
+    assert "explainer shape" not in charged
+    assert "too long" not in charged
+    assert "proper nouns" not in charged
+
+    one.provisional = False
+    assert {"too long", "proper nouns"} & set(
+        topics.score_candidate(one)["components"])
+
+
+def test_content_components_are_charged_either_way():
+    """The line the flag draws is form against content: the phrase pass is told
+    to keep the subject, so what a topic is *about* survives the rewrite."""
+    one = candidate("the largest waterfall on earth is underwater",
+                    rate=300, age_hours=2)
+    one.provisional = True
+    provisional = topics.score_candidate(one, niche_terms={"ocean", "earth"})
+    one.provisional = False
+    final = topics.score_candidate(one, niche_terms={"ocean", "earth"})
+
+    for part in ("velocity", "niche match", "curiosity (extreme)"):
+        assert provisional["components"][part] == final["components"][part]
+
+
+def test_the_backlog_is_final_wording_and_a_feed_is_not():
+    """Set on the source class, so it is one fact in one place rather than a
+    flag repeated at six Candidate(...) sites."""
+    assert topics.EvergreenSource.wording_is_final is True
+    assert topics.RedditRssSource.wording_is_final is False
+
+
+def test_the_footage_probe_is_asked_about_the_rewritten_topic(
+        offline, monkeypatch):
+    """The probe searches for what the topic says. Asked before the rewrite it
+    handed the stock libraries a whole reddit headline - a sentence no library
+    has ever been asked for."""
+    raw = ("Naked mole-rats can survive up to 18 minutes without oxygen by "
+           "switching their metabolism to run on fructose instead of glucose")
+    phrase = "how naked mole-rats survive without oxygen"
+    monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "llm")
+    monkeypatch.setattr(script_gen, "call_gemini", _fake_gemini({raw: phrase}))
+    install_source(monkeypatch, "reddit",
+                   [candidate(raw, external_id="t1", rate=300, age_hours=2)])
+
+    board = topics.find_topics("", sources=("reddit",), phrases="llm")
+    only = board["candidates"][0]
+    assert only["topic"] == phrase
+    assert only["sourceability"]["query"] == phrase
+
+
+def test_a_rewritten_headline_is_scored_on_the_shape_it_ships_with(
+        offline, monkeypatch):
+    """Board #33: the one live topic on the board sat third behind two backlog
+    lines, carrying `too long` and no explainer bonus - both read off a 28-word
+    headline it was never going to ship as."""
+    raw = ("Naked mole-rats can survive up to 18 minutes without oxygen by "
+           "switching their metabolism to run on fructose instead of glucose")
+    phrase = "how naked mole-rats survive without oxygen"
+    monkeypatch.setattr(script_gen, "call_gemini", _fake_gemini({raw: phrase}))
+    install_source(monkeypatch, "reddit",
+                   [candidate(raw, external_id="t1", rate=300, age_hours=2)])
+
+    board = topics.find_topics("", sources=("reddit",), sourceability="off",
+                               phrases="llm")
+    only = board["candidates"][0]
+    assert only["components"]["explainer shape"] == topics.EXPLAINER_BONUS
+    assert "too long" not in only["components"]
+
+
+def test_the_phrase_pass_settles_the_wording_on_every_path(monkeypatch):
+    """The flag means a rewrite is still coming, so every way of not getting one
+    has to clear it - or the score never reads the wording that ships."""
+    def boom(*args, **kwargs):
+        raise script_gen.ScriptGenerationError("503")
+
+    off = candidate("why the ocean is salty")
+    off.provisional = True
+    topics.polish_phrases([off], mode="heuristic")
+    assert off.provisional is False
+
+    monkeypatch.setattr(script_gen, "call_gemini", boom)
+    failed = candidate("why the ocean is salty")
+    failed.provisional = True
+    topics.polish_phrases([failed], mode="llm")
+    assert failed.provisional is False
+
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        lambda *a, **kw: json.dumps([{"index": 0, "topic": ""}]))
+    empty = candidate("why the ocean is salty")
+    empty.provisional = True
+    topics.polish_phrases([empty], mode="llm")
+    assert empty.provisional is False
+
+
+def test_the_phrase_budget_grows_with_the_batch(monkeypatch):
+    """It runs on the probe shortlist now, not on the eight-row board the fixed
+    1024 was sized for. A truncated array is silently kept as headlines."""
+    seen = {}
+
+    def capture(prompt, **kwargs):
+        seen.update(kwargs)
+        return json.dumps([])
+
+    monkeypatch.setattr(script_gen, "call_gemini", capture)
+    topics.polish_phrases([candidate(f"topic number {n}") for n in range(40)],
+                          mode="llm")
+    assert seen["max_output_tokens"] >= 40 * topics.PHRASE_TOKENS_PER_PHRASE
+
+
+def test_a_winner_that_missed_the_shortlist_is_still_rewritten(
+        offline, monkeypatch):
+    """The sorts after the shortlist read every candidate, so one that was never
+    on it can still finish inside `wanted`. Without the backstop it would ship
+    to step 2 as a raw headline."""
+    raw = "TIL that the ocean is salty because rivers carry minerals into it"
+    monkeypatch.setattr(config, "TOPIC_PROBE_LIMIT", 1)
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        _fake_gemini({raw: "why the ocean is salty"}))
+    install_source(monkeypatch, "reddit", [
+        candidate("how a canyon is carved", external_id="t1",
+                  rate=900, age_hours=2),
+        candidate(raw, external_id="t2", rate=300, age_hours=2),
+    ])
+
+    board = topics.find_topics("", sources=("reddit",), sourceability="off",
+                               phrases="llm")
+    shown = [row["topic"] for row in board["candidates"]]
+    assert "why the ocean is salty" in shown
+    assert not any(row.startswith("TIL") for row in shown)
 
 
 def test_phrase_json_is_read_tolerantly():
@@ -2511,3 +2730,81 @@ def test_the_self_check_reports_the_backlog_as_ready(tmp_path, monkeypatch):
     row, = topics.source_status()
     assert row["known"] is True and row["ready"] is True
     assert "unknown" not in row["detail"].lower()
+
+
+
+# ---------------------------------------------------------------------------
+# Which subreddits share a feed
+# ---------------------------------------------------------------------------
+
+NINE = ["todayilearned", "askscience", "explainlikeimfive", "science",
+        "geology", "EarthScience", "marinebiology", "oceans", "Awwducational"]
+#: The four default subs large enough to take every place in a combined feed.
+GIANTS = {"todayilearned", "askscience", "explainlikeimfive", "science"}
+
+
+def _groups(subs, most):
+    return topics.RedditRssSource._groups(subs, most)
+
+
+def test_the_niche_subreddits_get_a_feed_with_no_giant_in_it():
+    """The whole point of splitting at all. Nine into two has to go 4/5 and not
+    5/4 - under 5/4 the fifth name was pushed in with the giants, and measured
+    live on 2026-09-09 r/todayilearned took all twenty places while
+    r/askscience, r/explainlikeimfive, r/science and r/geology returned
+    nothing."""
+    groups = _groups(NINE, 2)
+
+    assert [len(group) for group in groups] == [4, 5]
+    assert set(groups[0]) == GIANTS
+    assert not (set(groups[1]) & GIANTS)
+    # The one the old boundary sacrificed.
+    assert "geology" in groups[1]
+
+
+def test_the_spare_places_go_to_the_last_group():
+    """Which is what keeps the head of the list packed together. The list is
+    ordered biggest-first, so the giants share one feed rather than spilling
+    into the group chosen for the niche."""
+    assert [len(g) for g in _groups(list("abcdefghi"), 2)] == [4, 5]
+    assert [len(g) for g in _groups(list("abcde"), 2)] == [2, 3]
+    assert [len(g) for g in _groups(list("abcdefghij"), 3)] == [3, 3, 4]
+
+
+def test_the_feed_budget_it_was_given_is_the_feed_budget_it_uses():
+    """Chunking by a ceiling silently returned three feeds when four were asked
+    for - spending fewer requests than allowed and reading fewer subreddits for
+    no reason."""
+    assert len(_groups(NINE, 4)) == 4
+    assert len(_groups(NINE, 3)) == 3
+    assert len(_groups(NINE, 2)) == 2
+
+
+def test_the_split_never_loses_or_repeats_a_subreddit():
+    for most in range(1, len(NINE) + 3):
+        groups = _groups(NINE, most)
+        flat = [name for group in groups for name in group]
+        assert sorted(flat) == sorted(NINE)
+        assert all(group for group in groups)
+
+
+def test_two_runs_scout_the_same_feeds():
+    """No state and no clock: `--rescout` is not a different board.
+
+    Rotating membership by the day was tried and measured worse - it moves the
+    largest subreddit into the niche group on most days. `_rotate` still varies
+    which feed is read *first*, which is a different question.
+    """
+    assert _groups(NINE, 2) == _groups(NINE, 2)
+    assert topics.RedditRssSource._groups(NINE, 2, day=1) == _groups(NINE, 2)
+
+
+def test_a_feed_each_is_left_alone():
+    assert _groups(["a", "b"], 5) == [("a",), ("b",)]
+
+
+def test_one_feed_is_still_the_whole_list():
+    """At TOPIC_REDDIT_FEEDS=1 this is exactly the old single-feed call."""
+    groups = _groups(NINE, 1)
+    assert len(groups) == 1
+    assert list(groups[0]) == NINE

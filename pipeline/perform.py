@@ -612,6 +612,28 @@ class PerformanceLedger:
     def reels(self) -> dict:
         return self._data["reels"]
 
+    @property
+    def audience(self) -> dict:
+        """The account's own size at the last read, or empty.
+
+        One block for the file rather than a column per reel. It is a
+        property of the account and not of any reel, and copying it onto
+        twenty-six rows would only invite reading it as though each reel
+        had its own - which is the mistake the block exists to stop.
+        """
+        found = self._data.get("account")
+        return found if isinstance(found, dict) else {}
+
+    def set_audience(self, audience: dict) -> None:
+        """Record what the provider said about the account. Empty is a no-op.
+
+        A provider that could not read the follower count must not erase a
+        figure an earlier read did get: not knowing today is not evidence
+        that yesterday was wrong.
+        """
+        if audience:
+            self._data["account"] = dict(audience)
+
     def entry(self, run_id: str) -> dict:
         entry = self.reels.get(run_id)
         return entry if isinstance(entry, dict) else {}
@@ -1303,6 +1325,72 @@ def recover_log(run_id: str, features: dict, logs_dir: Path | str | None = None)
     return None
 
 
+#: Metrics an operator's own accounts inflate simply by opening a reel. A
+#: comment is not one of them - own accounts do not comment on every post,
+#: and subtracting a flat count from comments would invent negative ones.
+#: Comments on a reel that reached nobody are handled by `real_engagement`
+#: instead, which discards the whole row rather than shaving a number off it.
+SELF_INFLATED = ("reach", "views", "likes")
+
+
+def net_of_own(metrics: dict, own: int | None = None) -> dict:
+    """A reel's numbers with the operator's own accounts taken out.
+
+    Floored at zero rather than allowed negative: `own` is a declared count
+    and a reel read before every alt had opened it will sit under it, which
+    is a stale reading and not evidence of negative reach.
+
+    Returns a copy. The stored row keeps what Instagram said, so lowering
+    PERFORMANCE_OWN_ACCOUNTS later re-reads the same history rather than
+    having overwritten it.
+    """
+    own = config.PERFORMANCE_OWN_ACCOUNTS if own is None else own
+    out = dict(metrics or {})
+    if own <= 0:
+        return out
+    for name in SELF_INFLATED:
+        value = out.get(name)
+        if isinstance(value, (int, float)):
+            out[name] = max(0, int(value) - own)
+    return out
+
+
+def real_engagement(rows: list[dict], own: int | None = None) -> dict:
+    """What people who are not the operator did, across every posted reel.
+
+    The one summary the ratio tables cannot produce: they compare reels
+    against each other, so a column that is the same constant on every row
+    reads as no finding at all. Twenty-five likes across eight reels looks
+    like a quiet account. Three of them on every reel and one real one is a
+    different fact, and it is the fact.
+
+    A reel whose reach does not clear `own` reached **nobody**, so nothing
+    it carries can have come from an audience. The whole row is discarded
+    rather than netted off, which is why a comment on a reel with a reach of
+    three does not survive into the total.
+    """
+    own = config.PERFORMANCE_OWN_ACCOUNTS if own is None else own
+    out = {"reach": 0, "likes": 0, "comments": 0, "saves": 0,
+           "shares": 0, "reels": 0, "unseen": 0}
+    for row in rows:
+        if row.get("status") != "posted":
+            continue
+        metrics = row.get("metrics") or {}
+        if not metrics:
+            continue
+        out["reels"] += 1
+        net = net_of_own(metrics, own)
+        reach = int(net.get("reach") or 0)
+        if reach <= 0:
+            out["unseen"] += 1
+            continue
+        out["reach"] += reach
+        out["likes"] += int(net.get("likes") or 0)
+        for name in ("comments", "saves", "shares"):
+            out[name] += int(metrics.get(name) or 0)
+    return out
+
+
 def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
            span: int | None = None, min_samples: int | None = None,
            window_hours: int | None = None,
@@ -1505,6 +1593,9 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     return {
         "metric": metric,
         "one_sided": flat,
+        "audience": ledger.audience,
+        "own_accounts": config.PERFORMANCE_OWN_ACCOUNTS,
+        "real": real_engagement(rows),
         "min_reach": reach_floor,
         "unseen": len(unseen),
         "reached": reached,
@@ -1763,7 +1854,13 @@ def fetch(*, ledger: PerformanceLedger | None = None, provider=None,
     # up. It writes that to disk while this object is holding a copy read
     # before it ran, so the fields it owns are merged back in; without this the
     # save below quietly reverts everything the provider recorded.
-    stored = _load(ledger.path).get("reels") or {}
+    written = _load(ledger.path)
+    stored = written.get("reels") or {}
+    # The account block travels the same way and for the same reason, but
+    # it is not in PROVIDER_ANNOTATIONS because it is not a field on a reel
+    # - it is one row about the account, and merging it per run_id would
+    # write the same follower count onto every row that happened to answer.
+    ledger.set_audience(written.get("account") or {})
     for run_id in (answers or {}):
         saved = stored.get(run_id)
         if not isinstance(saved, dict):
@@ -1964,6 +2061,79 @@ def _print_reasons(rows: list[dict]) -> None:
             print(f"             {note[:58]}")
 
 
+def _print_audience(audience: dict, reach_median, own: int = 0,
+                    real: dict | None = None) -> None:
+    """The account's own size and what strangers did, before anything is
+    divided by either.
+
+    Every ratio below this line is a reel measured against the people who were
+    shown it, and for the first eight posts that was 289, 64, 9, 6, 3, 3, 0 and
+    0. The report printed all of those as `1.00x an ordinary reel` and never
+    said how many accounts were behind them.
+
+    The second half is the one the ratio tables structurally cannot produce.
+    They compare reels against each other, so a column holding the same
+    constant on every row is not a finding to them - and likes here were 3, 3,
+    3, 3, 3, 3, 3 and 4. Read as a total that is twenty-five likes and a quiet
+    account; read against PERFORMANCE_OWN_ACCOUNTS it is **one like, ever**,
+    which is a different fact and the one worth printing.
+
+    Silent about the count when nothing has been read, rather than printing a
+    zero: an account with no followers and a token that cannot see the follower
+    count are different findings, and only one of them is about the reels.
+    """
+    real = real or {}
+    followers = audience.get("followers")
+
+    if followers is None:
+        print("AUDIENCE: not read - "
+              "python pipeline/instagram.py --fetch records it, and the "
+              "reach figures below have no denominator without it")
+    else:
+        line = f"AUDIENCE: {followers} follower(s)"
+        if audience.get("username"):
+            line += f" on @{audience['username']}"
+        if audience.get("posts") is not None:
+            line += f", {audience['posts']} post(s)"
+        # Said plainly rather than left to be worked out. A follower count that
+        # is entirely the operator's own logins is not a small audience, it is
+        # no audience, and the two lead to opposite decisions.
+        if own > 0 and followers <= own:
+            line += " - your own accounts, so the audience here is nobody"
+        elif reach_median is not None and followers > 0:
+            # Above 1.00 the account is being shown to people who do not follow
+            # it, which for this format is the only way it grows.
+            line += (f" - a median reel reached {reach_median:g}, "
+                     f"{reach_median / followers:.2f}x that")
+        print(line)
+        if audience.get("read_at"):
+            print(f"          read {audience['read_at'][:10]}; it is today's "
+                  f"figure against reels posted over weeks")
+
+    if not own or not real.get("reels"):
+        return
+
+    seen = real.get("reach") or 0
+    unseen = real.get("unseen") or 0
+    print(f"REACHED : {seen} impression(s) that were not yours, across "
+          f"{real['reels']} posted reel(s)"
+          + (f"; {unseen} of them reached nobody at all" if unseen else ""))
+
+    # Singular where the count is one: "1 likes, 0 comments" reads as a
+    # rounding artefact, and this number is the point of the line.
+    acts = [f"{real.get(name) or 0} {name[:-1] if real.get(name) == 1 else name}"
+            for name in ("likes", "comments", "saves", "shares")]
+    line = f"ACTED   : {', '.join(acts)}"
+    if seen > 0:
+        # The rate that matters and the one no table prints: of the people who
+        # were actually shown a reel, how many did anything about it.
+        line += f" - {(real.get('likes') or 0) / seen:.2%} of them liked it"
+    print(line)
+    print(f"          {own} own account(s) are taken out first "
+          f"(PERFORMANCE_OWN_ACCOUNTS); a reel that did not clear that "
+          f"reached nobody, so nothing it carries is counted")
+
+
 def _print_report(data: dict) -> None:
     print(RULE)
     print(f"REELS   : {data['reels']} known - {data['posted']} posted, "
@@ -1976,6 +2146,8 @@ def _print_report(data: dict) -> None:
           f"{data['window_hours']}h after posting"
           + (f", nothing under {data['min_reach']} reach"
              if data.get("min_reach") else ""))
+    _print_audience(data.get("audience") or {}, data.get("reach_median"),
+                    data.get("own_accounts") or 0, data.get("real") or {})
 
     _print_reasons(data.get("reasons") or [])
     _print_table("KEPT OR BINNED  (1.00 = always posted; every reel counts)",

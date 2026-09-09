@@ -765,7 +765,9 @@ def llm_queries(beats: list[Beat], topic: str) -> list[str]:
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=QUERY_THINKING_BUDGET
             )
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key, http_options=script_gen.client_http_options()
+        )
         response = client.models.generate_content(
             model=config.GEMINI_MODEL,
             contents=prompt,
@@ -1906,7 +1908,9 @@ def llm_screen(
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=SCREEN_THINKING_BUDGET
             )
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key, http_options=script_gen.client_http_options()
+        )
         response = client.models.generate_content(
             model=config.GEMINI_MODEL,
             contents=prompt,

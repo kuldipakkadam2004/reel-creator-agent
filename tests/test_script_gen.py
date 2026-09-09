@@ -54,8 +54,9 @@ def scripted_gemini(monkeypatch):
                 return outcome
 
         class FakeClient:
-            def __init__(self, api_key=None):
+            def __init__(self, api_key=None, http_options=None):
                 self.models = FakeModels()
+                self.http_options = http_options
 
         monkeypatch.setattr(genai, "Client", FakeClient)
         return calls
@@ -175,6 +176,38 @@ def test_the_retry_asks_for_exactly_the_same_thing(scripted_gemini):
 
     assert calls[0]["contents"] == calls[1]["contents"]
     assert calls[0]["model"] == calls[1]["model"] == "gemini-test"
+
+
+def test_every_call_is_given_a_deadline(monkeypatch):
+    """A request that is never answered raises nothing, so nothing retries it."""
+    monkeypatch.setattr(config, "GEMINI_TIMEOUT_SECONDS", 90.0)
+    built = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return FakeGeminiResponse("ok")
+
+    class RecordingClient:
+        def __init__(self, api_key=None, http_options=None):
+            built.append(http_options)
+            self.models = FakeModels()
+
+    monkeypatch.setattr(genai, "Client", RecordingClient)
+    script_gen.call_gemini("p", system_instruction="s")
+
+    assert built[0].timeout == 90_000      # HttpOptions counts in milliseconds
+
+
+def test_a_call_that_never_answers_is_retried_like_any_other_blip(
+        scripted_gemini, _no_real_sleeping):
+    """What the deadline buys: a hang becomes an error the retry already knows."""
+    import httpx
+
+    calls = scripted_gemini(httpx.ReadTimeout("timed out"),
+                            FakeGeminiResponse("ok"))
+
+    assert script_gen.call_gemini("p", system_instruction="s") == "ok"
+    assert len(calls) == 2
 
 
 def test_generate_script_rides_out_a_blip(scripted_gemini):

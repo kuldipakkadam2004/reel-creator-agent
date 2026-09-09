@@ -531,6 +531,17 @@ GEMINI_API_KEY = get_env("GEMINI_API_KEY")
 GEMINI_MODEL = get_env("GEMINI_MODEL", "gemini-2.5-pro")
 REQUIRED_SCRIPT_GEN = ("GEMINI_API_KEY",)
 
+#: How long one Gemini call may go unanswered before it is abandoned, in
+#: seconds. The SDK ships no default, so a request that is never answered
+#: simply waits: on 2026-09-09 the first call of step 2 held an open
+#: connection for fourteen minutes, burning no CPU, and the run had to be
+#: killed by hand. A hang raises nothing, so the retry logic never sees it -
+#: where a timeout raises `httpx.ReadTimeout`, which is a transport error, and
+#: `script_gen._is_retryable` already retries those. The default is generous
+#: against a slow pro call - the four calls of step 2 together take about
+#: 150s - and finite against a dead one.
+GEMINI_TIMEOUT_SECONDS = get_env_float("GEMINI_TIMEOUT_SECONDS", 120.0)
+
 # --- the length -------------------------------------------------------------
 # How long a reel should be is a decision, not a flag with a number in it.
 # Completion is what the ranking runs on, so a 30-second reel watched to the
@@ -1786,6 +1797,30 @@ PERFORMANCE_MIN_SAMPLES = get_env_int("PERFORMANCE_MIN_SAMPLES", 8)
 #: about the reel, and nobody has to see a reel for it to be true.
 PERFORMANCE_MIN_REACH = get_env_int("PERFORMANCE_MIN_REACH", 30)
 
+#: How many accounts belonging to whoever runs this see every reel - the
+#: operator's own login and any alts. Subtracted before anything is called
+#: engagement.
+#:
+#: Not a guess. Read off the ledger on 2026-09-09, the eight posted reels
+#: carried likes of 3, 3, 3, 3, 3, 3, 3 and 4 - a dead constant, and the 4
+#: on the only reel that ever reached a real audience. Real engagement is
+#: not "likes are low", it is **one like, ever**, and the report was
+#: printing the other twenty-four as though an audience had left them.
+#:
+#: Three consequences, all of which the report now applies:
+#:   * a reel whose reach does not exceed this reached **nobody**, so its
+#:     likes, saves and comments are the operator's own by definition and
+#:     count as zero. Four of the eight are in that state;
+#:   * `followers_count` is not an audience when the followers are the same
+#:     accounts. Two followers here, both the operator's;
+#:   * the raw numbers are still stored raw. This is applied when the report
+#:     reads them, so the figure Instagram gave is never overwritten and
+#:     lowering this later re-reads the same history honestly.
+#:
+#: 0 means every number is somebody else's, which is the right default for
+#: an account nobody is seeding by hand.
+PERFORMANCE_OWN_ACCOUNTS = get_env_int("PERFORMANCE_OWN_ACCOUNTS", 0)
+
 #: Hours after posting within which a measurement is comparable with the rest.
 #: A reel read at twelve hours and one read at a week are not the same
 #: measurement, and averaging them measures when you happened to look. 0 turns
@@ -2033,6 +2068,7 @@ def _report() -> None:
          else "off (the board may hold topics step 4 cannot shoot)"),
         ("TOPIC_PHRASE_MODE", TOPIC_PHRASE_MODE),
         ("GEMINI_MODEL", GEMINI_MODEL),
+        ("GEMINI_TIMEOUT", f"{GEMINI_TIMEOUT_SECONDS:g}s per call, then retried"),
         ("SCRIPT_LENGTH", f"{SCRIPT_DEFAULT_SECONDS}s default, step 0 suggests "
                           f"{SCRIPT_MIN_SECONDS}-{SCRIPT_MAX_SECONDS}s "
                           f"in steps of {SCRIPT_DURATION_STEP_SECONDS}"),

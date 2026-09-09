@@ -271,6 +271,41 @@ fixed order the same subreddits are the ones missing every time, which is how
 board #62 came back holding nothing but the group that happened to be first.
 `TOPIC_REDDIT_FEEDS=1` is exactly the single combined URL this replaced.
 
+**Splitting is not enough on its own — where the boundary falls decides who
+gets read.** The list is divided into exactly the number of feeds asked for,
+with any spare places going to the *last* group, so nine subreddits into two
+feeds split **4/5 and not 5/4**. That is what keeps the head of the list
+together: write the biggest subs first and the four large defaults take one
+feed while the five chosen for the niche take the other. Under 5/4 the fifth
+name was pushed in with
+the giants — measured live on 2026-09-09, `r/todayilearned` took all twenty
+places in that group and `r/askscience`, `r/explainlikeimfive`, `r/science`
+and `r/geology` returned nothing, every day, because the boundary never
+moved. **List order in `TOPIC_SUBREDDITS` is load-bearing for this reason.**
+
+Rotating *membership* by the day was built here and **measured worse the
+same hour**, so it is not in the code. It rescues the fifth name by moving
+the boundary, but it also moves the largest subreddit into the niche group
+on most days: doing so put `r/todayilearned` in with `r/EarthScience`,
+`r/marinebiology`, `r/oceans` and `r/Awwducational`, where it took all
+twenty places from the four subs that were actually producing the board.
+Keeping the giants together every day beats sharing the damage out. The
+arithmetic argument for rotation counts the days it helps and not the days
+it hurts, which only shows up against the real feed.
+
+**Sizes inside the niche group still decide it, and that is not settled here.**
+`r/geology` is ~700k members and took **19 of 20 places** from `r/EarthScience`
+when the two shared a feed, so moving it out of the giants' group may crowd out
+`r/marinebiology` and `r/Awwducational`, which are the subs currently producing
+the board. That was not measurable in one sitting — the anonymous endpoint rate
+limits well before you can try several groupings — and it does not need to be:
+the note below reports it on every ordinary scout.
+
+A subreddit that returns nothing is now **named in a note on the board**
+rather than being silently absent. A combined feed does not read a small sub
+thinly, it does not read it at all and says nothing about it — which is how
+seven of nine went unread for weeks behind a healthy-looking `fetched 40`.
+
 **Measured on board #65**, the first scouted after the split: `redditrss 40,
 evergreen 40` where the run before it managed `redditrss 14`, all of them from
 one subreddit. The board's top line was a live Reddit topic at **2.50** — *how
@@ -408,9 +443,7 @@ carried into the `script_gen.py` command as `-d`:
 The decision runs **after** the phrase pass below, not before. The rewrite is
 what turns "TIL that the ocean is salty because rivers carry minerals into it"
 into "why the ocean is salty" — a fact into a mechanism, which is most of what
-the length turns on. Scoring runs before the rewrite because it has to rank
-candidates that are about to be discarded; this runs after, because it only
-concerns the ones that survived and it reads their final wording.
+the length turns on.
 
 `-d` still overrides it, and `SCRIPT_MIN`/`MAX_SECONDS` bound the suggestion
 rather than the flag. A topic that reaches step 2 without coming through a
@@ -421,7 +454,27 @@ board — you brought your own — gets `SCRIPT_DEFAULT_SECONDS`.
 A Reddit title is not a topic. `clean_title` strips the furniture (`TIL`,
 `ELI5`, `[OC]`, trailing outlet credits) locally, and then one Gemini call
 rewrites the whole shortlist into topic phrases — one call, not one per
-candidate, and only after the ranking is settled.
+candidate.
+
+**It runs before the ranking is settled, not after**, and the board is scored
+twice because of it. Three of the components read the *form* of the wording —
+the opening word (`explainer shape`), the length (`too long`) and the proper
+nouns — and those are the three the rewrite exists to fix. Charging them to a
+headline marks a candidate down for a shape it is about to lose: measured on
+board #33, they came to **−2.24 a row across seventeen Reddit candidates
+against +0.49 across seventeen backlog lines**, which are written as topic
+phrases by hand and collect the bonus for free. That is a 2.7 point handicap
+on the *source* rather than on the topic, and the backlog won every board.
+
+So the first pass scores everything on its subject alone — velocity, the niche
+match, curiosity, the banned words, all of which the rewrite is told to
+preserve — and picks the shortlist. The phrase pass settles what that
+shortlist says. Then the shortlist is scored again, form included, and the
+footage probe runs on the rewritten wording rather than asking a stock library
+for "Naked mole-rats can survive up to 18 minutes without oxygen by switching
+their metabolism to run on fructose instead of glucose". A winner that was
+never on the shortlist and rose into the board on the re-sort is rewritten
+behind it, so nothing reaches step 2 as a raw headline.
 
 **It rewrites and nothing else.** The model is never shown the scores, never
 asked to rank or reorder, and a rewrite that shares too little with its
@@ -1702,6 +1755,44 @@ says so about itself rather than reading as "nothing fired".
   whatever is newest, which is precisely the reel you are most curious about.
   `PERFORMANCE_METRIC` defaults to a watch figure for the same reason: it is
   the one that does not simply climb with the account;
+* **the account's own size is printed before anything divides by it.**
+  Every ratio in the report is a reel measured against the people who were
+  shown it, and for the first seven posts that was 289, 64, 9, 6, 3, 3 and
+  0. The report printed all of them as `1.00x an ordinary reel` and never
+  said how many accounts were behind the number. `--fetch` now reads
+  `followers_count` with the insights and stores it as one `account` block
+  on the ledger — one row about the account, not a column copied onto every
+  reel — and the report opens with an `AUDIENCE` line. A token that cannot
+  see the count prints *not read* rather than a zero: nobody following the
+  account and no permission to see who does are different findings, and
+  only one of them is about the reels;
+* **your own accounts are not an audience, and they were most of the
+  numbers.** `PERFORMANCE_OWN_ACCOUNTS` is how many logins belonging to
+  whoever runs the account see every reel. It is not a guess here: likes
+  across the eight posted reels were **3, 3, 3, 3, 3, 3, 3 and 4** — a dead
+  constant, plus the single real like on the only reel that ever reached a
+  real audience. Read as a total that is twenty-five likes and a quiet
+  account; read against the floor it is **one like, ever**, which is a
+  different fact and the one worth acting on. The ratio tables cannot find
+  it — a column holding the same constant on every row is no finding to
+  them — so the report prints it outright:
+
+  ```
+  AUDIENCE: 2 follower(s) on @groundtruth.earth, 8 post(s) - your own
+            accounts, so the audience here is nobody
+  REACHED : 356 impression(s) that were not yours, across 8 posted
+            reel(s); 4 of them reached nobody at all
+  ACTED   : 1 like, 0 comments, 0 saves, 0 shares - 0.28% of them liked it
+  ```
+
+  A reel whose reach does not clear the floor **reached nobody**, so its
+  likes and comments are the operator's own by definition and the whole row
+  is discarded rather than shaved — which is why a comment on a reel with a
+  reach of three does not survive into the total. Reach, views and likes are
+  netted; comments are not, because own accounts do not comment on every
+  post and subtracting a flat count would invent negative ones. The stored
+  numbers stay raw, so lowering the setting re-reads the same history rather
+  than having overwritten it;
 * **the watch figure is `watch_ratio`, not `watch_through`.** Instagram's
   average watch time counts replays, so it can exceed the length of the reel —
   89.5 seconds of average watch time on a 37.59-second reel, measured here.

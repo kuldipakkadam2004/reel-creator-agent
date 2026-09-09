@@ -500,6 +500,10 @@ def sourceability_rung(rating: int) -> float:
 #: these are labels, not prose.
 PHRASE_TEMPERATURE = 0.3
 PHRASE_MAX_TOKENS = 1024
+#: Output budget per headline, used when the batch is bigger than the fixed
+#: floor above covers. One {"index": 0, "topic": "..."} object runs about 25
+#: tokens; 48 leaves room for a long subject without risking a truncated array.
+PHRASE_TOKENS_PER_PHRASE = 48
 PHRASE_THINKING_BUDGET = 0
 
 #: How much of a rewrite has to have come from the original before it counts
@@ -660,6 +664,12 @@ class Candidate:
     score: float = 0.0
     components: dict = dataclass_field(default_factory=dict)
     sourceability: dict = dataclass_field(default_factory=dict)
+    #: True while `topic` is a cleaned headline the phrase pass has yet to
+    #: rewrite - so the wording is not what would ship, and the parts of the
+    #: score that read wording cannot be charged against it yet. Cleared by
+    #: `polish_phrases` for every candidate it is handed, rewritten or not:
+    #: after that pass the headline standing *is* the final wording.
+    provisional: bool = False
     #: How long the reel about this should be, and the parts that decided it.
     #: Filled in after the phrase pass, because the phrasing is what says
     #: whether this is a mechanism or a fact.
@@ -1004,6 +1014,10 @@ class Source:
     keys_optional = False
     #: The unit `Candidate.rate` is measured in, for the printed board.
     rate_unit = ""
+    #: False where `Candidate.topic` is a cleaned headline rather than a topic
+    #: phrase, which is every source that reads someone else's titles. The
+    #: backlog is the exception: its lines are written as topics already.
+    wording_is_final = False
 
     def __init__(self, session):
         self.session = session
@@ -1511,7 +1525,8 @@ class RedditRssSource(Source):
         return True, "ready (no key required)"
 
     @staticmethod
-    def _groups(subreddits, most: int) -> list[tuple[str, ...]]:
+    def _groups(subreddits, most: int,
+                day: int | None = None) -> list[tuple[str, ...]]:
         """Split the subreddit list into at most `most` combined feeds.
 
         One combined `a+b+c` feed is one request, which is what the rate limit
@@ -1533,9 +1548,33 @@ class RedditRssSource(Source):
         group for the same reason - position among comparable subreddits is
         the honest reading of `_rate_for_rank`.
 
+        **List order decides who shares a feed, so the biggest subreddits go
+        first.** The remainder lands on the *last* group rather than the first,
+        which is what keeps them together: nine subreddits into two feeds split
+        4/5 and not 5/4, so the four large defaults take one feed and the five
+        chosen for the niche take the other. Under 5/4 the fifth name was
+        pushed in with the giants and never read - measured live on 2026-09-09,
+        r/todayilearned took all twenty places in that group and r/askscience,
+        r/explainlikeimfive, r/science and r/geology returned nothing.
+
+        Rotating membership by the day was tried here and **measured worse**.
+        It rescues the fifth name by moving the boundary, but it also moves the
+        largest subreddit into the niche group on most days: on 2026-09-09 that
+        put r/todayilearned in with r/EarthScience, r/marinebiology, r/oceans
+        and r/Awwducational, and it took all twenty places from the four subs
+        that were actually producing the board. Keeping the giants together
+        every day beats sharing the damage out. `_rotate` still rotates which
+        feed is read *first*, because that is a different question - it is
+        about which group loses when the rate limit bites, not about who is in
+        it. `day` is accepted and unused, so a caller that was passing it does
+        not break.
+
         Balanced rather than one-per-request: the constraint being respected is
         the request count, so the list is divided into `most` groups and not
         into groups of `most`. At 1 this is exactly the old single-feed call.
+        Exactly `most` groups, too - chunking by a ceiling silently returned
+        three feeds when four were asked for, spending fewer requests than it
+        was allowed and reading fewer subreddits for no reason.
         """
         subs = [str(name).strip() for name in subreddits if str(name).strip()]
         if not subs:
@@ -1543,8 +1582,18 @@ class RedditRssSource(Source):
         most = max(1, int(most))
         if most >= len(subs):
             return [(name,) for name in subs]
-        size = math.ceil(len(subs) / most)
-        return [tuple(subs[i:i + size]) for i in range(0, len(subs), size)]
+
+        base, spare = divmod(len(subs), most)
+        groups: list[tuple[str, ...]] = []
+        at = 0
+        for index in range(most):
+            # The spare places go to the last `spare` groups, so the head of
+            # the list - where the big subreddits are - stays as tightly packed
+            # as it can be.
+            size = base + (1 if index >= most - spare else 0)
+            groups.append(tuple(subs[at:at + size]))
+            at += size
+        return groups
 
     @staticmethod
     def _rotate(groups: list, day: int | None = None) -> list:
@@ -1673,7 +1722,44 @@ class RedditRssSource(Source):
                 f"{len(failures)} of {len(groups)} subreddit feed(s) failed - "
                 f"{failures[-1]}"
             )
-        return out[:limit]
+
+        kept = out[:limit]
+        self.notes.extend(self._starved(kept))
+        return kept
+
+    def _starved(self, found: list[Candidate]) -> list[str]:
+        """A note naming the subreddits that returned nothing, if any.
+
+        A combined feed is ranked by absolute score, so a subreddit that
+        shares its group with a much larger one is not read thinly - it is
+        not read at all, and says nothing about it. That is exactly how nine
+        subreddits went up as one feed and seven of them went unread for
+        weeks: `fetched 40` looked like a healthy number and no other line
+        contradicted it.
+
+        Measured live on 2026-09-09 at TOPIC_REDDIT_FEEDS=2: of the group
+        holding todayilearned, askscience, explainlikeimfive, science and
+        geology, r/todayilearned took all twenty places and the other four
+        returned nothing. A note rather than a warning - a starved feed is
+        worth seeing on the board, not worth stopping a scout for.
+        """
+        if not found:
+            return []
+        # Case-insensitively: the feed spells a subreddit the way its mods
+        # do (r/EarthScience) and TOPIC_SUBREDDITS however it was typed.
+        seen = {
+            candidate.context.split()[0].removeprefix("r/").lower()
+            for candidate in found if candidate.context
+        }
+        missing = [name for name in self.subreddits
+                   if str(name).strip().lower() not in seen]
+        if not missing:
+            return []
+        return [f"{len(missing)} of {len(self.subreddits)} subreddit(s) "
+                f"returned nothing - {', '.join(missing)}. A bigger "
+                f"subreddit in the same feed outranks them; give them a "
+                f"feed of their own by raising TOPIC_REDDIT_FEEDS, or "
+                f"reorder TOPIC_SUBREDDITS so they group together."]
 
     def _parse(self, body: bytes, limit: int) -> list[Candidate]:
         """One feed's XML into candidates. `rank` is within this feed."""
@@ -1871,6 +1957,9 @@ class WikipediaSource(Source):
 class EvergreenSource(Source):
     """The hand-written backlog, read as a source like any other.
 
+    Its lines are written as topic phrases, so `wording_is_final` is True and
+    the phrase pass leaves them alone.
+
     A source that makes no request and measures no motion, which is the point.
     Every other source here answers "what is moving?", and on a narrow niche
     that question has an empty answer most days - see TOPIC_EVERGREEN_FILE in
@@ -1897,6 +1986,7 @@ class EvergreenSource(Source):
     name = "evergreen"
     key_env = ()
     rate_unit = ""
+    wording_is_final = True
 
     @classmethod
     def overrides(cls, **supplied) -> dict:
@@ -2087,6 +2177,14 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
     included - it is added by `apply_sourceability` after the probe, so the
     expensive check only runs on candidates the free checks already like.
 
+    A candidate carrying `provisional` is scored on its subject alone. The
+    three components that read the *form* of the wording - the opening word,
+    the length and the proper nouns - are the three the phrase pass exists
+    to fix, so charging them to a headline marks a candidate down for a
+    shape it is about to lose. `find_topics` scores twice for this reason:
+    once to pick a shortlist, and again once `polish_phrases` has settled
+    what that shortlist actually says.
+
     `on_niche` is the niche pass's verdict where there is one. Left at None the
     subject is judged on shared words alone, which is what the standalone
     scorer and every caller without a Gemini key gets.
@@ -2128,9 +2226,6 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
     elif fits is False:
         parts["off the niche"] = NICHE_MISS_PENALTY
 
-    if _is_explainer(topic):
-        parts["explainer shape"] = EXPLAINER_BONUS
-
     curiosity, signals = curiosity_component(topic)
     if signals:
         # Named after what fired, so the printed board argues its own case.
@@ -2139,16 +2234,33 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
     if hype_words(topic):
         parts["hype in the title"] = HYPE_PENALTY
 
-    names = _proper_nouns(topic)
-    if names:
-        parts["proper nouns"] = round(
-            max(PROPER_NOUN_FLOOR, PROPER_NOUN_PENALTY * len(names)), 3
-        )
+    # The three components that read the *form* of the wording rather than its
+    # subject, and so cannot be charged while the wording is still a headline.
+    # The phrase pass exists to turn "TIL that X, which is why Y" into "why Y":
+    # it fixes exactly the opening word, the length and the proper nouns these
+    # three measure, so scoring them on the headline marks a candidate down for
+    # a shape it is about to lose. Measured on board #33: across seventeen
+    # reddit rows these three summed to -2.24 a row against +0.49 for the
+    # seventeen backlog lines, whose wording is final and explainer-shaped by
+    # hand - a 2.7 point handicap on the source, not on the topic.
+    #
+    # Content is charged either way. Curiosity, hype, the niche match and the
+    # banned words all read what the topic is *about*, and the phrase pass is
+    # told to keep the subject, so those survive the rewrite.
+    if not candidate.provisional:
+        if _is_explainer(topic):
+            parts["explainer shape"] = EXPLAINER_BONUS
 
-    if len(words) < TITLE_MIN_WORDS:
-        parts["too short"] = TITLE_SHORT_PENALTY
-    elif len(words) > TITLE_MAX_WORDS:
-        parts["too long"] = TITLE_LONG_PENALTY
+        names = _proper_nouns(topic)
+        if names:
+            parts["proper nouns"] = round(
+                max(PROPER_NOUN_FLOOR, PROPER_NOUN_PENALTY * len(names)), 3
+            )
+
+        if len(words) < TITLE_MIN_WORDS:
+            parts["too short"] = TITLE_SHORT_PENALTY
+        elif len(words) > TITLE_MAX_WORDS:
+            parts["too long"] = TITLE_LONG_PENALTY
 
     if limit > 0 and candidate.age_hours > limit:
         parts["past its peak"] = STALE_PENALTY
@@ -2934,9 +3046,20 @@ def polish_phrases(candidates: list[Candidate], *, mode: str | None = None) -> l
     Returns warnings. Every failure path - no key, a refused call, unparseable
     JSON, a rewrite that wandered - leaves the heuristic phrase in place, which
     is a usable topic already.
+
+    Every candidate handed in comes back with `provisional` cleared, on all of
+    those paths. The flag means "a rewrite is still coming", not "a rewrite
+    succeeded": once this pass has had its go the wording that stands is the
+    wording that ships, and `score_candidate` is entitled to read its shape
+    even when what stands is the headline it arrived with.
     """
     setting = (mode or config.TOPIC_PHRASE_MODE or "heuristic").strip().lower()
     if setting != "llm" or not candidates:
+        # Before the return, so that switching the pass off does not leave the
+        # board scored as though a rewrite were still coming. With no rewrite
+        # coming, the cleaned headline is the final wording.
+        for candidate in candidates:
+            candidate.provisional = False
         return []
 
     headlines = "\n".join(
@@ -2952,19 +3075,30 @@ def polish_phrases(candidates: list[Candidate], *, mode: str | None = None) -> l
             prompt,
             system_instruction=_PHRASE_SYSTEM_INSTRUCTION,
             temperature=PHRASE_TEMPERATURE,
-            max_output_tokens=PHRASE_MAX_TOKENS,
+            # Scaled to the batch rather than fixed. This runs on the probe
+            # shortlist now, not on the eight-row board the 1024 was sized
+            # for, and a budget that truncates the array loses every rewrite
+            # past the cut - which arrives here as absent entries and is then
+            # kept as headlines, silently and with no warning.
+            max_output_tokens=max(
+                PHRASE_MAX_TOKENS, PHRASE_TOKENS_PER_PHRASE * len(candidates)
+            ),
             thinking_budget=PHRASE_THINKING_BUDGET,
             json_mode=True,
         )
         rewritten = _parse_phrase_json(raw, len(candidates))
     except (script_gen.ScriptGenerationError, config.MissingConfigError,
             ValueError) as exc:
+        for candidate in candidates:
+            candidate.provisional = False
         return [f"the phrase pass failed ({exc}). "
                 f"Kept the cleaned headlines as topics."]
 
     warnings: list[str] = []
     drifted = 0
     for index, candidate in enumerate(candidates):
+        # Whatever the model returned for it, this candidate has had its go.
+        candidate.provisional = False
         topic = rewritten.get(index)
         if not topic:
             continue
@@ -3111,6 +3245,11 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
                             "detail": f"{type(exc).__name__}: {exc}"})
             continue
 
+        for candidate in found:
+            # Set here rather than at six Candidate(...) sites: whether a
+            # topic still needs rewriting is a fact about the source, and the
+            # source class is the thing that knows it.
+            candidate.provisional = not cls.wording_is_final
         gathered.extend(found)
         for note in getattr(source, "notes", ()):
             warnings.append(f"{name}: {note}")
@@ -3154,6 +3293,11 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
     if niche_mode != "off":
         verdicts, niche_warnings = classify_niche(fresh, niche, mode=niche_match)
         warnings.extend(niche_warnings)
+    # By key as well as by index: the re-score after the phrase pass works off
+    # a shortlist that has been sorted twice by then, so the position a verdict
+    # arrived at is no longer the position its candidate is in.
+    verdict_by_key = {candidate.key: verdicts.get(index)
+                      for index, candidate in enumerate(fresh)}
 
     scored: list[Candidate] = []
     for index, candidate in enumerate(fresh):
@@ -3207,12 +3351,53 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
         scored = sorted(on_niche + off_niche[:short],
                         key=lambda c: (-c.score, len(c.topic)))
 
+    # --- 2c. settle the wording before anything reads it -------------------
+    # The phrase pass used to run in step 4, on the finished board. That put it
+    # after both of the passes that read wording, and each was reading a
+    # headline it was about to rewrite:
+    #
+    #   * `score_candidate` charges the opening word, the length and the proper
+    #     nouns. A reddit headline has none of the first and too much of the
+    #     other two, so a live post was marked down for a shape the rewrite
+    #     was about to give it. Measured on board #33, those three components
+    #     came to -2.24 a row across seventeen reddit candidates against +0.49
+    #     across seventeen backlog lines - a handicap on the source rather than
+    #     on the topic, and the backlog won every board because of it.
+    #   * the footage probe searches for what the topic says. It was asking the
+    #     stock libraries for "Naked mole-rats can survive up to 18 minutes
+    #     without oxygen by switching their metabolism to run on fructose
+    #     instead of glucose, a trick otherwise only seen in plants" - a
+    #     sentence no library has ever been asked for - instead of for "how
+    #     naked mole-rats survive without oxygen".
+    #
+    # On the shortlist and not on everything read, for the reason the probe
+    # gives below: it is one model call and its output is worth spending on
+    # candidates the free checks already like. Sharing the probe's shortlist
+    # rather than taking its own keeps the two passes talking about one set.
+    shortlist = scored[:max(wanted, config.TOPIC_PROBE_LIMIT)]
+    warnings.extend(polish_phrases(shortlist, mode=phrases))
+
+    # Re-scored, because the wording moved under the score. This is the point
+    # at which the form components are charged, and it is deliberately before
+    # the probe: `apply_sourceability` and `apply_measured` add to
+    # `components` and recompute from it, so a rebuild after either of them
+    # would throw their work away.
+    for candidate in shortlist:
+        result = score_candidate(
+            candidate, niche_terms=niche_terms, banned=banned,
+            seen=ledger.seen_recently(candidate.key),
+            on_niche=verdict_by_key.get(candidate.key),
+            refused=ledger.refusals(candidate.key),
+        )
+        candidate.score = result["score"]
+        candidate.components = result["components"]
+    scored.sort(key=lambda c: (-c.score, len(c.topic)))
+
     # --- 3. probe the shortlist for footage --------------------------------
     # Only the shortlist: the probe costs a request per candidate, and there is
     # no point asking whether a topic that lost on every other count is
     # shootable.
     probed = 0
-    shortlist = scored[:max(wanted, config.TOPIC_PROBE_LIMIT)]
     if probe_mode == "llm" and shortlist:
         # One call for the shortlist rather than a request per candidate. The
         # keyword probe this replaced is still here and still selectable, but
@@ -3283,8 +3468,15 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
 
     board = scored[:wanted]
 
-    # --- 4. polish the winners into topic phrases --------------------------
-    warnings.extend(polish_phrases(board, mode=phrases))
+    # --- 4. catch any winner the shortlist missed --------------------------
+    # Step 2c polishes the shortlist, but the sorts after it read every
+    # candidate, so one that was never on the shortlist can still finish inside
+    # `wanted` - the same way an unprobed candidate always could. Those arrive
+    # here still provisional, and without this they would ship to step 2 as raw
+    # headlines. Normally an empty list, and `polish_phrases` returns straight
+    # away on one.
+    stragglers = [candidate for candidate in board if candidate.provisional]
+    warnings.extend(polish_phrases(stragglers, mode=phrases))
 
     # --- 5. decide how long each one should be -----------------------------
     # After the phrase pass and not before. The rewrite is what turns "TIL that

@@ -2577,6 +2577,38 @@ def test_narration_without_a_comparison_is_never_flagged():
     )
 
 
+def test_step_4_builds_its_clients_with_the_same_deadline(monkeypatch):
+    """Step 4 speaks to the SDK itself, so it needs the timeout step 2 has."""
+    from google import genai
+
+    from pipeline import script_gen
+
+    monkeypatch.setattr(config, "GEMINI_TIMEOUT_SECONDS", 75.0)
+    beats = visuals.segment_script("It is utterly dark down there.", 8.0)
+    payload = json.dumps([
+        {"index": beat.index, "query": "dark water", "alt": "deep sea",
+         "image_prompt": "black water"} for beat in beats
+    ])
+    built = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return type("R", (), {"text": payload})()
+
+    class RecordingClient:
+        def __init__(self, api_key=None, http_options=None):
+            built.append(http_options)
+            self.models = FakeModels()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(genai, "Client", RecordingClient)
+
+    visuals.llm_queries(beats, "the deep ocean")
+
+    assert built[0] == script_gen.client_http_options()
+    assert built[0].timeout == 75_000
+
+
 def test_the_check_is_advisory_and_does_not_replace_the_query(monkeypatch):
     """A warning the operator can read, not a good query silently discarded."""
     from google import genai
@@ -2595,8 +2627,9 @@ def test_the_check_is_advisory_and_does_not_replace_the_query(monkeypatch):
             return type("R", (), {"text": payload})()
 
     class FakeClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_options=None):
             self.models = FakeModels()
+            self.http_options = http_options
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(genai, "Client", FakeClient)

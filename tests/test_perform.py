@@ -1816,3 +1816,180 @@ def test_a_batch_relabel_does_not_print_its_sentence_three_times(paths):
 
     assert rows[0]["code"] == "other" and rows[0]["n"] == 4
     assert rows[0]["notes"] == ["reason lost", "ffmpeg exited 3221225786"]
+
+
+
+# ---------------------------------------------------------------------------
+# The audience the reach figures are divided by
+# ---------------------------------------------------------------------------
+
+def test_the_ledger_keeps_one_account_block(tmp_path):
+    ledger = perform.PerformanceLedger(tmp_path / "p.json")
+    assert ledger.audience == {}
+
+    ledger.set_audience({"followers": 2, "username": "reels"})
+    ledger.save()
+
+    assert perform.PerformanceLedger(tmp_path / "p.json").audience["followers"] == 2
+
+
+def test_a_read_that_could_not_see_the_count_does_not_erase_the_last_one(tmp_path):
+    """Not knowing today is not evidence that yesterday was wrong."""
+    ledger = perform.PerformanceLedger(tmp_path / "p.json")
+    ledger.set_audience({"followers": 2})
+    ledger.set_audience({})
+    assert ledger.audience["followers"] == 2
+
+
+def test_the_account_block_survives_the_providers_own_save(tmp_path, monkeypatch):
+    """The provider writes to the ledger itself while `fetch` holds a copy read
+    before it ran. The per-reel fields are merged back; without the same for the
+    account block the save below reverts it - which it did."""
+    monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "p.json")
+    outer = perform.PerformanceLedger()
+    outer.register({"run_id": "r1", "created_at": "2026-09-01T00:00:00+00:00"})
+    outer.save()
+
+    def provider(run_ids, features_by_run):
+        # What pipeline/instagram.py does: a second ledger, written to disk.
+        inner = perform.PerformanceLedger()
+        inner.set_audience({"followers": 2, "username": "reels"})
+        inner.save()
+        return {"r1": {"views": 10, "reach": 8}}
+
+    perform.fetch(ledger=outer, provider=provider)
+    outer.save()
+
+    assert perform.PerformanceLedger().audience["followers"] == 2
+
+
+def test_the_report_says_so_when_the_audience_was_never_read(capsys):
+    perform._print_audience({}, 6)
+    printed = capsys.readouterr().out
+    assert "not read" in printed
+    assert "--fetch" in printed
+
+
+def test_the_report_prints_the_audience_a_reach_is_measured_against(capsys):
+    perform._print_audience(
+        {"followers": 2, "username": "reels", "posts": 8,
+         "read_at": "2026-09-09T14:14:37+00:00"}, 3)
+    printed = capsys.readouterr().out
+
+    assert "2 follower(s)" in printed
+    assert "@reels" in printed
+    # A median reel reaching 3 accounts off a following of 2 is the finding:
+    # the reels are leaving the follower graph, there is just no graph.
+    assert "1.50x" in printed
+
+
+def test_no_ratio_is_printed_against_no_followers(capsys):
+    """Dividing by zero followers is not a bigger number, it is not a number."""
+    perform._print_audience({"followers": 0}, 3)
+    printed = capsys.readouterr().out
+    assert "0 follower(s)" in printed
+    assert "x that" not in printed
+
+
+
+# ---------------------------------------------------------------------------
+# The operator's own accounts are not an audience
+# ---------------------------------------------------------------------------
+
+def _posted(reach, likes, **rest):
+    metrics = {"reach": reach, "views": reach, "likes": likes,
+               "comments": 0, "saves": 0, "shares": 0}
+    metrics.update(rest)
+    return {"status": "posted", "metrics": metrics}
+
+
+def test_own_accounts_come_out_of_the_inflated_metrics(monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 3)
+    net = perform.net_of_own({"reach": 289, "views": 373, "likes": 4,
+                              "comments": 2, "saves": 0})
+
+    assert net["reach"] == 286
+    assert net["views"] == 370
+    assert net["likes"] == 1
+    # Own accounts do not comment on every post, so a flat subtraction there
+    # would invent comments that were never left.
+    assert net["comments"] == 2
+
+
+def test_nothing_is_taken_out_when_nobody_is_seeding(monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 0)
+    raw = {"reach": 289, "likes": 4}
+    assert perform.net_of_own(raw) == raw
+
+
+def test_a_stale_reading_under_the_floor_does_not_go_negative(monkeypatch):
+    """`own` is a declared count. A reel read before every alt had opened it
+    sits under it, which is a stale reading and not negative reach."""
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 3)
+    assert perform.net_of_own({"reach": 1, "likes": 0})["reach"] == 0
+
+
+def test_the_stored_row_is_never_rewritten(monkeypatch):
+    """Applied when the report reads them, so lowering the setting later
+    re-reads the same history rather than having overwritten it."""
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 3)
+    raw = {"reach": 289, "likes": 4}
+    perform.net_of_own(raw)
+    assert raw == {"reach": 289, "likes": 4}
+
+
+def test_a_reel_that_reached_nobody_contributes_no_engagement(monkeypatch):
+    """Its likes and comments are the operator's own by definition. The whole
+    row is discarded rather than netted off - which is why a comment on a reel
+    with a reach of three does not survive into the total."""
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 3)
+    real = perform.real_engagement([_posted(3, 3, comments=1)])
+
+    assert real["reach"] == 0
+    assert real["likes"] == 0
+    assert real["comments"] == 0
+    assert real["unseen"] == 1
+    assert real["reels"] == 1
+
+
+def test_the_one_real_like_survives_a_constant_of_three(monkeypatch):
+    """The ledger as it stood on 2026-09-09. Read as a total it is twenty-five
+    likes and a quiet account; read against the floor it is one like, ever."""
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 3)
+    rows = [_posted(289, 4), _posted(64, 3), _posted(9, 3), _posted(6, 3),
+            _posted(3, 3), _posted(3, 3), _posted(0, 3), _posted(0, 3)]
+
+    real = perform.real_engagement(rows)
+
+    assert real["likes"] == 1
+    assert real["reach"] == 286 + 61 + 6 + 3
+    assert real["unseen"] == 4
+    assert real["reels"] == 8
+
+
+def test_the_report_says_the_followers_are_your_own(capsys, monkeypatch):
+    """A follower count that is entirely the operator's own logins is not a
+    small audience, it is no audience, and the two lead to opposite calls."""
+    perform._print_audience({"followers": 2, "username": "reels"}, 3, own=3,
+                            real={"reels": 8, "reach": 356, "likes": 1,
+                                  "comments": 0, "saves": 0, "shares": 0,
+                                  "unseen": 4})
+    printed = capsys.readouterr().out
+
+    assert "your own accounts" in printed
+    assert "audience here is nobody" in printed
+    # And the ratio that would read as growth is not printed against them.
+    assert "x that" not in printed
+    assert "356 impression(s) that were not yours" in printed
+    assert "1 like," in printed
+    assert "0.28%" in printed
+
+
+def test_the_real_lines_are_absent_when_nobody_is_seeding(capsys):
+    perform._print_audience({"followers": 400, "username": "reels"}, 600,
+                            own=0, real={"reels": 8, "reach": 4800})
+    printed = capsys.readouterr().out
+
+    assert "REACHED" not in printed
+    assert "ACTED" not in printed
+    assert "1.50x that" in printed

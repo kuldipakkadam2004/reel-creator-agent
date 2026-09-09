@@ -748,3 +748,56 @@ def test_cli_media_lists_what_the_api_sees(credentials, monkeypatch, capsys):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+
+# ---------------------------------------------------------------------------
+# The audience the reach figures are divided by
+# ---------------------------------------------------------------------------
+
+def test_the_account_call_asks_for_the_follower_count(credentials):
+    session = FakeSession({"/": {"id": "178", "username": "reels",
+                                 "followers_count": 2, "follows_count": 0,
+                                 "media_count": 8}})
+    instagram.account(session)
+    asked = session.asked[0][1]["fields"]
+    assert "followers_count" in asked
+
+
+def test_a_field_the_api_refuses_does_not_cost_the_whole_call(credentials):
+    """A token that cannot see the follower count must still be able to prove
+    itself - proving itself is this call's first job."""
+    answers = [
+        {"error": {"message": "(#100) followers_count is not valid",
+                   "code": 100}},
+        {"id": "178", "username": "reels"},
+    ]
+    session = FakeSession({"/": answers})
+
+    body = instagram.account(session)
+
+    assert body["username"] == "reels"
+    assert "followers_count" not in session.asked[-1][1]["fields"]
+
+
+def test_the_audience_is_read_into_the_shape_step_9_stores(credentials):
+    session = FakeSession({"/": {"id": "178", "username": "reels",
+                                 "followers_count": 2, "follows_count": 0,
+                                 "media_count": 8}})
+    found = instagram.audience(session)
+
+    assert found["followers"] == 2
+    assert found["following"] == 0
+    assert found["posts"] == 8
+    assert found["username"] == "reels"
+    assert found["read_at"]
+
+
+def test_an_unreadable_audience_is_empty_rather_than_zero(credentials):
+    """Nobody following the account and no permission to see who does are
+    different findings, and only one of them is about the reels."""
+    session = FakeSession({"/": [
+        {"error": {"message": "(#100) followers_count is not valid", "code": 100}},
+        {"error": {"message": "(#190) bad token", "code": 190}},
+    ]})
+    assert instagram.audience(session) == {}

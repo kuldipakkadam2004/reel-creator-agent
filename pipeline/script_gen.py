@@ -335,6 +335,21 @@ def _build_generation_config(model: str, *, system_instruction: str,
     return types.GenerateContentConfig(**kwargs)
 
 
+def client_http_options():
+    """Transport settings every Gemini client in the project is built with.
+
+    Public because step 2 is not the only caller: the query writer and the
+    relevance screener in `visuals.py` build their own clients, and already
+    import this module for the pro-model quirks. A timeout belongs in the same
+    place for the same reason - otherwise one call site is left as the one that
+    can wait forever, and it is never the one you are watching.
+    """
+    from google.genai import types
+
+    # HttpOptions counts in milliseconds; the setting is in seconds.
+    return types.HttpOptions(timeout=int(config.GEMINI_TIMEOUT_SECONDS * 1000))
+
+
 def _is_retryable(exc: Exception) -> bool:
     """True when the identical call could plausibly succeed on a second try."""
     from google.genai import errors
@@ -401,7 +416,9 @@ def call_gemini(prompt: str, *, system_instruction: str,
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            client = genai.Client(api_key=api_key)
+            client = genai.Client(
+                api_key=api_key, http_options=client_http_options()
+            )
             response = client.models.generate_content(
                 model=model,
                 contents=prompt,

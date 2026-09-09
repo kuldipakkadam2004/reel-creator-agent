@@ -187,6 +187,11 @@ def _get(session, path: str, params: dict) -> dict:
     return body if isinstance(body, dict) else {}
 
 
+#: The fields `account` may not drop - without these it is not proving
+#: anything, and a token that cannot answer them is a token to report.
+REQUIRED_ACCOUNT_FIELDS = ("id", "username")
+
+
 def require_credentials() -> None:
     config.require(*config.REQUIRED_INSTAGRAM)
 
@@ -195,11 +200,60 @@ def require_credentials() -> None:
 # The account, and what it has posted
 # ---------------------------------------------------------------------------
 
-def account(session=None) -> dict:
-    """Who the token belongs to. The cheapest proof it works."""
+#: Asked for on the account node, most useful first. `followers_count` is
+#: the denominator every reach figure in step 9 is implicitly divided by,
+#: and the one number the report never had - see AUDIENCE in `_print_report`.
+ACCOUNT_FIELDS = ("id", "username", "media_count", "followers_count",
+                  "follows_count")
+
+
+def account(session=None, *, fields=None) -> dict:
+    """Who the token belongs to. The cheapest proof it works.
+
+    Drops a field the API will not answer for rather than failing. The two
+    Instagram APIs disagree about `followers_count` - the Graph API serves
+    it on a business or creator account, and a token that cannot have it
+    should still be able to prove itself, which is this call's first job.
+    Same reasoning as `_refused`, at a smaller scale: what is asked for here
+    is fixed and short, so one retry without the extras settles it.
+    """
     require_credentials()
-    return _get(session or _session(), str(config.INSTAGRAM_USER_ID),
-                {"fields": "id,username,media_count"})
+    session = session or _session()
+    wanted = list(fields or ACCOUNT_FIELDS)
+    try:
+        return _get(session, str(config.INSTAGRAM_USER_ID),
+                    {"fields": ",".join(wanted)})
+    except InstagramAuthError:
+        raise
+    except InstagramError:
+        core = [name for name in wanted if name in REQUIRED_ACCOUNT_FIELDS]
+        if core == wanted:
+            raise
+        return _get(session, str(config.INSTAGRAM_USER_ID),
+                    {"fields": ",".join(core)})
+
+
+def audience(session=None) -> dict:
+    """The account's own size, for the reach figures to be read against.
+
+    Empty when the API would not say, which is not the same as zero - the
+    report prints the difference, because "nobody follows this account" and
+    "this token cannot see the follower count" are different findings.
+    """
+    try:
+        body = account(session)
+    except InstagramError:
+        return {}
+    out = {"read_at": perform._now()}
+    for key, name in (("followers", "followers_count"),
+                      ("following", "follows_count"),
+                      ("posts", "media_count")):
+        value = body.get(name)
+        if isinstance(value, (int, float)):
+            out[key] = int(value)
+    if body.get("username"):
+        out["username"] = str(body["username"])
+    return out if len(out) > 1 else {}
 
 
 def media(session=None, *, limit: int | None = None) -> list[dict]:
@@ -504,6 +558,9 @@ def fetch(run_ids, features_by_run: dict) -> dict:
         return {}
 
     ledger = perform.PerformanceLedger()
+    # Once per fetch, not once per reel: it is one number about the account
+    # and it does not change between two reels read in the same minute.
+    ledger.set_audience(audience(session))
     out: dict[str, dict] = {}
 
     features_by_run = {run_id: features_by_run.get(run_id) or {}
