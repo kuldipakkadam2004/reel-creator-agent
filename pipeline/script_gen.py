@@ -2524,11 +2524,15 @@ def revise_claims(script: str, findings: list[dict]) -> dict:
 def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
     """Fact-check `script` and repair it if it needs it. Never raises.
 
-    The repair is re-checked and bought again for up to
-    `config.VERIFY_REPAIR_ROUNDS` rounds. It stops the moment the script is
-    clean, and the moment a round leaves *more* blocking findings than the one
-    before it - a rewrite that merely holds level is re-sampled, because the
-    repair is a sampled call that can miss once and land the next time.
+    The repair is re-checked and bought again. It stops the moment the script
+    is clean, and the moment a round leaves *more* blocking findings than the
+    one before it - a rewrite that merely holds level is re-sampled, because
+    the repair is a sampled call that can miss once and land the next time.
+
+    `config.VERIFY_REPAIR_ROUNDS` is the patience for rounds that get nowhere,
+    counted from the last round that brought the finding count down; a round
+    that improves gives it back. `config.VERIFY_REPAIR_MAX_ROUNDS` caps the
+    total however well it is going.
 
     Returns the report step 8 and the saved metadata read:
 
@@ -2569,11 +2573,26 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
     # costs a whole generation (script, best-of-N hook, structure pass, two
     # checks) where a round here costs two calls. Measured 2026-09-02: six
     # topics in a row were discarded on a single failed repair each.
+    # `rounds` is the patience for a repair that is getting nowhere, counted
+    # from the last round that brought the count down rather than from the
+    # start; `ceiling` is what the whole script may cost however well it goes.
+    # Measured 2026-09-05: the tuna draft went 3 blocking findings -> 2 -> 1
+    # and was refused there, having improved on every round it was given. A
+    # budget meant to stop futile spend was ending a convergence one round
+    # short, and the run that paid for the generation got nothing for it.
     rounds = max(1, config.VERIFY_REPAIR_ROUNDS)
+    ceiling = max(rounds, config.VERIFY_REPAIR_MAX_ROUNDS)
     current, faults = script, blocking
     improved = None
+    spent = 0
+    #: Rounds since the count last came down. A round that improves resets it,
+    #: which is the whole change - not more patience, the same patience each
+    #: time the repair proves it is working.
+    stale = 0
 
-    for attempt in range(rounds):
+    while stale < rounds and spent < ceiling:
+        attempt = spent
+        spent += 1
         repair = revise_claims(current, faults)
         report["warnings"].extend(repair["warnings"])
         if not repair["script"]:
@@ -2622,8 +2641,7 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
             return report
 
         report["warnings"].append(
-            f"repair round {attempt + 1} of {rounds} left {len(still)} "
-            f"finding(s) standing: "
+            f"repair round {spent} left {len(still)} finding(s) standing: "
             + "; ".join(f'"{f["sentence"]}" - {f["problem"]}' for f in still)
         )
 
@@ -2646,10 +2664,15 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
         # things worse ends the loop early.
         if len(still) < len(faults):
             # Fewer faults than it started with, but not none. Keep it as the
-            # best script so far. A rewrite that only held level is not an
-            # improvement and is deliberately not recorded as one - if the
-            # rounds run out, the original ships and blocks.
+            # best script so far, and give the repair its patience back: it has
+            # just demonstrated it is working, and the next round starts from
+            # this script rather than from the one that had more wrong with it.
             improved = (repair["script"], still)
+            stale = 0
+        else:
+            # Held level. Re-sampled rather than abandoned, but the patience
+            # for that is finite and this is what spends it.
+            stale += 1
         current, faults = repair["script"], still
 
     if improved is not None:
@@ -2658,8 +2681,11 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
         report["blocked"] = True
         report["warnings"].append(
             f"the rewrite cleared some of the fact-check but not all of it "
-            f"after {rounds} round(s) - "
+            f"after {spent} round(s) - "
             f"{len(improved[1])} finding(s) still stand"
+            + (f" (the {ceiling}-round ceiling stopped it while it was still "
+               f"improving - raise VERIFY_REPAIR_MAX_ROUNDS)"
+               if spent >= ceiling and stale == 0 else "")
         )
         return report
 

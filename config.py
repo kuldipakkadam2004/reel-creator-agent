@@ -681,7 +681,25 @@ VERIFY_MODE = get_env("VERIFY_MODE", "llm")
 #: than useless on 2026-09-03 - a script with one blocking finding can never
 #: leave "fewer than one" without leaving none, so the single-finding case,
 #: which is the common one, bought a single attempt whatever this was set to.
+#: Counted from the last round that actually brought the finding count down,
+#: not from the start. A repair that is converging is not the spend this bounds
+#: - measured 2026-09-05 from output/scripts/refused/, where the tuna script
+#: went 3 blocking findings -> 2 -> 1 and was then refused, having improved on
+#: every single round it was given. The budget existed to stop a rewrite going
+#: nowhere and it stopped one that was three quarters of the way there, one
+#: round short. A run that ends like that has paid for the whole generation and
+#: thrown it away.
 VERIFY_REPAIR_ROUNDS = get_env_int("VERIFY_REPAIR_ROUNDS", 2)
+
+#: The hard ceiling on repair rounds for one script, however well it is going.
+#:
+#: Strict improvement is self-limiting - the count cannot come down more times
+#: than it started at - so this is not what stops a runaway loop so much as
+#: what bounds the bill on a draft that starts with a dozen findings and grinds
+#: them off one at a time. At that point the draft is the problem and the next
+#: topic is cheaper. Two calls a round, so this is the worst case in calls,
+#: doubled.
+VERIFY_REPAIR_MAX_ROUNDS = get_env_int("VERIFY_REPAIR_MAX_ROUNDS", 5)
 
 # Step 3 — text-to-speech
 ELEVENLABS_API_KEY = get_env("ELEVENLABS_API_KEY")
@@ -2049,8 +2067,9 @@ def _report() -> None:
                               if TAKEAWAY_MODE == "llm" else "")),
         ("VERIFY_MODE", f"{VERIFY_MODE}"
                         + (f", false claims and self-contradictions refuse "
-                           f"the script, up to {VERIFY_REPAIR_ROUNDS} repair "
-                           f"round(s) to save it"
+                           f"the script, {VERIFY_REPAIR_ROUNDS} repair "
+                           f"round(s) without progress and "
+                           f"{VERIFY_REPAIR_MAX_ROUNDS} in all to save it"
                            if VERIFY_MODE == "llm" else "")),
         ("HOOK_CARD", (f"{HOOK_CARD_SECONDS:g}s, {HOOK_CARD_FONT_SIZE}px, "
                        f"<={HOOK_CARD_MAX_WORDS} words")

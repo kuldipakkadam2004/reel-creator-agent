@@ -522,13 +522,16 @@ def test_a_rewrite_that_makes_things_worse_stops_the_rounds(monkeypatch):
     assert report["script"] == DEEP_SEA
 
 
-def test_a_repair_that_improves_to_the_last_round_is_kept_and_still_blocks(
+def test_a_repair_that_keeps_improving_is_not_cut_off_by_the_budget(
         monkeypatch):
-    """Converging and arriving are not the same thing. Every round left fewer
-    faults than the one before, the rounds ran out anyway, and what is kept is
-    the best script of the three - still refused, because something on it is
-    still wrong."""
+    """The tuna draft of 2026-09-05 went 3 blocking findings -> 2 -> 1, and was
+    refused there having improved on every round it was given.
+
+    `VERIFY_REPAIR_ROUNDS` exists to stop a rewrite that is going nowhere. It
+    was ending one that was working, a round short of clean, after the run had
+    already paid for the whole generation."""
     monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    monkeypatch.setattr(config, "VERIFY_REPAIR_MAX_ROUNDS", 5)
     three = [{"sentence": "Total darkness.", "kind": "false",
               "problem": "one percent of the light is left"},
              {"sentence": "The water strips out red first, then green, then "
@@ -536,26 +539,98 @@ def test_a_repair_that_improves_to_the_last_round_is_kept_and_still_blocks(
               "kind": "false", "problem": "blue is what is left, not stripped"},
              {"sentence": "The ocean does not block the light.",
               "kind": "contradiction", "problem": "it is stripped out above"}]
+    two = [{"sentence": "Total darkness.", "kind": "false",
+            "problem": "one percent is left"},
+           {"sentence": "The ocean does not block the light.",
+            "kind": "contradiction", "problem": "it is stripped out above"}]
+    one = [{"sentence": "Total darkness.", "kind": "false",
+            "problem": "one percent is left"}]
+    calls = _verify_gemini(
+        monkeypatch, findings=three,
+        repaired=[DEEP_SEA.replace("red first", "the reds first"),
+                  _HALF_FIXED, _FULLY_FIXED],
+        recheck=[two, one, []],
+    )
+
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert _repairs_bought(calls) == 3, "the third round is the one that lands"
+    assert report["blocked"] is False
+    assert report["revised"] is True
+    assert report["script"] == _FULLY_FIXED
+    assert report["remaining"] == []
+
+
+def test_the_budget_is_spent_only_on_rounds_that_get_nowhere(monkeypatch):
+    """Converging and arriving are still not the same thing.
+
+    Three rounds brought the count down and gave the patience back each time;
+    the two after that held level and spent it. What is kept is the best script
+    of them - still refused, because something on it is still wrong."""
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    monkeypatch.setattr(config, "VERIFY_REPAIR_MAX_ROUNDS", 9)
+    three = [{"sentence": "Total darkness.", "kind": "false",
+              "problem": "one percent of the light is left"},
+             {"sentence": "The water strips out red first, then green, then "
+                          "blue.",
+              "kind": "false", "problem": "blue is what is left, not stripped"},
+             {"sentence": "The ocean does not block the light.",
+              "kind": "contradiction", "problem": "it is stripped out above"}]
+    two = [{"sentence": "Total darkness.", "kind": "false",
+            "problem": "one percent is left"},
+           {"sentence": "The ocean does not block the light.",
+            "kind": "contradiction", "problem": "it is stripped out above"}]
+    one = [{"sentence": "Total darkness.", "kind": "false",
+            "problem": "one percent is left"}]
     calls = _verify_gemini(
         monkeypatch, findings=three,
         repaired=[DEEP_SEA.replace("red first", "the reds first"), _HALF_FIXED],
-        recheck=[
-            [{"sentence": "Total darkness.", "kind": "false",
-              "problem": "one percent is left"},
-             {"sentence": "The ocean does not block the light.",
-              "kind": "contradiction", "problem": "it is stripped out above"}],
-            [{"sentence": "Total darkness.", "kind": "false",
-              "problem": "one percent is left"}],
-        ],
+        recheck=[two, one],       # and `one` again for every round after
     )
+
     report = script_gen.verify_claims("the deep sea", DEEP_SEA)
 
-    assert _repairs_bought(calls) == 2, "both rounds, and no more"
+    # 3 -> 2 -> 1 buys three rounds back; the fourth and fifth hold level.
+    assert _repairs_bought(calls) == 4
     assert report["revised"] is True
     assert report["blocked"] is True
     assert report["script"] == _HALF_FIXED
     assert len(report["remaining"]) == 1
     assert any("still stand" in w for w in report["warnings"])
+
+
+def test_the_ceiling_stops_a_repair_that_is_still_improving(monkeypatch):
+    """Strict improvement is self-limiting, but a draft with a dozen faults
+    would grind them off one round at a time and bill for every one. At that
+    point the draft is the problem and the next topic is cheaper."""
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    monkeypatch.setattr(config, "VERIFY_REPAIR_MAX_ROUNDS", 2)
+    three = [{"sentence": "Total darkness.", "kind": "false",
+              "problem": "one percent of the light is left"},
+             {"sentence": "The water strips out red first, then green, then "
+                          "blue.",
+              "kind": "false", "problem": "blue is what is left, not stripped"},
+             {"sentence": "The ocean does not block the light.",
+              "kind": "contradiction", "problem": "it is stripped out above"}]
+    two = [{"sentence": "Total darkness.", "kind": "false",
+            "problem": "one percent is left"},
+           {"sentence": "The ocean does not block the light.",
+            "kind": "contradiction", "problem": "it is stripped out above"}]
+    one = [{"sentence": "Total darkness.", "kind": "false",
+            "problem": "one percent is left"}]
+    calls = _verify_gemini(
+        monkeypatch, findings=three,
+        repaired=[DEEP_SEA.replace("red first", "the reds first"),
+                  _HALF_FIXED, _FULLY_FIXED],
+        recheck=[two, one, []],
+    )
+
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert _repairs_bought(calls) == 2, "the ceiling, not the patience"
+    assert report["blocked"] is True
+    assert report["script"] == _HALF_FIXED
+    assert any("ceiling" in w for w in report["warnings"])
 
 
 def test_every_repair_round_is_recorded_with_what_it_came_back_with(
