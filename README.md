@@ -1804,6 +1804,18 @@ band, topic source, hook replaced or kept, structure rewritten or kept,
 take-away rewritten or kept, cover source, and whichever trial is running** —
 those plus the kept/binned table are what this can actually tell you.
 
+**A question with one answer is not a thin row, and the report says which is
+which.** A segment needs two answers to compare; where the pipeline makes the
+same choice every time there is no other side, and no number of further reels
+produces one. Both print as unreadable, but only one of them is fixed by
+waiting — so a constant column is named as constant, kept out of the
+"closest to readable" list, and counted in a warning that points at
+`PERFORMANCE_EXPLORE`. On the first seven posted reels five questions were
+constant, `captions`, `motion` and `music` among them: every reel used the same
+aligner, moved every shot and played a bed. That is what a trial is for, and it
+is the difference between "this choice does not matter" and "this choice has
+never been made twice".
+
 Hashtags are the exception to "~20 components": from `FEATURES_VERSION` 5 every
 tag on a post is recorded by name and asked as its own question, which is a
 great many questions and almost all of them unreadable for a long time. That is

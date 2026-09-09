@@ -181,6 +181,14 @@ TRIALS = {
     "duration": ("short", "long"),
     "structure": ("on", "off"),
     "takeaway": ("on", "off"),
+    # The two below are here because `one_sided` named them. Every reel ever
+    # made has a bed under it and moving shots in it, so the report asks both
+    # questions of the ledger and neither has a second answer to compare with -
+    # and the warning that says so pointed at PERFORMANCE_EXPLORE, which until
+    # now could not vary either of them. A trial nobody can run is not a
+    # remedy.
+    "music": ("on", "off"),
+    "motion": ("on", "off"),
 }
 
 
@@ -329,6 +337,14 @@ def features_for(record: dict) -> dict:
         "created_at": record.get("finished_at") or record.get("started_at") or _now(),
         "run_dir": str(run_dir) if has_dir else "",
         "video_path": record.get("video_path") or "",
+        # The only one of these three that survives the run directory being
+        # pruned, because output/logs/ does not sit under it. Every reel binned
+        # before this column existed lost its evidence along with its
+        # directory, which is why rows sit in `unlabelled` with nothing left to
+        # read and no way to settle what went wrong. Not a facet - `facets`
+        # asks from an allowlist, and a path is not a question - so this adds a
+        # column without adding a version.
+        "log_path": record.get("log_path") or "",
 
         "topic": record.get("topic") or "",
         "topic_source": record.get("topic_source") or "",
@@ -1074,7 +1090,8 @@ def build_vocabulary(rows: list[dict]) -> dict[str, list[str]]:
 
 
 def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
-             min_samples: int, statistic=statistics.median) -> list[dict]:
+             min_samples: int, statistic=statistics.median,
+             extra=None) -> list[dict]:
     """Group reels by facet and compare each answer against the rest.
 
     `score` maps a row to a number, or to None where the row cannot be scored.
@@ -1082,13 +1099,20 @@ def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
     freak reel should not carry a segment, and the mean for a rate like "how
     often did this get posted", where the median of a column of ones and zeros
     is a majority vote rather than a share.
+
+    `extra` adds questions that are not about the reel but about what was done
+    with it - the time of day it went out - and is per table, because those are
+    not answerable by every table. See `_when_posted`.
     """
     buckets: dict[tuple[str, str], list[float]] = {}
     for row in rows:
         value = score(row)
         if value is None:
             continue
-        for pair in facets(row.get("features") or {}, vocabulary):
+        pairs = facets(row.get("features") or {}, vocabulary)
+        if extra:
+            pairs = pairs + list(extra(row))
+        for pair in pairs:
             buckets.setdefault(pair, []).append(value)
 
     questions: dict[str, list[str]] = {}
@@ -1112,10 +1136,37 @@ def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
                 "delta": round(here - there, 3) if there is not None else None,
                 "readable": len(mine) >= min_samples and len(rest) >= min_samples,
                 "of": len(mine) + len(rest),
+                # How many answers this question has ever had here. One means
+                # every reel in this table answered it the same way, and the
+                # row is not a segment at all - there is nothing on the other
+                # side to compare against, and no number of further reels
+                # makes one appear. `readable` is already False for those, but
+                # False covers both "not enough yet" and "not ever", and only
+                # one of those is fixed by waiting. See `one_sided`.
+                "sides": len(set(answers)),
             })
     out.sort(key=lambda entry: (not entry["readable"],
                                 -abs(entry["delta"] or 0.0), entry["question"]))
     return out
+
+
+def one_sided(rows: list[dict]) -> list[str]:
+    """The questions every reel in a table answered the same way.
+
+    These are the columns the pipeline holds constant. A segment needs two
+    answers to compare, so a constant column can never produce a finding: it
+    is not a thin row, it is an absent experiment, and it stays absent until
+    something upstream varies. Reported by name because which ones they are is
+    the actionable part - a table full of them means the reels are identical,
+    not that the choices in them do not matter.
+
+    A question only one reel has answered is skipped. One reel answers every
+    question exactly one way, so on a table of one the whole vocabulary comes
+    back "constant" - which says nothing about the pipeline and would bury the
+    handful of columns that really are held fixed under thirty that are not.
+    """
+    return sorted({row["question"] for row in rows
+                   if row.get("sides") == 1 and row.get("of", 0) >= 2})
 
 
 def skip_tally(rows: list[dict]) -> list[dict]:
@@ -1142,22 +1193,121 @@ def skip_tally(rows: list[dict]) -> list[dict]:
         if note:
             notes.setdefault(code, []).append(note)
 
+    def distinct(seen: list[str]) -> list[str]:
+        """The last few notes on a code, without repeating one.
+
+        A batch relabel writes the same sentence onto every row it touches, and
+        printing it three times says no more than printing it once while
+        crowding out the notes that differ - which are the ones worth reading.
+        """
+        out: list[str] = []
+        for note in reversed(seen):
+            if note not in out:
+                out.append(note)
+            if len(out) >= 3:
+                break
+        return list(reversed(out))
+
     total = len(judged)
     out = [{
         "code": code,
         "means": SKIP_REASONS.get(code, code),
         "n": count,
         "share": round(count / total, 3) if total else 0.0,
-        "notes": notes.get(code, [])[-3:],
+        "notes": distinct(notes.get(code, [])),
     } for code, count in counts.items()]
     out.sort(key=lambda row: (-row["n"], row["code"]))
     return out
 
 
+def posting_slot(entry: dict) -> str:
+    """Which six-hour block of the day, UTC, a reel went out in - or "".
+
+    UTC and said so in the label, because the alternative is worse. Converting
+    to the account's own clock needs a timezone this does not have and would
+    have to be told, and a mislabelled hour is a finding about the wrong time
+    of day. The blocks are wide enough that the offset shifts a reel by at most
+    one of them.
+
+    A row whose posting time was assumed gets no slot at all. `posted_at` falls
+    back to when the reel was *made* when nobody said otherwise, and a reel
+    made at noon and posted in the evening would otherwise answer this question
+    with a time nothing happened at - the one kind of wrong answer that looks
+    exactly like a right one.
+    """
+    if entry.get("posted_at_assumed"):
+        return ""
+    stamp = _parse_stamp(entry.get("posted_at"))
+    if not stamp:
+        return ""
+    start = (stamp.astimezone(timezone.utc).hour // 6) * 6
+    return f"{start:02d}-{start + 6:02d} utc"
+
+
+def _when_posted(row: dict) -> list[tuple[str, str]]:
+    """The posting-time facet, for the tables where it is not a trick question.
+
+    Never asked of KEPT OR BINNED. A binned reel has no posting time, so there
+    the question would separate exactly the posted reels from exactly the
+    binned ones and report a perfect correlation with being posted - which is
+    the tautology the table is made of, dressed as a finding about the clock.
+    """
+    slot = posting_slot(row)
+    return [("posted", slot)] if slot else []
+
+
+def unlabelled_bins(rows: list[dict]) -> list[dict]:
+    """The binned reels whose reason was lost, oldest first.
+
+    `UNJUDGED_SKIPS` holds two codes and only one of them is a chore. A test
+    run is finished business - it was never a candidate, and no label will ever
+    be wanted for it - while an unlabelled row is a verdict somebody reached
+    and the ledger failed to keep, which is the only kind of row `--relabel`
+    can do anything about.
+    """
+    return [row for row in rows if row.get("status") == "skipped"
+            and str(row.get("skip_code") or UNLABELLED_SKIP) == UNLABELLED_SKIP]
+
+
+def recover_log(run_id: str, features: dict, logs_dir: Path | str | None = None):
+    """The transcript of a run whose row predates the `log_path` column.
+
+    Found by reading output/logs/ for the id rather than by matching on the
+    day, because several runs can share a day and only one of them is this
+    reel. The files are a few KB each and there are tens of them, so the scan
+    is cheaper than the guess is wrong.
+
+    This exists for the rows already in the ledger. Rows written from here on
+    carry `log_path` and never reach the scan.
+    """
+    recorded = str(features.get("log_path") or "")
+    if recorded and Path(recorded).is_file():
+        return Path(recorded)
+
+    directory = Path(logs_dir or config.LOGS_DIR)
+    if not directory.is_dir():
+        return None
+    # The whole id, then the short form the CLI takes - a log names the run
+    # directory in full, but an older one may only carry the suffix people type.
+    needles = [run_id]
+    tail = run_id.rsplit("-", 1)[-1]
+    if tail and tail != run_id:
+        needles.append(tail)
+    for path in sorted(directory.glob("*.log"), reverse=True):
+        try:
+            body = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if any(needle in body for needle in needles):
+            return path
+    return None
+
+
 def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
            span: int | None = None, min_samples: int | None = None,
            window_hours: int | None = None,
-           min_age_hours: int | None = None) -> dict:
+           min_age_hours: int | None = None,
+           min_reach: int | None = None) -> dict:
     """Everything the ledger can currently say, and what it cannot say yet.
 
     Three tables, because three different columns are being read. `kept` uses
@@ -1173,6 +1323,8 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     window = config.PERFORMANCE_WINDOW_HOURS if window_hours is None else window_hours
     green = (config.PERFORMANCE_MIN_AGE_HOURS
              if min_age_hours is None else min_age_hours)
+    reach_floor = (config.PERFORMANCE_MIN_REACH
+                   if min_reach is None else min_reach)
 
     rows = ledger.rows()
     warnings: list[str] = []
@@ -1213,6 +1365,36 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
             )
         fresh = settled
 
+    # How many people saw it, not how many reels are in the table. A ratio over
+    # a reach of three is not a thin measurement of the reel, it is a
+    # measurement of who happened to open the app, and averaging those with a
+    # reel that reached three hundred puts the two on the same footing. Kept
+    # out of the ratio tables for the same reason a reading taken a week late
+    # is. Rows with no reach recorded stay in: not knowing the reach is not the
+    # same as knowing it was small, and the freshness filters above make the
+    # same call about an unknown age.
+    # Kept before the reach floor is applied. A reel that reached nobody is a
+    # perfectly good observation *of reach* - it is only as a denominator that
+    # it is worthless - and filtering the reach table by reach would drop the
+    # end of the distribution the account is actually stuck at.
+    seen_by = fresh
+    unseen: list[dict] = []
+    if reach_floor > 0:
+        seen = []
+        for row in fresh:
+            reach = (row.get("metrics") or {}).get("reach")
+            (seen if reach is None or float(reach) >= reach_floor
+             else unseen).append(row)
+        if unseen:
+            warnings.append(
+                f"{len(unseen)} reel(s) reached fewer than {reach_floor} "
+                f"accounts and are not compared - at that reach the ratio "
+                f"moves by a third when one person watches, so it measures the "
+                f"audience and not the reel. PERFORMANCE_MIN_REACH=0 compares "
+                f"them anyway"
+            )
+        fresh = seen
+
     vocabulary = build_vocabulary(rows)
 
     kept = _segment(
@@ -1226,7 +1408,20 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     performance = _segment(
         fresh,
         lambda row: scores.get(row.get("run_id") or ""),
-        vocabulary, floor,
+        vocabulary, floor, extra=_when_posted,
+    )
+
+    # How many people it got in front of, which is upstream of everything else
+    # in this report and was the one thing it did not print. Every other table
+    # here divides by an audience; this is the audience. Read on 2026-09-09 the
+    # seven posted reels reached 289, 64, 9, 6, 3, 3 and 0 accounts - a median
+    # of six - and a report whose headline was watch-through was answering a
+    # question the account does not have yet.
+    reach_scores = ratios(seen_by, "reach", span)
+    reached = _segment(
+        seen_by,
+        lambda row: reach_scores.get(row.get("run_id") or ""),
+        vocabulary, floor, extra=_when_posted,
     )
 
     # Read on the same window as the performance table, so every reel is
@@ -1235,6 +1430,7 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     # long ago a reel went out as much as anything about the reel.
     saved = _segment(
         fresh, was_kept, vocabulary, floor, statistic=statistics.fmean,
+        extra=_when_posted,
     )
 
     if not posted:
@@ -1289,8 +1485,32 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
             "from when they were made - pass --posted YYYY-MM-DD to correct one"
         )
 
+    # Said with the other warnings because it is the one that no amount of
+    # patience clears. Every table above prints "nothing has reached n reels
+    # on both sides yet", which invites waiting; for a question the pipeline
+    # answers identically every time, waiting is the one thing that cannot
+    # work. Read off `kept`, which uses every reel that got a verdict and so
+    # sees the widest evidence of what is actually being held fixed.
+    flat = one_sided(kept)
+    if flat and decided:
+        warnings.append(
+            f"{len(flat)} question(s) have had one answer on every reel ever "
+            f"made ({', '.join(flat[:4])}"
+            f"{', ...' if len(flat) > 4 else ''}) - those columns are constant, "
+            f"so they cannot produce a finding at any number of reels. "
+            f"PERFORMANCE_EXPLORE=" + "|".join(TRIALS) + " alternates one of "
+            f"them per reel so there is something to compare"
+        )
+
     return {
         "metric": metric,
+        "one_sided": flat,
+        "min_reach": reach_floor,
+        "unseen": len(unseen),
+        "reached": reached,
+        "reach_median": (round(statistics.median(
+            [float((row.get("metrics") or {}).get("reach") or 0.0)
+             for row in seen_by]), 1) if seen_by else None),
         "reels": len(rows),
         "posted": len(posted),
         "skipped": sum(1 for row in rows if row.get("status") == "skipped"),
@@ -1440,6 +1660,28 @@ def apply_arm(trial: dict, *,
     return duration, None, None, None
 
 
+def arm_assembly(trial: dict) -> dict:
+    """What a trial arm changes about step 5, as keyword arguments for it.
+
+    Separate from `apply_arm` because the two are spent at different points in
+    the run: `apply_arm` answers step 2, before a word is written, and this
+    answers step 5, after the footage is on disk. Folding them together would
+    mean deciding both an hour apart from one call, and step 5 already takes
+    every one of these as an override.
+
+    Anything not named here is left to config, which is what a trial on some
+    other question wants.
+    """
+    name, arm = (trial or {}).get("name"), (trial or {}).get("arm")
+    if name == "music":
+        # False, not "": step 5 reads False as "no bed" and None as "rotate
+        # over assets/music/ as usual".
+        return {"music": False} if arm == "off" else {}
+    if name == "motion":
+        return {"motion": "off"} if arm == "off" else {}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Where the numbers come from
 # ---------------------------------------------------------------------------
@@ -1583,6 +1825,93 @@ def _print_pending(ledger: PerformanceLedger, limit: int = 14) -> None:
           f"   ({', '.join(list(SKIP_REASONS)[:5])}, ...)")
 
 
+def _log_warnings(path, limit: int = 3) -> list[str]:
+    """The WARNINGS block of a run transcript, as single lines.
+
+    Read from the log rather than from the ledger because the ledger keeps only
+    the count. The block is the last thing a run prints and every line in it
+    starts "  - ", so it is found by that shape rather than by position - a run
+    that failed prints the same block from a different place in the file.
+    """
+    out: list[str] = []
+    try:
+        body = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return out
+    seen = False
+    for line in body.splitlines():
+        if line.strip() == "WARNINGS":
+            seen = True
+            continue
+        if not seen:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            out.append(" ".join(stripped[2:].split()))
+            if len(out) >= limit:
+                break
+        elif stripped.startswith("---") or not stripped:
+            break
+    return out
+
+
+def _print_relabel(ledger: PerformanceLedger, limit: int = 20) -> None:
+    """The binned reels with no reason, what survives of each, and the command.
+
+    A worksheet rather than a prompt. The verdict on a reel is a judgement
+    about something that was watched, and nothing here is in a position to make
+    it - what this can do is put the evidence and the exact command on one
+    screen so a backlog of them is one pass instead of nine hunts through
+    output/logs/.
+    """
+    rows = unlabelled_bins(ledger.rows())
+    if not rows:
+        print("every binned reel carries a reason.")
+        return
+
+    print(f"{len(rows)} binned reel(s) have no reason on them.")
+    print("They are read by neither table: `unlabelled` is a verdict the "
+          "ledger failed to")
+    print("keep, not a verdict about the reel. One word each puts them into "
+          "the tally that")
+    print("says what to go and fix.")
+    if config.RUN_LOG_KEEP_DAYS:
+        print()
+        print(f"The evidence expires. Run directories are pruned and "
+              f"output/logs/ keeps {config.RUN_LOG_KEEP_DAYS} days,")
+        print("so a bin left unlabelled for longer than that cannot be "
+              "settled later at all.")
+    print(RULE)
+
+    for row in rows[-limit:]:
+        features = row.get("features") or {}
+        run_id = row["run_id"]
+        print(f"  {features.get('day', '?'):<12} {run_id}")
+        print(f"    topic : {features.get('topic') or '(none recorded)'}")
+        said = str(row.get("skip_note") or row.get("skip_reason") or "").strip()
+        if said:
+            print(f"    said  : \"{said}\"")
+        video = str(features.get("video_path") or "")
+        print(f"    reel  : {video if video and Path(video).is_file() else 'gone - the run directory was pruned'}")
+        log = recover_log(run_id, features)
+        if log:
+            print(f"    log   : {log}")
+            for warning in _log_warnings(log):
+                print(f"      - {warning[:110]}")
+        else:
+            print("    log   : gone")
+        print(f"    label : python pipeline/perform.py "
+              f"{run_id.rsplit('-', 1)[-1]} --skipped <code>")
+        print()
+
+    if len(rows) > limit:
+        print(f"  ... and {len(rows) - limit} older one(s).")
+    print(RULE)
+    print("  " + " | ".join(code for code in SKIP_REASONS
+                            if code not in UNJUDGED_SKIPS))
+    print("  python pipeline/perform.py --reasons     what each one means")
+
+
 def _print_table(title: str, rows: list[dict], *, unit: str,
                  min_samples: int, limit: int = 12) -> None:
     print(RULE)
@@ -1591,11 +1920,25 @@ def _print_table(title: str, rows: list[dict], *, unit: str,
     if not readable:
         print(f"  nothing has reached {min_samples} reels on both sides of a "
               f"question yet.")
-        # What is closest to being readable, rather than whatever sorted first
-        # among a field of ties.
-        for row in sorted(rows, key=lambda entry: -entry["n"])[:4]:
+        # Only the questions that actually have two sides are on their way to
+        # being readable. A one-sided question printed here as "n=12 of 12"
+        # reads as the closest of the lot when it is the furthest: every reel
+        # answered it the same way, so the count is already final and the
+        # other side is empty. Listing those in the same breath as the thin
+        # ones is how "the pipeline never varies this" gets read as "four more
+        # reels to go".
+        contested = [row for row in rows if row.get("sides", 2) > 1]
+        for row in sorted(contested, key=lambda entry: -entry["n"])[:4]:
             print(f"    {row['question']} = {row['answer']}: "
                   f"n={row['n']} of {row['of']}")
+        if rows and not contested:
+            print("    no question here has two answers to compare.")
+        flat = one_sided(rows)
+        if flat:
+            print(f"  {len(flat)} question(s) had one answer on every reel and "
+                  f"cannot be read at any n:")
+            print("    " + ", ".join(flat[:6])
+                  + (", ..." if len(flat) > 6 else ""))
         return
     print(f"  {'question':<26} {'answer':<12} {'n':>3}  {'median':>8}  vs rest")
     for row in readable[:limit]:
@@ -1630,11 +1973,21 @@ def _print_report(data: dict) -> None:
     print(f"READS   : {data['compared']} comparable, "
           f"nothing below n={data['min_samples']} is read, "
           f"nothing measured outside {data['min_age_hours']}-"
-          f"{data['window_hours']}h after posting")
+          f"{data['window_hours']}h after posting"
+          + (f", nothing under {data['min_reach']} reach"
+             if data.get("min_reach") else ""))
 
     _print_reasons(data.get("reasons") or [])
     _print_table("KEPT OR BINNED  (1.00 = always posted; every reel counts)",
                  data["kept"], unit="", min_samples=data["min_samples"])
+    # Printed first of the three outcome tables, because it is upstream of the
+    # other two: a reel nobody was shown cannot be watched through or saved,
+    # and for this account that is the case that keeps happening.
+    _print_table(
+        f"HOW MANY SAW IT  (1.00 = an ordinary reach for this account"
+        + (f"; median {data['reach_median']:g} accounts)"
+           if data.get("reach_median") is not None else ")"),
+        data.get("reached") or [], unit="x", min_samples=data["min_samples"])
     _print_table(f"HOW THEY DID  (1.00 = an ordinary reel for this account)",
                  data["performance"], unit="x", min_samples=data["min_samples"])
     _print_table("SAVED OR SENT  (1.00 = every reel got a save or a share)",
@@ -1741,6 +2094,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="the sentence behind the code, kept alongside it")
     parser.add_argument("--reasons", action="store_true",
                         help="the skip vocabulary, and what each code means")
+    parser.add_argument("--relabel", action="store_true",
+                        help="the binned reels whose reason was lost, what "
+                             "evidence survives of each, and the command to "
+                             "label it")
     parser.add_argument("--report", action="store_true",
                         help="what the ledger has learned so far")
     parser.add_argument("--fetch", action="store_true",
@@ -1786,6 +2143,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n  python pipeline/perform.py <run> --skipped footage")
             print(f"  python pipeline/perform.py <run> --skipped hook "
                   f"--note \"the card gave the answer away\"")
+            print("  python pipeline/perform.py --relabel"
+                  "        the bins still missing one")
+            return 0
+
+        if args.relabel:
+            _print_relabel(ledger, max(1, args.limit))
             return 0
 
         if args.fetch:

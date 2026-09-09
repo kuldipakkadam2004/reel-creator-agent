@@ -2552,3 +2552,27 @@ def test_the_ceiling_follows_the_curve_rather_than_a_constant(monkeypatch):
 
 
 
+
+
+def test_a_motion_trial_can_freeze_the_shots_for_one_reel(moving):
+    """`motion` overrides SHOT_MOTION for this reel only.
+
+    Every reel in the ledger answered the motion question "on", so nothing in
+    it could say whether the move earns the crop it costs. A trial has to be
+    able to turn it off for one reel without changing the setting for all of
+    them.
+    """
+    shots = [shot(index=i, asset_index=i, start=i * 3.0) for i in range(3)]
+
+    assemble._plan_motion(shots, "off")
+
+    assert [s.motion for s in shots] == ["", "", ""]
+    assert all(s.motion_zoom == 1.0 for s in shots)
+
+
+def test_no_override_leaves_the_setting_in_charge(moving):
+    shots = [shot(index=i, asset_index=i, start=i * 3.0) for i in range(3)]
+
+    assemble._plan_motion(shots)
+
+    assert [s.motion for s in shots] == ["push", "pull", "push"]

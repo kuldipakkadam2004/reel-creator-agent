@@ -35,6 +35,7 @@ def paths(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "performance.json")
     monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path / "out")
     monkeypatch.setattr(config, "SCRIPTS_DIR", tmp_path / "scripts")
+    monkeypatch.setattr(config, "LOGS_DIR", tmp_path / "out" / "logs")
     monkeypatch.setattr(config, "PERFORMANCE_FEEDBACK", False)
     monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "off")
     monkeypatch.setattr(config, "PERFORMANCE_MIN_SAMPLES", 3)
@@ -1426,3 +1427,392 @@ def test_tag_effects_never_reach_step_0_s_board(paths):
     effects = perform.measured_effects(ledger=ledger)
 
     assert not any(name in ("ecology", "planetearth") for name in effects)
+
+
+def test_a_constant_column_is_told_apart_from_a_thin_one(paths):
+    """Both are unreadable. Only one of them is fixed by making more reels."""
+    ledger = perform.PerformanceLedger()
+    for day in range(6):
+        # `captions` is the same on every reel, so its question has one answer.
+        # `topic source` has two, and is merely thin.
+        ledger.register(_features(f"r{day}", day=day,
+                                  source="wikipedia" if day < 2 else "redditrss"))
+        ledger.record(f"r{day}", {"watch_through": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=4)
+
+    captions = next(row for row in data["kept"]
+                    if row["question"] == "captions")
+    assert captions["sides"] == 1
+    assert captions["readable"] is False
+
+    source = next(row for row in data["kept"]
+                  if row["question"] == "topic source"
+                  and row["answer"] == "wikipedia")
+    assert source["sides"] == 2
+    assert source["readable"] is False
+
+    assert "captions" in data["one_sided"]
+    assert "topic source" not in data["one_sided"]
+
+
+def test_a_table_of_one_reel_calls_nothing_constant(paths):
+    """One reel answers every question one way. That is not evidence."""
+    rows = [{"question": "captions", "answer": "elevenlabs",
+             "sides": 1, "of": 1}]
+    assert perform.one_sided(rows) == []
+
+    rows[0]["of"] = 2
+    assert perform.one_sided(rows) == ["captions"]
+
+
+def test_the_constant_columns_are_named_in_the_warnings(paths):
+    """The one warning more patience cannot clear, so it says which."""
+    ledger = perform.PerformanceLedger()
+    for day in range(6):
+        ledger.register(_features(f"r{day}", day=day))
+        ledger.record(f"r{day}", {"watch_through": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=4)
+
+    flat = [w for w in data["warnings"] if "one answer on every reel" in w]
+    assert len(flat) == 1
+    assert "captions" in flat[0]
+    assert "PERFORMANCE_EXPLORE" in flat[0]
+
+
+def test_a_trial_arm_gives_a_constant_column_a_second_side(paths):
+    """The point of the trial: it is what makes a column readable at all."""
+    ledger = perform.PerformanceLedger()
+    for day in range(6):
+        arm = "on" if day % 2 else "off"
+        ledger.register(_features(f"r{day}", day=day,
+                                  trial={"name": "takeaway", "arm": arm}))
+        ledger.record(f"r{day}", {"watch_through": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=3)
+
+    arms = [row for row in data["kept"]
+            if row["question"] == "trial: takeaway"]
+    assert {row["answer"] for row in arms} == {"on", "off"}
+    assert all(row["sides"] == 2 for row in arms)
+    assert "trial: takeaway" not in data["one_sided"]
+
+
+# ---------------------------------------------------------------------------
+# Relabelling a bin whose reason was lost
+# ---------------------------------------------------------------------------
+
+def test_the_features_row_keeps_the_log_path(paths):
+    """The run directory is pruned. output/logs/ is not under it."""
+    features = perform.features_for({
+        "run_id": "r1",
+        "run_dir": str(paths / "out" / "2026-08-24" / "r1"),
+        "log_path": str(paths / "out" / "logs" / "2026-08-24-210542.log"),
+    })
+
+    assert features["log_path"].endswith("2026-08-24-210542.log")
+
+
+def test_a_run_with_no_transcript_records_no_path(paths):
+    assert perform.features_for({"run_id": "r1"})["log_path"] == ""
+
+
+def test_unlabelled_bins_are_only_the_ones_worth_chasing(paths):
+    """A test run is finished business. An unlabelled row is a lost verdict."""
+    ledger = _ledger(_features("r1"), _features("r2"), _features("r3"),
+                     _features("r4"))
+    ledger.skip("r1", "not good enough to post")
+    ledger.skip("r2", "untested")
+    ledger.skip("r3", "footage")
+    ledger.record("r4", {"watch_ratio": 0.5})
+
+    assert [row["run_id"] for row in perform.unlabelled_bins(ledger.rows())] == ["r1"]
+
+
+def test_the_transcript_is_found_by_the_run_id_not_the_day(paths):
+    """Several runs share a day, and only one of them is this reel."""
+    logs = paths / "out" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "2026-08-24-160050.log").write_text("REEL: ocean-aaaaaaaa",
+                                                encoding="utf-8")
+    (logs / "2026-08-24-210542.log").write_text("REEL: glacier-ec3d56f9",
+                                                encoding="utf-8")
+
+    found = perform.recover_log("glacier-ec3d56f9", {})
+
+    assert found is not None and found.name == "2026-08-24-210542.log"
+
+
+def test_the_short_id_people_type_finds_the_transcript_too(paths):
+    logs = paths / "out" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "2026-08-26-125153.log").write_text("perform.py ec3d56f9 --views",
+                                                encoding="utf-8")
+
+    assert perform.recover_log("glacier-ec3d56f9", {}) is not None
+
+
+def test_a_recorded_log_path_is_used_before_any_scan(paths):
+    logs = paths / "out" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    named = logs / "2026-09-01-210819.log"
+    named.write_text("nothing that mentions the id", encoding="utf-8")
+
+    found = perform.recover_log("deserts-08022f98", {"log_path": str(named)})
+
+    assert found == named
+
+
+def test_no_transcript_left_is_not_an_error(paths):
+    assert perform.recover_log("gone-56d0526c", {}) is None
+
+
+def test_the_warnings_block_is_read_off_the_transcript(paths):
+    log = paths / "run.log"
+    log.write_text(
+        "STATUS  : OK\n"
+        "--------------------------------\n"
+        "WARNINGS\n"
+        "  - visuals: beat 6 had 0 hits\n"
+        "  - assemble: 8 of 9 cuts were nudged\n"
+        "--------------------------------\n",
+        encoding="utf-8")
+
+    assert perform._log_warnings(log) == [
+        "visuals: beat 6 had 0 hits",
+        "assemble: 8 of 9 cuts were nudged",
+    ]
+
+
+def test_relabel_prints_the_evidence_and_the_command(paths, capsys):
+    ledger = _ledger(_features("ocean-1e2c6cb6"))
+    ledger.skip("ocean-1e2c6cb6", "not good enough to post")
+
+    perform._print_relabel(ledger)
+
+    printed = capsys.readouterr().out
+    assert "1 binned reel(s) have no reason on them" in printed
+    assert "not good enough to post" in printed
+    assert "--skipped <code>" in printed
+    assert "footage | hook | claim" in printed
+
+
+def test_relabel_says_so_when_there_is_nothing_to_do(paths, capsys):
+    ledger = _ledger(_features("r1"))
+    ledger.skip("r1", "footage")
+
+    perform._print_relabel(ledger)
+
+    assert "every binned reel carries a reason" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# How many people saw it
+# ---------------------------------------------------------------------------
+
+def test_a_reel_almost_nobody_saw_is_not_compared(paths):
+    """Reach 0 carried the best watch_ratio in the file: 2.381.
+
+    A ratio computed over one or two viewers is not a weak measurement of the
+    reel, it is a measurement of who opened the app, and the report was ranking
+    it against a reel that reached 289.
+    """
+    ledger = _corpus(6)
+    for day in range(6):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": 200})
+    ledger.record("r3", {"watch_ratio": 2.4, "reach": 2})
+
+    data = perform.report(ledger=ledger, min_samples=1, min_reach=30)
+    everything = perform.report(ledger=ledger, min_samples=1, min_reach=0)
+
+    assert data["unseen"] == 1
+    assert any("fewer than 30 accounts" in w for w in data["warnings"])
+    # One fewer row to compare, and it is the one nobody saw.
+    assert data["compared"] == everything["compared"] - 1
+
+
+def test_a_reel_with_no_reach_recorded_is_still_compared(paths):
+    """Not knowing the reach is not knowing it was small.
+
+    The same call the freshness window makes about a measurement with no age
+    on it - and every row in the ledger before the provider was switched on
+    has numbers but no reach.
+    """
+    ledger = _corpus(4)
+    for day in range(4):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=1, min_reach=30)
+
+    assert data["unseen"] == 0
+    assert data["compared"] == perform.report(
+        ledger=ledger, min_samples=1, min_reach=0)["compared"]
+
+
+def test_the_reach_floor_does_not_touch_the_kept_or_binned_table(paths):
+    """Nobody has to see a reel for "it was not good enough" to be true.
+
+    That table is a same-day verdict made before the reel went anywhere, so a
+    floor about audience size has no business filtering it.
+    """
+    ledger = _corpus(4)
+    ledger.record("r0", {"watch_ratio": 0.5, "reach": 1})
+    ledger.record("r1", {"watch_ratio": 0.5, "reach": 1})
+    ledger.skip("r2", "footage")
+    ledger.skip("r3", "hook")
+
+    data = perform.report(ledger=ledger, min_samples=1, min_reach=30)
+
+    assert data["unseen"] == 2
+    assert data["posted"] == 2 and data["binned"] == 2
+    assert all(row["of"] == 4 for row in data["kept"])
+
+
+def test_the_floor_can_be_switched_off(paths):
+    ledger = _corpus(4)
+    for day in range(4):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": 1})
+
+    data = perform.report(ledger=ledger, min_samples=1, min_reach=0)
+    floored = perform.report(ledger=ledger, min_samples=1, min_reach=30)
+
+    assert data["unseen"] == 0
+    assert floored["unseen"] == 4, "the floor is what is being switched off"
+    assert data["compared"] > floored["compared"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Trials that reach step 5
+# ---------------------------------------------------------------------------
+
+def test_the_columns_the_report_calls_constant_can_be_trialled(paths):
+    """The warning named music and motion and pointed at PERFORMANCE_EXPLORE.
+
+    Until they were in TRIALS, that was a remedy nobody could apply: the
+    setting took four names and neither of the two it was being recommended
+    for was one of them.
+    """
+    assert {"music", "motion"} <= set(perform.TRIALS)
+
+
+def test_a_music_arm_turns_the_bed_off_at_step_5(paths):
+    off = perform.arm_assembly({"name": "music", "arm": "off"})
+    on = perform.arm_assembly({"name": "music", "arm": "on"})
+
+    assert off == {"music": False}, "False is 'no bed'; None is 'rotate as usual'"
+    assert on == {}, "the control arm leaves config alone"
+
+
+def test_a_motion_arm_freezes_the_shots(paths):
+    assert perform.arm_assembly({"name": "motion", "arm": "off"}) == {"motion": "off"}
+    assert perform.arm_assembly({"name": "motion", "arm": "on"}) == {}
+
+
+def test_a_trial_on_something_else_changes_nothing_about_step_5(paths):
+    assert perform.arm_assembly({"name": "hook", "arm": "off"}) == {}
+    assert perform.arm_assembly({}) == {}
+
+
+def test_the_music_and_motion_arms_alternate_like_the_rest(paths):
+    ledger = _ledger(_features("r1", trial={"name": "music", "arm": "on"}))
+
+    assert perform.choose_arm("music", ledger=ledger)["arm"] == "off"
+
+
+# ---------------------------------------------------------------------------
+# How many people saw it, and when it went out
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stamp, slot", [
+    ("2026-09-01T17:27:24+00:00", "12-18 utc"),
+    ("2026-09-08T11:48:37+00:00", "06-12 utc"),
+    ("2026-09-08T00:00:00+00:00", "00-06 utc"),
+    ("2026-09-08T23:59:59+00:00", "18-24 utc"),
+])
+def test_the_posting_hour_buckets_into_six_hour_blocks(stamp, slot):
+    assert perform.posting_slot({"posted_at": stamp}) == slot
+
+
+def test_an_assumed_posting_time_answers_nothing(paths):
+    """`posted_at` falls back to when the reel was MADE when nobody said.
+
+    A reel made at noon and posted in the evening would otherwise answer the
+    clock question with a time nothing happened at - a wrong answer that looks
+    exactly like a right one.
+    """
+    assert perform.posting_slot({
+        "posted_at": "2026-09-01T12:00:00+00:00", "posted_at_assumed": True,
+    }) == ""
+
+
+def test_no_posting_time_answers_nothing(paths):
+    assert perform.posting_slot({}) == ""
+
+
+def test_the_clock_is_never_asked_of_kept_or_binned(paths):
+    """Only posted reels have a posting time.
+
+    Asked there, the question would split exactly the posted reels from
+    exactly the binned ones and report a perfect correlation with being
+    posted - the tautology that table is made of, dressed as a finding.
+    """
+    ledger = _corpus(6)
+    for day in range(4):
+        # An explicit posting time: without one it is assumed from when the
+        # reel was made, and an assumed time answers no clock question at all.
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": 90 + day},
+                      posted_at=_stamp(day))
+    ledger.skip("r4", "footage")
+    ledger.skip("r5", "hook")
+
+    data = perform.report(ledger=ledger, min_samples=1)
+
+    assert not any(row["question"] == "posted" for row in data["kept"])
+    assert any(row["question"] == "posted" for row in data["reached"])
+
+
+def test_the_reach_table_is_not_filtered_by_the_reach_floor(paths):
+    """A reel nobody saw is a perfectly good observation OF reach.
+
+    It is only worthless as a denominator, and filtering this table by reach
+    would drop the end of the distribution the account is stuck at.
+    """
+    ledger = _corpus(6)
+    for day in range(6):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": 2})
+
+    data = perform.report(ledger=ledger, min_samples=1, min_reach=30)
+
+    assert data["unseen"] == 6, "none of them can be a denominator"
+    assert data["reached"], "all of them are still observations of reach"
+    assert data["reach_median"] == 2
+
+
+def test_the_report_says_what_an_ordinary_reach_is(paths):
+    ledger = _corpus(4)
+    for day, reach in enumerate((3, 6, 64, 289)):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": reach})
+
+    data = perform.report(ledger=ledger, min_samples=1)
+
+    assert data["reach_median"] == 35.0
+
+
+def test_a_batch_relabel_does_not_print_its_sentence_three_times(paths):
+    """Nine rows relabelled at once carry one sentence between them.
+
+    Printing it once says everything printing it three times does, and leaves
+    room for the notes that differ - which are the ones worth reading.
+    """
+    ledger = _corpus(5)
+    for day in range(3):
+        ledger.skip(f"r{day}", "other")
+        ledger.entry(f"r{day}")["skip_note"] = "reason lost"
+    ledger.skip("r3", "other")
+    ledger.entry("r3")["skip_note"] = "ffmpeg exited 3221225786"
+
+    rows = perform.skip_tally(ledger.rows())
+
+    assert rows[0]["code"] == "other" and rows[0]["n"] == 4
+    assert rows[0]["notes"] == ["reason lost", "ffmpeg exited 3221225786"]

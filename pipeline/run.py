@@ -870,7 +870,10 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
     # --- step 5: the reel -------------------------------------------------
     started = time.monotonic()
     _announce(5, "assemble", "encoding")
-    assembly = assemble.assemble_video(audio, manifest)
+    # The same trial, spent at the other end of the run: `apply_arm` answered
+    # step 2 an hour ago, and a music or motion arm is only decided here.
+    assembly = assemble.assemble_video(audio, manifest,
+                                       **perform.arm_assembly(trial))
     _collect(record, "assemble", assembly.get("warnings"))
     record["run_id"] = assembly.get("run_id") or record["run_id"]
     record["video_path"] = assembly["video_path"]

@@ -1762,6 +1762,30 @@ PERFORMANCE_BASELINE_RUNS = get_env_int("PERFORMANCE_BASELINE_RUNS", 10)
 #: that happened to do well will otherwise print as a finding.
 PERFORMANCE_MIN_SAMPLES = get_env_int("PERFORMANCE_MIN_SAMPLES", 8)
 
+#: Accounts a reel had to reach before its numbers are compared with anything.
+#:
+#: The other floors here are about how many *reels* a finding rests on. This is
+#: about how many *people* each reel's number rests on, which nothing was
+#: checking. Read off the ledger on 2026-09-09, the seven posted reels reached
+#: 289, 64, 9, 6, 3, 3 and 0 accounts. The reel that reached nobody carries a
+#: watch_ratio of 2.381 - the best figure in the file, computed from one or two
+#: viewers, and the report was ranking it against the rest as though it were a
+#: measurement of the reel.
+#:
+#: A ratio over a handful of viewers is not a weak signal, it is a different
+#: quantity: at a reach of 3, one person changes it by a third, so what the
+#: table would converge on with more reels is who happened to open the app.
+#: Excluded rather than down-weighted, for the reason the freshness window is:
+#: a number that does not mean what the column means does not belong in the
+#: column at all.
+#:
+#: 30 is a declared prior and not a measured threshold - there is no reach at
+#: which the number becomes trustworthy, only one below which it certainly is
+#: not. Set it to 0 to compare everything, which is what the report did before
+#: this existed. It does not touch KEPT OR BINNED: that is a same-day verdict
+#: about the reel, and nobody has to see a reel for it to be true.
+PERFORMANCE_MIN_REACH = get_env_int("PERFORMANCE_MIN_REACH", 30)
+
 #: Hours after posting within which a measurement is comparable with the rest.
 #: A reel read at twelve hours and one read at a week are not the same
 #: measurement, and averaging them measures when you happened to look. 0 turns
@@ -1803,11 +1827,26 @@ PERFORMANCE_MAX_ADJUST = get_env_float("PERFORMANCE_MAX_ADJUST", 1.0)
 PERFORMANCE_MIN_REELS = get_env_int("PERFORMANCE_MIN_REELS", 30)
 
 #: One thing to vary deliberately from reel to reel, so there is ever anything
-#: to compare: "off", "hook" (run the hook pass on alternate reels) or
-#: "duration" (a step shorter, then a step longer than step 0 suggested).
+#: to compare. "off", or one of:
+#:
+#:   hook       run the hook pass on alternate reels
+#:   duration   a step shorter, then a step longer than step 0 suggested
+#:   structure  run the shape pass on alternate reels
+#:   takeaway   run the hand-over pass on alternate reels
+#:   music      a bed under alternate reels, silence under the rest
+#:   motion     shots move on alternate reels, are locked off on the rest
+#:
 #: Without a trial the pipeline makes the same choice every day and the ledger
 #: fills up with 365 reels that cannot answer whether it was the right one.
 #: Arms alternate rather than randomise - see perform.choose_arm.
+#:
+#: `music` and `motion` are here because the report named them. Read on
+#: 2026-09-09, five questions had been answered identically by every reel ever
+#: made, and the warning about it recommended this setting - which at the time
+#: took four names, none of them the ones it was recommending. The other three
+#: constants are not switches: the captions have one aligner, and the two
+#: component columns describe what a scorer happened to find in a script rather
+#: than a choice anything makes.
 PERFORMANCE_EXPLORE = get_env("PERFORMANCE_EXPLORE", "off")
 
 #: Dotted path to something that can fetch the numbers - `mypkg.mod.fetch`,

@@ -778,7 +778,7 @@ def _merge_identical_neighbours(shots: list[Shot]) -> list[Shot]:
     return merged
 
 
-def _plan_motion(shots: list[Shot]) -> None:
+def _plan_motion(shots: list[Shot], mode: str | None = None) -> None:
     """Decide how the frame moves across each shot, in place.
 
     Runs after the timeline is final - after snapping and after identical
@@ -802,7 +802,11 @@ def _plan_motion(shots: list[Shot]) -> None:
     skipped over, so the clips either side of one carry on in the order they
     would have had. A still simply does not honour the "pull" half of it.
     """
-    mode = (config.SHOT_MOTION or "off").strip().lower()
+    # `mode` overrides the setting for one reel, which is what lets step 9 run
+    # a motion trial: the column was answered "on" by every reel ever made, so
+    # nothing in the ledger could say whether the move is worth the crop.
+    mode = (mode if mode is not None else config.SHOT_MOTION or "off")
+    mode = str(mode).strip().lower()
     clips_move = mode not in ("", "off", "none") and config.SHOT_MOTION_ZOOM > 1.0
 
     for shot in shots:
@@ -989,6 +993,7 @@ def plan_timeline(manifest: dict, audio_duration: float,
                   probes: dict[int, dict],
                   words: list[dict] | None = None,
                   beats: list[float] | None = None,
+                  motion: str | None = None,
                   ) -> tuple[list[Shot], list[str]]:
     """Lay step 4's assets out across the narration.
 
@@ -1131,7 +1136,7 @@ def plan_timeline(manifest: dict, audio_duration: float,
     shots = _merge_identical_neighbours(shots)
     if shots:  # absorb the rounding drift rather than ending a frame short
         shots[-1].duration = round(total - shots[-1].start, 3)
-    _plan_motion(shots)
+    _plan_motion(shots, motion)
 
     if on_beat:
         warnings.append(
@@ -3153,6 +3158,7 @@ def _derive_hook_card(script: str) -> str:
 def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                    run_id: str | None = None, captions: bool | None = None,
                    alignment: str | None = None, music=None, sfx=None,
+                   motion: str | None = None,
                    hook=None, cover=None, dry_run: bool = False,
                    overwrite: bool = True) -> dict:
     """Cut step 3's narration and step 4's footage into a finished reel.
@@ -3168,6 +3174,8 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             rotating over whatever is in assets/music/.
         sfx: False to render without sound effects. Defaults to using whatever
             is in assets/sfx/.
+        motion: how shots move - "alternate", "push" or "off". Defaults to
+            config.SHOT_MOTION. Overridden per reel so step 9 can trial it.
         hook: text for the hook card burned over the opening. False for no
             card; None takes step 2's `hook_card` from the manifest, falling
             back to the script's own opening sentence.
@@ -3240,7 +3248,7 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
     beats = beat_grid(track, narration + max(0.0, config.VIDEO_TAIL_SECONDS))
 
     shots, plan_warnings = plan_timeline(manifest, narration, probes, words,
-                                         beats)
+                                         beats, motion)
     warnings += plan_warnings
     total = round(shots[-1].end, 3)
 
