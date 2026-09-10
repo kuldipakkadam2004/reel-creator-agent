@@ -2519,6 +2519,26 @@ class Track:
     def name(self) -> str:
         return self.path.name
 
+    @property
+    def has_grid(self) -> bool:
+        """Whether cuts could actually be snapped to this bed.
+
+        Asked *before* `resolve_track` applies the MUSIC_BPM fallback, so it
+        has to account for it: a track with no tempo of its own still gets a
+        grid where MUSIC_BPM stands one up. `beatless` overrides both - it is
+        the measured answer that there is no constant pulse to snap to, and no
+        fallback number can conjure one.
+
+        A tempo outside MUSIC_BPM_MIN..MAX is a typo that `prepare_track` will
+        drop later, so it does not count here either. Otherwise a stray
+        "bpm: 9000" would pull the rotation towards the one bed guaranteed to
+        end up with no grid at all.
+        """
+        if self.beatless:
+            return False
+        tempo = self.bpm or config.MUSIC_BPM
+        return bool(tempo) and config.MUSIC_BPM_MIN <= tempo <= config.MUSIC_BPM_MAX
+
     def to_dict(self) -> dict:
         return {
             "file": self.name,
@@ -2650,8 +2670,18 @@ class MusicLedger:
         return [str(entry.get("track") or "")
                 for entry in reversed(self._data["history"])]
 
-    def choose(self, tracks: list[Track], *, cooldown: int) -> Track | None:
-        """Least recently used track, preferring one outside the cooldown."""
+    def choose(self, tracks: list[Track], *, cooldown: int,
+               prefer_grid: bool = False) -> Track | None:
+        """Least recently used track, preferring one outside the cooldown.
+
+        `prefer_grid` puts a bed the cuts can be snapped to ahead of one they
+        cannot, *within* whatever the cooldown has left free. Ordering it that
+        way round rather than as an outright filter is what keeps the beatless
+        beds in the rotation: with a cooldown of 3 and three gridded beds, the
+        gridded ones are all blocked every fourth run and a beatless one comes
+        up on its own. Measured on assets/music/, that is the difference
+        between cutting to a grid on 3 runs in 5 and on 3 in 4.
+        """
         if not tracks:
             return None
         recent = self._recent()
@@ -2672,7 +2702,11 @@ class MusicLedger:
             # Every track inside the cooldown means the library is smaller than
             # the cooldown - rotate anyway rather than dropping the bed.
             if fresh:
-                return fresh[0]
+                ranked = fresh
+        if prefer_grid:
+            gridded = [t for t in ranked if t.has_grid]
+            if gridded:
+                return gridded[0]
         return ranked[0]
 
     def record(self, run_id: str, track: Track) -> None:
@@ -2732,7 +2766,14 @@ def resolve_track(music, warnings: list[str]) -> tuple[Track | None,
         return None, None       # nothing dropped in yet; not worth a warning
 
     ledger = MusicLedger()
-    chosen = ledger.choose(tracks, cooldown=config.MUSIC_REUSE_COOLDOWN_RUNS)
+    chosen = ledger.choose(
+        tracks,
+        cooldown=config.MUSIC_REUSE_COOLDOWN_RUNS,
+        # Only worth preferring a grid where something is going to cut to it.
+        # With snapping off the preference would trade away variety for a
+        # property nothing reads.
+        prefer_grid=config.MUSIC_PREFER_BEAT_GRID and config.SHOT_SNAP_TO_BEAT,
+    )
     return chosen, ledger
 
 
@@ -3135,6 +3176,32 @@ def write_attribution_file(path: Path, manifest: dict, credits: list[dict]) -> N
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+#: What step 4 knew about an asset that is worth carrying onto the timeline.
+#: Deliberately short: this is here to be correlated against how a reel did,
+#: not to duplicate the visuals manifest, which is on disk and pointed at by
+#: `visuals_manifest`. Provider is the one nobody could answer before - every
+#: shot in the first eight reels reads `"provider": null` when the assembly is
+#: loaded back, so "do the Pexels reels hold viewers better than the Openverse
+#: ones?" had no way of being asked.
+_SHOT_PROVENANCE_FIELDS = ("provider", "provider_key", "score", "relevance",
+                           "width", "height")
+
+
+def _shot_provenance(manifest: dict, shot: Shot) -> dict:
+    """Step 4's record of the asset behind one shot, or nothing if it is gone.
+
+    Missing keys are left out rather than written as null: a manifest from
+    before a field existed should read as "not recorded", which an absent key
+    says and a null does not.
+    """
+    assets = manifest.get("assets") or []
+    if not 0 <= shot.asset_index < len(assets):
+        return {}
+    asset = assets[shot.asset_index]
+    return {field: asset[field]
+            for field in _SHOT_PROVENANCE_FIELDS if field in asset}
+
+
 def _derive_hook_card(script: str) -> str:
     """Step 2's hook card, worked out here when the manifest has none.
 
@@ -3416,6 +3483,7 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                 "reused": shot.reused,
                 "motion": shot.motion,
                 "motion_zoom": shot.motion_zoom,
+                **_shot_provenance(manifest, shot),
             }
             for shot in shots
         ],

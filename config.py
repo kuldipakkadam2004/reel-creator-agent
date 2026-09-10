@@ -1237,6 +1237,18 @@ MUSIC_BEAT_OFFSET = get_env_float("MUSIC_BEAT_OFFSET", 0.0)
 MUSIC_BPM_MIN = get_env_float("MUSIC_BPM_MIN", 30.0)
 MUSIC_BPM_MAX = get_env_float("MUSIC_BPM_MAX", 300.0)
 
+#: Put a bed the cuts can be snapped to ahead of one they cannot, inside
+#: whatever the reuse cooldown has left free. Only three of the five beds in
+#: assets/music/ have a measured grid, and the rotation before this treated all
+#: five alike: six of the first eight reels went out cut to the words alone
+#: because the bed that came up had no tempo. This is a preference rather than
+#: a filter, so the beatless beds still come round when the cooldown blocks the
+#: others - roughly one run in four instead of two in five.
+#:
+#: Does nothing where SHOT_SNAP_TO_BEAT is off: with nothing cutting to the
+#: grid, preferring a bed that has one costs variety and buys nothing.
+MUSIC_PREFER_BEAT_GRID = get_env_bool("MUSIC_PREFER_BEAT_GRID", True)
+
 # --- sound design -----------------------------------------------------------
 # Cuts that are heard as well as seen. A whoosh across a cut is the cheapest
 # production value there is: it costs one small file and it turns a change of
@@ -2158,6 +2170,9 @@ def _report() -> None:
                    + (", ducked" if MUSIC_DUCKING else ", flat")
                    + (f", pinned to {MUSIC_FILE}" if MUSIC_FILE
                       else ", rotating over assets/music/")
+                   + (", beds with a grid first"
+                      if MUSIC_PREFER_BEAT_GRID and SHOT_SNAP_TO_BEAT
+                      and not MUSIC_FILE else "")
                    + (f", {MUSIC_BPM:g} BPM" if MUSIC_BPM > 0 else ""))
                   if MUSIC_ENABLED else "off"),
         ("SFX", (f"{SFX_PEAK_TARGET:g} dBFS peak"

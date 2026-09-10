@@ -1077,7 +1077,7 @@ What lands in `output/<date>/<run id>/`:
 | `captions.ass` / `.srt` | the burned-in captions, and a plain copy |
 | `alignment.json` | every word with its timestamp, and which backend timed it |
 | `attribution.txt` | credits for the footage that made the cut |
-| `assembly.json` | the shot-by-shot timeline, the music bed used, every effect and where it landed, **which frame became the cover and why**, plus **step 4's per-asset attribution**, carried through for steps 6 and 7 |
+| `assembly.json` | the shot-by-shot timeline, the music bed used, every effect and where it landed, **which frame became the cover and why**, plus **step 4's per-asset attribution**, carried through for steps 6 and 7. Each shot also carries **where its footage came from** — provider, that provider's id, and the score and relevance step 4 ranked it on — so a finished reel can be read back against the footage that made it without going and finding step 4's manifest |
 
 ### Motion
 
@@ -1225,6 +1225,15 @@ nothing is generated, so whatever you put there is yours to have licensed.
 * with several tracks, step 5 **rotates** between them
   (`MUSIC_REUSE_COOLDOWN_RUNS`) so the same bed does not sit under every reel.
   `--music <file>` pins one, `--no-music` goes without;
+* the rotation puts a bed the cuts can land on **ahead of one they cannot**
+  (`MUSIC_PREFER_BEAT_GRID`, on). Only three of the five beds below have a
+  measured tempo, and a rotation that treats all five alike spends most of its
+  runs on a bed `SHOT_SNAP_TO_BEAT` can do nothing with — six of the first
+  eight reels went out cut to the words alone for exactly that reason. It is a
+  preference and not a filter, applied inside whatever the reuse cooldown has
+  left free, so the beatless beds still come round: roughly one run in four
+  rather than two in five. Off where `SHOT_SNAP_TO_BEAT` is off, where it
+  would cost variety and buy nothing;
 * the bed is normalised to `MUSIC_LOUDNESS_TARGET` (-30 LUFS — about 16 LU
   under the narration). **That is the knob that decides how loud the music
   is**, and normalising means the level does not depend on how hot the track

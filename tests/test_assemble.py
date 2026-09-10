@@ -682,6 +682,35 @@ def test_a_short_clip_is_looped_rather_than_seeked():
     assert "-stream_loop" in args and "-ss" not in args
 
 
+# --- what the timeline remembers about its footage -------------------------
+
+def test_a_shot_carries_the_provider_that_supplied_it():
+    """Without this the assembly cannot say where a reel's pictures came from."""
+    manifest = {"assets": [{"provider": "pexels", "provider_key": "pexels:1",
+                            "score": 14.5, "relevance": 0.5,
+                            "width": 1080, "height": 1920}]}
+
+    carried = assemble._shot_provenance(manifest, shot(asset_index=0))
+
+    assert carried["provider"] == "pexels"
+    assert carried["score"] == 14.5
+    assert carried["width"] == 1080
+
+
+def test_a_field_step_four_never_wrote_is_absent_rather_than_null():
+    """"Not recorded" and "recorded as nothing" are different answers."""
+    manifest = {"assets": [{"provider": "openverse"}]}
+
+    carried = assemble._shot_provenance(manifest, shot(asset_index=0))
+
+    assert carried == {"provider": "openverse"}
+
+
+def test_a_shot_pointing_past_the_manifest_costs_nothing():
+    """A stale index must not take the whole assembly down with it."""
+    assert assemble._shot_provenance({"assets": []}, shot(asset_index=3)) == {}
+
+
 def test_an_in_point_becomes_a_seek_before_the_input():
     args = assemble._shot_inputs(shot(source_start=2.5))
     assert args.index("-ss") < args.index("-i")
@@ -1076,6 +1105,72 @@ def test_a_library_rotates_instead_of_repeating(music_dir):
         picked.append(track.name)
 
     assert picked == ["a.mp3", "b.mp3", "c.mp3", "a.mp3", "b.mp3", "c.mp3"]
+
+
+def test_a_bed_the_cuts_can_land_on_is_picked_over_one_they_cannot(music_dir):
+    """The whole point of measuring a tempo is that the rotation uses it."""
+    track_file(music_dir, "a-beatless.mp3", "Someone (CC BY 3.0)\nbpm: none")
+    track_file(music_dir, "b-gridded.mp3", "Someone (CC BY 3.0)\nbpm: 120")
+
+    track, _ledger = assemble.resolve_track(None, [])
+
+    assert track.name == "b-gridded.mp3"
+
+
+def test_a_beatless_bed_still_comes_round(music_dir, monkeypatch):
+    """A preference, not a filter: a two-bed library must not become one bed.
+
+    The cooldown blocks the gridded bed the run after it plays, which is what
+    lets the beatless one through without any of this having to count runs.
+    """
+    monkeypatch.setattr(config, "MUSIC_REUSE_COOLDOWN_RUNS", 1)
+    track_file(music_dir, "a-beatless.mp3", "Someone (CC BY 3.0)\nbpm: none")
+    track_file(music_dir, "b-gridded.mp3", "Someone (CC BY 3.0)\nbpm: 120")
+
+    picked = []
+    for run in range(4):
+        track, ledger = assemble.resolve_track(None, [])
+        ledger.record(f"run-{run}", track)
+        picked.append(track.name)
+
+    assert picked == ["b-gridded.mp3", "a-beatless.mp3"] * 2
+
+
+def test_the_grid_preference_is_off_when_nothing_cuts_to_a_grid(music_dir,
+                                                               monkeypatch):
+    """With snapping off the preference would cost variety and buy nothing."""
+    monkeypatch.setattr(config, "SHOT_SNAP_TO_BEAT", False)
+    track_file(music_dir, "a-beatless.mp3", "Someone (CC BY 3.0)\nbpm: none")
+    track_file(music_dir, "b-gridded.mp3", "Someone (CC BY 3.0)\nbpm: 120")
+
+    track, _ledger = assemble.resolve_track(None, [])
+
+    assert track.name == "a-beatless.mp3"
+
+
+def test_a_fallback_tempo_gives_every_bed_but_a_beatless_one_a_grid(music_dir,
+                                                                   monkeypatch):
+    """MUSIC_BPM stands a grid up, so `has_grid` cannot just read `bpm`."""
+    monkeypatch.setattr(config, "MUSIC_BPM", 100.0)
+    silent = assemble.Track(path=Path("no-sidecar.mp3"))
+    measured = assemble.Track(path=Path("measured.mp3"), beatless=True)
+
+    assert silent.has_grid is True
+    assert measured.has_grid is False
+
+
+def test_a_typo_tempo_does_not_attract_the_rotation(music_dir):
+    """`prepare_track` drops a 9000 BPM grid, so it must not be preferred."""
+    track_file(music_dir, "a-real.mp3", "Someone (CC BY 3.0)\nbpm: 120")
+    track_file(music_dir, "b-typo.mp3", "Someone (CC BY 3.0)\nbpm: 9000")
+
+    assert assemble._named_track("b-typo.mp3").has_grid is False
+
+    for run in range(2):
+        track, ledger = assemble.resolve_track(None, [])
+        ledger.record(f"run-{run}", track)
+        if run == 0:
+            assert track.name == "a-real.mp3"
 
 
 def test_one_track_is_still_used_when_the_cooldown_covers_everything(music_dir):
