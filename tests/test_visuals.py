@@ -674,6 +674,50 @@ def _reject_everything(shortlists, beats, topic):
     )
 
 
+def test_the_neutral_fill_names_the_real_reason_it_was_needed():
+    """The note used to assert a download failure it had never checked for.
+
+    `filled N slot(s) from the neutral shot ...: what the screen kept could not
+    be downloaded` was hard-coded on a branch whose only condition is that the
+    beat came up short. On the bedrock reel (2026-09-10) it fired on three
+    beats while the run recorded no download failure at all - every real one
+    warns, and there were none. The commonest cause is the opposite of what it
+    claimed: the screen kept fewer clips than the beat has slots, so nothing
+    was ever downloaded and nothing could have failed.
+
+    The four causes want different responses - too few keepers is a supply
+    problem, an already-spent key is the cross-beat dedupe working - so the
+    note has to tell them apart.
+    """
+    rows = [(1.0, make_candidate(i), "q") for i in range(3)]
+    state = visuals._RunState()
+
+    # Too few keepers: nothing was downloaded, so nothing failed.
+    reason = visuals._shortfall_reason(rows[:1], [{}], want=2, state=state)
+    assert "kept only 1" in reason
+    assert "nothing failed to download" in reason
+
+    # A keeper that really did fail is still reported as one.
+    state.failed_keys.add(rows[1][1].key)
+    reason = visuals._shortfall_reason(rows[:2], [{}], want=2, state=state)
+    assert "failed to download" in reason
+    assert "nothing failed" not in reason
+
+    # A keeper an earlier beat already used is not a failure at all.
+    state.failed_keys.clear()
+    state.taken_keys.add(rows[1][1].key)
+    reason = visuals._shortfall_reason(rows[:2], [{}], want=2, state=state)
+    assert "already used by an earlier beat" in reason
+
+    # `taken_keys` is run-wide, so a beat's own placement is in it too. The
+    # clip this beat just used must not be read back as an earlier beat's.
+    state.taken_keys.clear()
+    state.taken_keys.add(rows[0][1].key)
+    placed = [{"provider_key": rows[0][1].key}]
+    reason = visuals._shortfall_reason(rows[:2], placed, want=2, state=state)
+    assert "already used by an earlier beat" not in reason, reason
+
+
 def test_a_beat_with_nothing_honest_falls_back_to_the_neutral_shot(monkeypatch):
     """The cement mixer's beat, end to end.
 

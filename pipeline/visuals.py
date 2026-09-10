@@ -2621,6 +2621,47 @@ def _demote_rejects(
     return keep + drop, notes
 
 
+def _shortfall_reason(
+    keepers: list[tuple[float, "Candidate", str]],
+    acquired: list[dict], want: int, state: "_RunState",
+) -> str:
+    """Why this beat could not fill itself from what the screen kept.
+
+    The note this feeds used to assert one cause - "what the screen kept could
+    not be downloaded" - on a branch that never tested for it. It fires
+    whenever the beat came up short, and the commonest reason by far is that
+    the screen kept fewer clips than the beat has slots: nothing was ever
+    downloaded, so nothing could have failed. Reading the manifest of the
+    bedrock reel (2026-09-10) there was no way to tell those apart, because
+    every path out of `_acquire` that is not a download failure leaves no
+    record at all - a genuine failure at least warns.
+
+    Distinguishing them matters because they call for opposite fixes: too few
+    keepers is a supply problem (the resolution floor, the shortlist size, the
+    screen's strictness), while a key already taken is the cross-beat dedupe
+    doing its job and wants no fix at all.
+    """
+    short = want - len(acquired)
+    if len(keepers) < want:
+        return (f"the screen kept only {len(keepers)} clip(s) for {want} slot(s)"
+                f" - nothing failed to download")
+    # `taken_keys` is run-wide and this beat has already added its own to it,
+    # so the clips it just placed have to come out before the rest can be read
+    # as an earlier beat's - otherwise a beat that filled one slot itself
+    # reports that slot as having been spent somewhere else.
+    mine = {a.get("provider_key") for a in acquired}
+    spent = [row for row in keepers
+             if row[1].key in state.taken_keys and row[1].key not in mine]
+    failed = [row for row in keepers if row[1].key in state.failed_keys]
+    if failed:
+        return (f"{len(failed)} of {len(keepers)} kept clip(s) failed to "
+                f"download")
+    if spent:
+        return (f"{len(spent)} of {len(keepers)} kept clip(s) were already "
+                f"used by an earlier beat")
+    return f"{short} kept clip(s) were held back as near-repeats"
+
+
 def _neutral_plan(
     beat: Beat, providers: list[Provider], settings: dict, ledger: UsageLedger,
     run_id: str, state: "_RunState", rejections: dict[str, int],
@@ -3455,6 +3496,21 @@ def source_visuals(
             unscreened_keys = {r[1].key for r in unscreened}
             unjudged_keys.update(unscreened_keys)
 
+            # What the beat had to choose from, kept so a finished run can be
+            # audited without re-running it. The bedrock reel (2026-09-10)
+            # filled three beats from the neutral shot and none of this was
+            # recoverable afterwards: whether the screen had kept too little,
+            # or an earlier beat had already spent it, could only be guessed.
+            record["supply"] = {
+                "pool": pool_sizes.get(beat.index, 0),
+                "ranked": len(ranked),
+                "screened": len([r for r in ranked if r[1].key in screened_keys]),
+                "keepers": len(keepers),
+                "rejected": len(rejects),
+                "unscreened": len(unscreened),
+                "wanted": want,
+            }
+
             acquired = take(keepers, want, beat)
             if len(acquired) < want:
                 # Variety is a preference, not a filter. A beat left short by
@@ -3464,12 +3520,12 @@ def source_visuals(
                 acquired += take(keepers, want - len(acquired), beat,
                                  avoid_similar=False)
 
-            # The screen kept something here, but not enough of it survived
-            # downloading, and the next rows are clips it rejected. Reaching
-            # past them for the beat's neutral shot is the same trade the screen
-            # itself makes: an under-specified shot of the subject's own world
-            # beats one that contradicts the narration. Only beats that need it
-            # pay for the search.
+            # The screen kept something here, but not enough of it reached the
+            # beat, and the next rows are clips it rejected. Reaching past them
+            # for the beat's neutral shot is the same trade the screen itself
+            # makes: an under-specified shot of the subject's own world beats
+            # one that contradicts the narration. Only beats that need it pay
+            # for the search.
             if len(acquired) < want and (rejects or unscreened):
                 seen = {row[1].key for row in ranked}
                 safe = _neutral_plan(beat, active, settings, ledger, run_id,
@@ -3479,8 +3535,8 @@ def source_visuals(
                     acquired += taken
                     record["notes"].append(
                         f"filled {len(taken)} slot(s) from the neutral shot "
-                        f"{beat.neutral_query!r}: what the screen kept could "
-                        f"not be downloaded"
+                        f"{beat.neutral_query!r}: "
+                        f"{_shortfall_reason(keepers, acquired, want, state)}"
                     )
                 ranked = ranked + safe
 
