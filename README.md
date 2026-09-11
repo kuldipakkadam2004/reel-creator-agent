@@ -2028,12 +2028,15 @@ WHY THEY WERE BINNED  (the same-day verdict; no API involved)
   pacing       2    14%  it dragged, or the cuts fought the read
 
 KEPT OR BINNED  (1.00 = always posted; every reel counts)
-  question                   answer         n    median   vs rest
-  topic source               evergreen     11     0.91    +0.24
+  question                   answer         n    median   vs rest  90% range
+  topic source               evergreen     11     0.91    +0.24    +0.06 .. +0.41  *
+  * 1 of 6 row(s) separated from nothing - the range clears zero. The rest sit inside it.
 
 HOW MANY SAW IT  (1.00 = an ordinary reach for this account; median 6 accounts)
-  question                   answer         n    median   vs rest
-  topic source               redditrss     11     2.40x   +1.51
+  question                   answer         n    median   vs rest  90% range
+  topic source               redditrss     11     2.40x   +1.51    -0.88 .. +4.12
+  none of the 4 readable row(s) separated from nothing: every range above covers zero.
+  at this many reels the table can only see a difference past about 2.44, and the largest here is 1.51.
 
 WHAT REACH ACTUALLY LOOKED LIKE  (every posted reel, no floors)
   an exhibit and not a finding - nothing here is read as an effect
@@ -2056,17 +2059,19 @@ WHAT REACH ACTUALLY LOOKED LIKE  (every posted reel, no floors)
     1.90  why leaves change colour before they fall    reached 6
 
 HOW THEY DID  (1.00 = an ordinary reel for this account)
-  question                   answer         n    median   vs rest
-  length                     40-50s        12     1.18x   +0.21
-  trial: hook                on            11     1.09x   +0.14
+  question                   answer         n    median   vs rest  90% range
+  length                     40-50s        12     1.18x   +0.21    -0.34 .. +0.77
+  trial: hook                on            11     1.09x   +0.14    -0.41 .. +0.68
+  none of the 6 readable row(s) separated from nothing: every range above covers zero.
+  at this many reels the table can only see a difference past about 0.55, and the largest here is 0.21.
 
 SAVED OR SENT  (1.00 = every reel got a save or a share)
-  question                   answer         n    median   vs rest
-  trial: takeaway            on            11     0.27    +0.18
+  question                   answer         n    median   vs rest  90% range
+  trial: takeaway            on            11     0.27    +0.18    -0.05 .. +0.39
 
 FOLLOWED AFTER  (1.00 = every reel won a follow or a profile visit)
-  question                   answer         n    median   vs rest
-  trial: takeaway            on            11     0.09    +0.09
+  question                   answer         n    median   vs rest  90% range
+  trial: takeaway            on            11     0.09    +0.09    -0.02 .. +0.19
 ```
 
 They are printed in that order on purpose, and it is the order the funnel
@@ -2243,6 +2248,82 @@ different questions — *worth a tap* against *worth posting* — and because it
 the one number here that **moved a decision** rather than only describing one.
 If the covers the model liked reach no better than the ones it did not,
 `COVER_LOOK_WEIGHT` is wrong, and that is a thing this ledger can now find out.
+
+### Is the delta bigger than the noise?
+
+Every table above prints `n`, and for a long time `n` was the only thing
+standing between a reader and a finding: `PERFORMANCE_MIN_SAMPLES` (8) on both
+sides, and the row was read out. **That is the wrong question asked well.**
+
+Here is the whole objection, in the ledger's own numbers. Reach on the nine
+posted reels runs `289, 64, 20, 14, 9, 6, 3, 3, 0` — a coefficient of variation
+just over 2. Draw two arms of eight *from that same list*, so that there is
+provably no effect anywhere in the draw, and look at what the report would have
+printed:
+
+```
+  delta of medians spans -274 to +148
+  90% of the time it lands within -30 .. +32
+  |delta| > 5 in 55% of draws - with no real effect present
+```
+
+More than half the time, eight-a-side hands back a difference big enough to act
+on, from two arms that are the same thing. So eight reels a side never made a
+delta *readable*. It made it *printable*, and the table had no way of telling
+the reader which of the two it was holding out.
+
+That is not only a reporting fault. `measured_effects` feeds every readable
+`topic:` row into `adjustment_for`, which adds it to the score of every future
+candidate carrying that component — so a delta drawn from the shape of the
+spread does not get printed and forgotten, it comes back as a weight on the
+next board. Left alone, the ledger would have spent its first months teaching
+step 0 its own noise, and the account is small enough that it would have looked
+like learning.
+
+So every row now carries a **bootstrap interval on its own delta**, and a row
+whose interval covers nought has not separated its two sides:
+
+```
+  length                     40-50s        12     1.18x   +0.21    -0.34 .. +0.77
+  none of the 6 readable row(s) separated from nothing: every range above covers zero.
+  at this many reels the table can only see a difference past about 0.55, and the largest here is 0.21.
+```
+
+* **a bootstrap rather than a t-test**, because the default statistic is a
+  *median* — which a t-test has nothing to say about — and because the spread it
+  would be asked to assume is normal is one where a single reel holds 71% of all
+  the reach in the file. Resampling the numbers actually in the bucket assumes
+  neither, works for whatever `statistic` the table passes in, and costs a
+  thousand medians a row, which is milliseconds at these sizes;
+* **`separated` is a third state, not a stricter `readable`.** The report
+  already took care to tell "not enough reels yet" apart from "not ever" —
+  `readable` against `sides`, because only one of those is fixed by waiting.
+  This is the third: *enough reels, and the difference is smaller than they can
+  resolve.* That is a real result and a useful one, and it used to be printed in
+  the same shape as a finding;
+* **the summary line is the part that matters.** A table that prints deltas and
+  stops invites the largest one to be read as the answer, which is exactly
+  backwards when every interval covers nought: the biggest delta in a table that
+  has separated nothing is its *noisiest* row — it is the one with the least
+  evidence under it, which is how it got to be the biggest;
+* **rows are sorted by separation before magnitude**, for the same reason;
+* **a bucket of fewer than two readings gets no interval at all** rather than a
+  narrow one. One reading resamples to itself every time and would report a
+  width of exactly nought — the most confident row in the table, drawn from the
+  least evidence;
+* `PERFORMANCE_CONFIDENCE` (0.90) is the level, and it is deliberately the
+  looser of the two conventional choices. This gate exists to keep noise out of
+  the board, not to publish, and at one reel a day a 95% interval would refuse
+  everything for years. Raise it to 0.95 to be strict.
+
+**What this does not fix.** The intervals say whether *these* two buckets differ;
+they say nothing about why. `sfx off` separates cleanly on `KEPT OR BINNED`
+today, and the reason is that the reels with no sound effects are the early test
+runs that were binned for being test runs — a real difference between the
+buckets, and not a fact about sound effects. Nor does an interval buy power: at
+n=8 a side, most of what the pipeline would like to know stays invisible, and
+the honest reading of a table full of ranges covering zero is *this account has
+not produced enough evidence yet*, not *these choices do not matter*.
 
 ### What it changes
 

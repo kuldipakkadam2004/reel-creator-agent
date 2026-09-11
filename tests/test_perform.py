@@ -13,6 +13,7 @@ feedback stays switched off until there is something to feed back.
 from __future__ import annotations
 
 import json
+import statistics
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2455,3 +2456,131 @@ def test_a_run_with_no_assembly_at_all_still_reads(paths):
     assert features["look_problems"] == []
     assert features["cover_look_grade"] is None
 
+
+
+# ---------------------------------------------------------------------------
+# Is the delta bigger than the noise?
+# ---------------------------------------------------------------------------
+
+#: The nine posted reels' reach, on 2026-09-11. Every test below uses the real
+#: spread rather than an invented one: the whole question is whether a delta
+#: survives *this* distribution, and a tidier one would answer an easier
+#: question than the report actually faces.
+_REACH = [289.0, 64.0, 20.0, 14.0, 9.0, 6.0, 3.0, 3.0, 0.0]
+
+
+def _split(values_a: list[float], values_b: list[float]) -> tuple[list, callable]:
+    """Rows whose `topic source` splits the two lists of readings apart."""
+    rows, readings = [], {}
+    for index, value in enumerate(values_a + values_b):
+        run_id = f"r{index}"
+        source = "redditrss" if index < len(values_a) else "wikipedia"
+        rows.append({"features": _features(run_id, day=index, source=source)})
+        readings[run_id] = value
+    return rows, (lambda row: readings[row["features"]["run_id"]])
+
+
+def test_an_interval_needs_two_readings_a_side():
+    """A bucket of one resamples to itself and would report a width of zero."""
+    assert perform._interval([1.0], [2.0, 3.0], statistics.median,
+                             0.9, 1) == (None, None)
+    assert perform._interval([1.0, 2.0], [], statistics.median,
+                             0.9, 1) == (None, None)
+
+
+def test_a_delta_inside_its_own_noise_is_readable_but_not_separated():
+    """The defect this exists for.
+
+    Both sides are drawn from the reach figures actually in the ledger, so
+    there is no effect here to find. Eight-a-side makes the row `readable` -
+    it always did - and the delta it prints is the shape of the spread. The
+    row has to say so.
+    """
+    rows, score = _split(_REACH[:8], list(reversed(_REACH[1:])))
+
+    out = perform._segment(rows, score, {}, min_samples=8)
+    row = next(r for r in out if r["question"] == "topic source"
+               and r["answer"] == "redditrss")
+
+    assert row["readable"] is True, "eight a side; it was always printable"
+    assert row["separated"] is False
+    assert row["low"] < 0.0 < row["high"], "the range has to cover nought"
+
+
+def test_a_difference_that_is_really_there_separates():
+    rows, score = _split([9.0, 10.0, 11.0, 9.5, 10.5, 9.8, 10.2, 9.9],
+                         [1.0, 2.0, 1.5, 1.2, 1.8, 1.4, 1.6, 1.3])
+
+    row = next(r for r in perform._segment(rows, score, {}, min_samples=8)
+               if r["question"] == "topic source" and r["answer"] == "redditrss")
+
+    assert row["separated"] is True
+    assert row["low"] > 0.0
+
+
+def test_the_same_rows_resample_the_same_interval_twice():
+    """The report is cached against the ledger's mtime and quoted in commits."""
+    rows, score = _split(_REACH[:8], list(reversed(_REACH[1:])))
+
+    first = perform._segment(rows, score, {}, min_samples=8)
+    second = perform._segment(rows, score, {}, min_samples=8)
+
+    assert [(r["low"], r["high"]) for r in first] \
+        == [(r["low"], r["high"]) for r in second]
+
+
+def test_a_separated_row_outranks_a_merely_printable_one():
+    """Sorting on |delta| alone puts the noisiest row at the top of the table."""
+    rows, score = _split(_REACH[:8], list(reversed(_REACH[1:])))
+    out = [r for r in perform._segment(rows, score, {}, min_samples=8)
+           if r["readable"]]
+
+    assert out, "the fixture is meant to be readable"
+    assert [r["separated"] for r in out] == sorted(
+        (r["separated"] for r in out), reverse=True)
+
+
+def test_noise_is_not_fed_back_onto_the_board(paths):
+    """`adjustment_for` nudges step 0. Only a separated row may weigh on it."""
+    ledger = perform.PerformanceLedger()
+    for index, value in enumerate(_REACH[:8] + list(reversed(_REACH[1:]))):
+        run_id = f"r{index}"
+        components = ["niche match"] if index < 8 else ["explainer shape"]
+        ledger.register(_features(run_id, day=index,
+                                  topic_components=components))
+        ledger.record(run_id, {"watch_ratio": value})
+
+    effects = perform.measured_effects(ledger=ledger)
+
+    assert "niche match" not in effects, \
+        "eight a side of the ledger's own spread is not a measured effect"
+
+
+def test_a_table_that_separated_nothing_says_so(capsys):
+    rows, score = _split(_REACH[:8], list(reversed(_REACH[1:])))
+    out = perform._segment(rows, score, {}, min_samples=8)
+
+    perform._print_table("HOW THEY DID", out, unit="x", min_samples=8)
+
+    printed = capsys.readouterr().out
+    assert "none of the" in printed and "separated from nothing" in printed
+    assert "can only see a difference past about" in printed
+
+
+def test_a_table_that_separated_something_marks_it(capsys):
+    rows, score = _split([9.0, 10.0, 11.0, 9.5, 10.5, 9.8, 10.2, 9.9],
+                         [1.0, 2.0, 1.5, 1.2, 1.8, 1.4, 1.6, 1.3])
+    out = perform._segment(rows, score, {}, min_samples=8)
+
+    perform._print_table("HOW THEY DID", out, unit="x", min_samples=8)
+
+    printed = capsys.readouterr().out
+    assert "*" in printed
+    assert "row(s) separated from nothing" in printed
+
+
+def test_a_confidence_outside_the_range_does_not_index_backwards():
+    """1.5 makes the tail negative, and a negative index reads the other end."""
+    mine, rest = [1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]
+    low, high = perform._interval(mine, rest, statistics.median, 1.5, 1)
+    assert low <= high

@@ -1875,6 +1875,29 @@ PERFORMANCE_BASELINE_RUNS = get_env_int("PERFORMANCE_BASELINE_RUNS", 10)
 #: that happened to do well will otherwise print as a finding.
 PERFORMANCE_MIN_SAMPLES = get_env_int("PERFORMANCE_MIN_SAMPLES", 8)
 
+#: How sure a segment has to be before the report calls it a finding.
+#:
+#: `PERFORMANCE_MIN_SAMPLES` counts the reels on each side and nothing else,
+#: which is the wrong question asked well. Reach on the nine posted reels runs
+#: 289, 64, 20, 14, 9, 6, 3, 3, 0 - a coefficient of variation just over 2 - and
+#: drawing two arms of eight *from that same list* puts the difference of
+#: medians outside +/-5 in 55% of draws, with no effect present anywhere. So
+#: eight-a-side does not make a delta readable; it makes it printable, and the
+#: report had no way to tell the reader which one it was holding.
+#:
+#: Each row now carries a bootstrap interval on its own delta, and a row whose
+#: interval covers nought has not separated its two sides. The interval is
+#: resampled from the numbers in the bucket rather than taken from a t
+#: distribution, because the default statistic is a median and the spread is
+#: dominated by one reel in nine - neither of which a t-test is entitled to
+#: assume.
+#:
+#: 0.90 rather than the conventional 0.95 on purpose, and it is the looser of
+#: the two: this gate exists to keep noise out of `adjustment_for`, not to
+#: publish, and at one reel a day a 95% interval would refuse everything for
+#: years. Raise it to 0.95 to be strict; nothing here rounds it away.
+PERFORMANCE_CONFIDENCE = get_env_float("PERFORMANCE_CONFIDENCE", 0.90)
+
 #: Accounts a reel had to reach before its numbers are compared with anything.
 #:
 #: The other floors here are about how many *reels* a finding rests on. This is
@@ -2306,7 +2329,9 @@ def _report() -> None:
         ("RUN_LOGS", f"output/logs/, kept {RUN_LOG_KEEP_DAYS} days"
                      if RUN_LOG_KEEP_DAYS else "output/logs/, kept forever"),
         ("PERFORMANCE", f"on {PERFORMANCE_METRIC}, n>={PERFORMANCE_MIN_SAMPLES} "
-                        f"to read a segment"
+                        f"to read a segment and a "
+                        f"{PERFORMANCE_CONFIDENCE:.0%} range clear of zero "
+                        f"to call it a finding"
                         + (f", via {PERFORMANCE_PROVIDER}"
                            if PERFORMANCE_PROVIDER else ", recorded by hand")
                         + (f"  (feeding back, <= {PERFORMANCE_MAX_ADJUST:g} "

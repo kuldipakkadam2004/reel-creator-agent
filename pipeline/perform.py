@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import statistics
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -1321,6 +1322,53 @@ def build_vocabulary(rows: list[dict]) -> dict[str, list[str]]:
     return vocabulary
 
 
+#: Resamples behind each row's interval. A thousand is where the 5th and 95th
+#: percentiles of the resampled deltas stop moving in the third decimal, which
+#: is the only precision this prints.
+_RESAMPLES = 1000
+
+#: Fixed, and not a tuning knob. The report is cached against the ledger's
+#: modification time and its numbers get quoted in commit messages, so the same
+#: ledger has to produce the same interval twice. Which integer it is changes
+#: nothing about what the interval means.
+_RESAMPLE_SEED = 20260911
+
+
+def _interval(mine: list[float], rest: list[float], statistic,
+              confidence: float, seed: int) -> tuple[float | None, float | None]:
+    """A confidence interval on the delta `_segment` is about to print.
+
+    **Why a bootstrap and not a t-test.** `statistic` is the median by default,
+    and a t-test has nothing to say about a median. The spread it would be
+    asked to assume is normal is one where a single reel holds 76% of all the
+    reach in the file. Resampling the numbers actually in the bucket makes
+    neither assumption and works for whatever `statistic` is - including the
+    mean the rate tables pass in - at the cost of a thousand medians per row,
+    which is microseconds on buckets this size.
+
+    Returns `(None, None)` when either side has fewer than two readings, which
+    is not a weak interval but an absent one: a bucket of one resamples to
+    itself every time and would report a width of exactly nought - the most
+    confident row in the table, drawn from the least evidence.
+    """
+    if len(mine) < 2 or len(rest) < 2:
+        return (None, None)
+    rng = random.Random(seed)
+    pick, count_mine, count_rest = rng.choice, len(mine), len(rest)
+    deltas = sorted(
+        statistic([pick(mine) for _ in range(count_mine)])
+        - statistic([pick(rest) for _ in range(count_rest)])
+        for _ in range(_RESAMPLES)
+    )
+    # Clamped, because a confidence outside (0, 1) indexes the resamples from
+    # the wrong end: 1.5 makes `tail` negative, and a negative index quietly
+    # returns a percentile from the other tail rather than raising.
+    tail = (1.0 - min(max(confidence, 0.5), 0.999)) / 2.0
+    last = len(deltas) - 1
+    return (round(deltas[int(tail * last)], 3),
+            round(deltas[int((1.0 - tail) * last)], 3))
+
+
 def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
              min_samples: int, statistic=statistics.median,
              extra=None) -> list[dict]:
@@ -1352,6 +1400,9 @@ def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
         questions.setdefault(question, []).append(answer)
 
     out: list[dict] = []
+    # Counted rather than derived from the row, so the same ledger seeds the
+    # same resamples in the same order however the table is sorted afterwards.
+    index = 0
     for question, answers in questions.items():
         for answer in sorted(set(answers)):
             mine = buckets[(question, answer)]
@@ -1359,6 +1410,10 @@ def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
                     for value in buckets[(question, other)]]
             here = statistic(mine)
             there = statistic(rest) if rest else None
+            low, high = _interval(mine, rest, statistic,
+                                  config.PERFORMANCE_CONFIDENCE,
+                                  _RESAMPLE_SEED + index)
+            index += 1
             out.append({
                 "question": question,
                 "answer": answer,
@@ -1368,6 +1423,18 @@ def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
                 "delta": round(here - there, 3) if there is not None else None,
                 "readable": len(mine) >= min_samples and len(rest) >= min_samples,
                 "of": len(mine) + len(rest),
+                # The interval on `delta`, and whether it clears nought. These
+                # are the two that say what `readable` only implies: `readable`
+                # is a count of reels, and a count of reels is not evidence of
+                # anything on its own. A row that is readable and not separated
+                # is a real observation with a real answer - this many reels
+                # cannot see a difference this small - and it is a different
+                # answer from "not enough reels yet", which is what the table
+                # used to print in its place.
+                "low": low,
+                "high": high,
+                "separated": bool(low is not None and high is not None
+                                  and (low > 0.0 or high < 0.0)),
                 # How many answers this question has ever had here. One means
                 # every reel in this table answered it the same way, and the
                 # row is not a segment at all - there is nothing on the other
@@ -1377,7 +1444,7 @@ def _segment(rows: list[dict], score, vocabulary: dict[str, list[str]],
                 # one of those is fixed by waiting. See `one_sided`.
                 "sides": len(set(answers)),
             })
-    out.sort(key=lambda entry: (not entry["readable"],
+    out.sort(key=lambda entry: (not entry["readable"], not entry["separated"],
                                 -abs(entry["delta"] or 0.0), entry["question"]))
     return out
 
@@ -1885,9 +1952,20 @@ def measured_effects(*, ledger: PerformanceLedger | None = None) -> dict[str, di
     """Per topic component, how its reels did against the ones without it.
 
     {name: {"delta": how much better, "n": on how many reels}} - the n travels
-    with the number because it is what says whether to believe it, and a board
-    that printed the effect without it would be the one dishonest line on an
-    otherwise self-auditing page.
+    with the number because a board that printed the effect without it would be
+    the one dishonest line on an otherwise self-auditing page.
+
+    **The n is not what says whether to believe it, and this used to think it
+    was.** Only rows that are `readable` reach this dict, and `readable` counts
+    reels: eight on each side. Drawing two arms of eight from the nine reach
+    figures actually in the ledger - 289, 64, 20, 14, 9, 6, 3, 3, 0 - moves the
+    difference of medians past +/-5 in 55% of draws with no effect present, so
+    an eight-a-side delta arriving here was as likely to be the shape of the
+    spread as anything about the component. That delta is not printed and
+    forgotten: `adjustment_for` adds it to the score of every future candidate
+    carrying the component, which is the ledger teaching step 0 its own noise.
+    A row now has to be `separated` as well - its bootstrap interval clear of
+    nought - before it is allowed to weigh on a board.
 
     Cached against the ledger's modification time: this is read once per
     candidate on every board, and re-medianing the history a dozen times to
@@ -1906,7 +1984,7 @@ def measured_effects(*, ledger: PerformanceLedger | None = None) -> dict[str, di
         entry["question"].split(": ", 1)[1]: {"delta": entry["delta"],
                                               "n": entry["n"]}
         for entry in data["performance"]
-        if entry["readable"] and entry["answer"] == "fired"
+        if entry["readable"] and entry["separated"] and entry["answer"] == "fired"
         and entry["question"].startswith("topic: ") and entry["delta"] is not None
     }
     if ledger is None:
@@ -2428,6 +2506,40 @@ def _print_relabel(ledger: PerformanceLedger, limit: int = 20) -> None:
     print("  python pipeline/perform.py --reasons     what each one means")
 
 
+def _print_separation(readable: list[dict]) -> None:
+    """What the rows above did and did not establish.
+
+    A table that prints deltas and stops invites the largest one to be read as
+    the finding, and that is exactly backwards when every interval in the
+    column covers nought: the biggest delta in a table that has separated
+    nothing is its noisiest row, not its most interesting one. It is the row
+    with the least evidence under it, which is how it got to be the biggest.
+
+    So the table says which of the two it is holding. "None of these separated"
+    is a real result and a useful one - it is the report declining to hand over
+    a finding it cannot support, in a project whose every other number is
+    printed with the parts it was built from.
+    """
+    separated = [row for row in readable if row["separated"]]
+    if separated:
+        print(f"  * {len(separated)} of {len(readable)} row(s) separated from "
+              f"nothing - the range clears zero. The rest sit inside it.")
+        return
+    widths = [(row["high"] - row["low"]) / 2.0 for row in readable
+              if row["low"] is not None]
+    if not widths:
+        print("  no row here has two readings a side to resample; the deltas "
+              "above are differences, not findings.")
+        return
+    biggest = max((abs(row["delta"]) for row in readable
+                   if row["delta"] is not None), default=0.0)
+    print(f"  none of the {len(readable)} readable row(s) separated from "
+          f"nothing: every range above covers zero.")
+    print(f"  at this many reels the table can only see a difference past "
+          f"about {statistics.median(widths):.2f}, and the largest here is "
+          f"{biggest:.2f}.")
+
+
 def _print_table(title: str, rows: list[dict], *, unit: str,
                  min_samples: int, limit: int = 12) -> None:
     print(RULE)
@@ -2456,12 +2568,18 @@ def _print_table(title: str, rows: list[dict], *, unit: str,
             print("    " + ", ".join(flat[:6])
                   + (", ..." if len(flat) > 6 else ""))
         return
-    print(f"  {'question':<26} {'answer':<12} {'n':>3}  {'median':>8}  vs rest")
+    label = f"{config.PERFORMANCE_CONFIDENCE:.0%} range"
+    print(f"  {'question':<26} {'answer':<12} {'n':>3}  {'median':>8}  "
+          f"{'vs rest':>8}  {label}")
     for row in readable[:limit]:
         delta = row["delta"]
+        shown = f"{delta:+g}" if delta is not None else "-"
+        span = ("-" if row["low"] is None
+                else f"{row['low']:+g} .. {row['high']:+g}")
         print(f"  {row['question'][:26]:<26} {row['answer'][:12]:<12} "
-              f"{row['n']:>3}  {row['median']:>7}{unit}  "
-              + (f"{delta:+g}" if delta is not None else "-"))
+              f"{row['n']:>3}  {row['median']:>7}{unit}  {shown:>8}  {span}"
+              + ("  *" if row["separated"] else ""))
+    _print_separation(readable)
 
 
 def _charged(components: list, width: int = 65) -> str:
