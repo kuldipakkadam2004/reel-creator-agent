@@ -72,6 +72,17 @@ TIMEOUT = (5, 30)
 #: Asked for as a set and pruned on refusal - see `_insights`. `views` is the
 #: current name for what used to be `plays`; both are listed because which one
 #: a given API version answers to is not knowable from here.
+#:
+#: `follows` and `profile_visits` are the outcome the rest of this file was
+#: only ever measuring the run-up to. Every other metric here is attention -
+#: how many were shown it, how long they stayed, whether they tapped. For an
+#: account at zero followers the only number that compounds is whether a
+#: viewer went and followed, and until 2026-09-10 nothing asked for it:
+#: `perform.METRICS` carried a `follows` column and `--follows` parsed, but no
+#: fetch ever filled either, so the column had been empty on every reel ever
+#: made. Asking is free by construction - `_insights` reads a refusal for
+#: which name offended and drops it - so whether this API version serves the
+#: two at media level is answered by running it, and costs a warning if not.
 METRIC_MAP = {
     "views": "views",
     "plays": "views",
@@ -81,6 +92,8 @@ METRIC_MAP = {
     "saved": "saves",
     "shares": "shares",
     "ig_reels_avg_watch_time": "avg_watch_seconds",
+    "follows": "follows",
+    "profile_visits": "profile_visits",
 }
 
 #: The ones worth a second attempt on their own if the batch was refused.
@@ -341,6 +354,20 @@ def _insights(session, media_id: str) -> tuple[dict, list[str]]:
             values = entry.get("values") or []
             value = values[0].get("value") if values and isinstance(values[0], dict) else None
             if name in METRIC_MAP and value is not None:
+                # Some metrics answer with a breakdown rather than a count -
+                # `profile_activity` returns {action_type: n} - and a dict
+                # written into the ledger is a number every reader downstream
+                # would try to divide by. Only scalars are stored, and a
+                # breakdown is skipped rather than flattened, because which
+                # part of it was meant is not knowable from here. Checked
+                # here rather than at the call site so it holds for whatever
+                # is added to METRIC_MAP next.
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    warnings.append(
+                        f"{media_id}: {name} answered with a "
+                        f"{type(value).__name__} rather than a count - not stored"
+                    )
+                    continue
                 # `views` and `plays` both land on views; whichever the version
                 # answered with is the one that counts, and the larger of two
                 # answers is never the right tie-break, so first wins.

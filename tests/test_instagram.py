@@ -227,6 +227,47 @@ def test_a_refusal_listing_what_is_valid_is_read_the_right_way_round(credentials
     assert len(session.asked) == 2
 
 
+def test_follows_and_profile_visits_are_asked_for(credentials):
+    """The outcome column. It was in the ledger and nothing ever fetched it."""
+    session = FakeSession({"/insights": {"data": [
+        _insight("reach", 289), _insight("follows", 2),
+        _insight("profile_visits", 11)]}})
+
+    metrics, _ = instagram._insights(session, "1791")
+
+    assert metrics == {"reach": 289, "follows": 2, "profile_visits": 11}
+    asked = session.asked[0][1]["metric"]
+    assert "follows" in asked and "profile_visits" in asked
+
+
+def test_an_api_version_without_follows_still_answers_for_the_rest(credentials):
+    """Asking is free: a refusal costs a warning, not the fetch."""
+    session = FakeSession({"/insights": [
+        {"error": {"message":
+                   "metric[1] must be one of the following values: "
+                   "reach, likes, comments, saved, shares, views",
+                   "code": 100}},
+        {"data": [_insight("reach", 289), _insight("saved", 0)]},
+    ]})
+
+    metrics, warnings = instagram._insights(session, "1791")
+
+    assert metrics == {"reach": 289, "saves": 0}
+    assert any("follows" in warning for warning in warnings)
+
+
+def test_a_metric_answering_with_a_breakdown_is_not_stored_as_one(credentials):
+    """A dict written into the ledger is a number every reader would divide by."""
+    session = FakeSession({"/insights": {"data": [
+        _insight("reach", 289),
+        _insight("follows", {"profile": 2, "reel": 1})]}})
+
+    metrics, warnings = instagram._insights(session, "1791")
+
+    assert metrics == {"reach": 289}
+    assert any("rather than a count" in warning for warning in warnings)
+
+
 def test_plays_and_views_both_land_on_views(credentials):
     session = FakeSession({"/insights": {"data": [_insight("plays", 4200)]}})
 

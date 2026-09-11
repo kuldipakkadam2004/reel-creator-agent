@@ -111,7 +111,7 @@ STATUSES = ("pending", "posted", "skipped")
 #: is seconds.
 METRICS = ("views", "reach", "watch_through", "watch_ratio",
            "avg_watch_seconds", "likes", "comments", "saves", "shares",
-           "follows")
+           "follows", "profile_visits")
 
 #: Metrics that are rates rather than counts, and are read as percentages when
 #: what was typed is bigger than 1. `watch_ratio` is deliberately not one of
@@ -983,6 +983,149 @@ def was_kept(entry: dict) -> float | None:
     return 1.0 if total > 0 else 0.0
 
 
+#: The two metrics that are about the account rather than the reel. A profile
+#: visit is a viewer who stopped watching and went looking for who made it; a
+#: follow is that same viewer deciding to come back. Everything else in
+#: `METRICS` is attention paid to one reel and spent there.
+_FOLLOW_METRICS = ("follows", "profile_visits")
+
+
+def won_a_follow(entry: dict) -> float | None:
+    """Whether one reel turned a viewer into a follower. 1.0, 0.0, unmeasured.
+
+    A yes/no for the same reason `was_kept` is one, and the reasoning is worth
+    repeating because this column is even sparser: `ratios` divides a reel by
+    the median of its neighbours and `local_baseline` refuses a median of
+    zero, so a metric that is zero on most reels never produces a baseline and
+    therefore never produces a reading - silently, and for as long as the
+    account stays small. A rate - "how often did a reel in this bucket win a
+    follow at all" - is defined at zero and moves the first time one does.
+
+    `follows` alone would be the truer question, but it is the rarer event by
+    some margin, and a profile visit is the same intent one step short of it.
+    Either counts, and the report says so in the table's own heading rather
+    than leaving the reader to assume it means follows.
+
+    Returns None when neither has ever been read, which is every reel made
+    before 2026-09-10: the ledger held the column and no fetch filled it. That
+    is unmeasured, not zero, and the difference is the whole reason the table
+    can be trusted once it starts printing numbers.
+    """
+    metrics = entry.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    seen = [metrics.get(name) for name in _FOLLOW_METRICS]
+    if all(value is None for value in seen):
+        return None
+    total = 0.0
+    for value in seen:
+        try:
+            total += float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+    return 1.0 if total > 0 else 0.0
+
+
+#: The share of all reach one reel has to hold before the word "average"
+#: stops describing anything here. Not a tuned threshold and not a prior: at
+#: more than half, the single best reel outweighs every other reel put
+#: together, so the mean necessarily sits above all but one of the numbers it
+#: was drawn from. Below that it is a spread; above it, it is one event and
+#: some noise.
+_NO_MIDDLE_SHARE = 0.5
+
+
+def reach_exhibit(rows: list[dict], limit: int = 12) -> dict:
+    """Every posted reel against the raw reach it got, ranked, with no floors.
+
+    The four tables around this one all ask the same shape of question - does
+    answering something one way beat answering it the other - and none of them
+    can print until `PERFORMANCE_MIN_SAMPLES` reels have landed on each side.
+    Reach does not need them to. It has a reading on every posted reel, it
+    spans nought to several hundred, and the one thing worth knowing about it
+    - that nearly all of it arrived on one reel - is exactly what the first
+    median anyone takes destroys.
+
+    So this is deliberately **not** run through `_segment`, and the three
+    filters that guard the tables are all off on purpose:
+
+      * **no freshness window.** The window exists so a ratio compares reels
+        of a like age. Nothing here is a ratio. A reel read at 167h did have
+        longer to accumulate, which is why `hours` is carried on every row and
+        printed beside it rather than used to drop it: at a spread of forty to
+        one, read-age is not what separates the top of this list from the
+        bottom, and filtering on it would cost most of the observations there
+        are to explain a difference it cannot account for.
+      * **no reach floor.** `PERFORMANCE_MIN_REACH` keeps a reel out of the
+        *ratio* tables because a denominator of three measures whoever opened
+        the app. As an observation *of* reach, three is not a weak reading -
+        it is the reading, and it is the one the account keeps getting.
+      * **no sample floor.** Nothing here is read as an effect, so there is no
+        n at which it turns trustworthy. It is the list of what happened, and
+        it is labelled an exhibit where it prints so that it is never quoted
+        as a finding about any component on it.
+
+    `concentration` is the number this exists to print: the share of all reach
+    that the single best reel holds. When one reel carries most of it, every
+    mean in this report is describing a distribution with no middle, and "an
+    ordinary reel for this account" is not a thing that exists.
+
+    `by_score` re-sorts the same rows by what the board scored them, so the two
+    orderings can be read against each other. That comparison is left to the
+    reader on purpose - printing a correlation over eight rows, one of which is
+    four fifths of the total, would be inventing the finding this is here to
+    avoid inventing.
+
+    A reel with no reach reading is counted in `unread` and never listed as a
+    zero: never asked is not nobody saw it, the same distinction `won_a_follow`
+    makes one stage further down the funnel.
+    """
+    listed: list[dict] = []
+    unread = 0
+    for row in rows:
+        if row.get("status") != "posted":
+            continue
+        reach = (row.get("metrics") or {}).get("reach")
+        try:
+            reach = float(reach) if reach is not None else None
+        except (TypeError, ValueError):
+            reach = None
+        if reach is None:
+            unread += 1
+            continue
+        features = row.get("features") or {}
+        components = features.get("topic_components")
+        if isinstance(components, dict):
+            components = component_names(components)
+        listed.append({
+            "run_id": row.get("run_id") or "",
+            "topic": features.get("topic") or "",
+            "source": features.get("topic_source") or "",
+            "reach": int(reach),
+            "score": features.get("topic_score"),
+            "components": [str(name) for name in components]
+                          if isinstance(components, list) else [],
+            "hours": row.get("hours_after_post"),
+        })
+
+    listed.sort(key=lambda entry: -entry["reach"])
+    total = sum(entry["reach"] for entry in listed)
+    for entry in listed:
+        entry["share"] = round(entry["reach"] / total, 3) if total else None
+
+    scored = [entry for entry in listed if entry.get("score") is not None]
+    scored.sort(key=lambda entry: -float(entry["score"]))
+
+    return {
+        "rows": listed[:limit],
+        "by_score": scored[:2],
+        "of": len(listed),
+        "total": total,
+        "unread": unread,
+        "concentration": listed[0]["share"] if listed and total else None,
+    }
+
+
 def local_baseline(values: list[float], index: int, span: int) -> float | None:
     """Median of an equal number of reels either side of this one.
 
@@ -1371,7 +1514,8 @@ def real_engagement(rows: list[dict], own: int | None = None) -> dict:
     """
     own = config.PERFORMANCE_OWN_ACCOUNTS if own is None else own
     out = {"reach": 0, "likes": 0, "comments": 0, "saves": 0,
-           "shares": 0, "reels": 0, "unseen": 0}
+           "shares": 0, "follows": 0, "profile_visits": 0,
+           "reels": 0, "unseen": 0, "follow_reels": 0}
     for row in rows:
         if row.get("status") != "posted":
             continue
@@ -1388,6 +1532,15 @@ def real_engagement(rows: list[dict], own: int | None = None) -> dict:
         out["likes"] += int(net.get("likes") or 0)
         for name in ("comments", "saves", "shares"):
             out[name] += int(metrics.get(name) or 0)
+        # Not netted against the operator's own accounts, unlike likes. Those
+        # three alts already follow and cannot follow again, so there is no
+        # per-reel floor to take out here - a follow counted against a reel is
+        # a follow that reel won. Counted separately from `reels` because a
+        # reel nothing ever asked for these on is not a reel that won none.
+        if any(metrics.get(name) is not None for name in _FOLLOW_METRICS):
+            out["follow_reels"] += 1
+            for name in _FOLLOW_METRICS:
+                out[name] += int(metrics.get(name) or 0)
     return out
 
 
@@ -1521,6 +1674,14 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
         extra=_when_posted,
     )
 
+    # The last stage of the funnel, and the only one that compounds. Read on
+    # the same window as the two above it for the same reason: a reel read at
+    # 96h has had three more days to win a follow than one read at 29h.
+    followed = _segment(
+        fresh, won_a_follow, vocabulary, floor, statistic=statistics.fmean,
+        extra=_when_posted,
+    )
+
     if not posted:
         warnings.append(
             "no reel has numbers against it yet - "
@@ -1557,6 +1718,26 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
             f"column of zeros - that is the account's state, not a finding "
             f"about anything in the table. It starts saying something the "
             f"first time one is"
+        )
+
+    # Three states, not two, and they mean different things. Never read at all
+    # is the one worth shouting about, because it looks exactly like nobody
+    # following and is instead nobody asking.
+    read_follow = [row for row in fresh if won_a_follow(row) is not None]
+    if fresh and not read_follow:
+        warnings.append(
+            f"no reel has a follows or profile_visits reading on it, so "
+            f"FOLLOWED AFTER is empty - that is a metric nothing fetched, not "
+            f"an account nobody followed. python pipeline/instagram.py --fetch "
+            f"asks for both now; if it warns that this API version does not "
+            f"report them, they are account-level only on your token"
+        )
+    elif read_follow and not [row for row in read_follow
+                              if (won_a_follow(row) or 0.0) > 0]:
+        warnings.append(
+            f"{len(read_follow)} reel(s) have been read for follows and none "
+            f"won one, so FOLLOWED AFTER is a column of zeros - that is the "
+            f"account's state and not a finding about the table"
         )
 
     stale = [row for row in rows if row.get("skip_code") == UNLABELLED_SKIP]
@@ -1599,6 +1780,7 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
         "min_reach": reach_floor,
         "unseen": len(unseen),
         "reached": reached,
+        "reach_exhibit": reach_exhibit(rows),
         "reach_median": (round(statistics.median(
             [float((row.get("metrics") or {}).get("reach") or 0.0)
              for row in seen_by]), 1) if seen_by else None),
@@ -1618,6 +1800,7 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
         "reasons": reasons,
         "performance": performance,
         "saved": saved,
+        "followed": followed,
         "ever_saved": len(ever_kept),
         "ratios": scores,
         "warnings": warnings,
@@ -2045,6 +2228,98 @@ def _print_table(title: str, rows: list[dict], *, unit: str,
               + (f"{delta:+g}" if delta is not None else "-"))
 
 
+def _charged(components: list, width: int = 65) -> str:
+    """The component names that fit, cut at a comma and never mid-word.
+
+    A name sliced in half - "curiosity (contradic" - reads as a component
+    nobody recognises rather than as a line that ran out of room, and this
+    column exists to be recognised.
+    """
+    if not components:
+        return "nothing recorded"
+    out = ""
+    last = len(components) - 1
+    for index, name in enumerate(components):
+        nxt = f"{out}, {name}" if out else str(name)
+        # Every name but the last has to leave room for the ", ..." that says
+        # it was not the last, or the column overruns the width it declared and
+        # the rule this report is drawn to.
+        if len(nxt) > (width if index == last else width - 5):
+            return f"{out}, ..." if out else str(name)[:width]
+        out = nxt
+    return out
+
+
+def _print_reach_exhibit(exhibit: dict) -> None:
+    """The reach distribution itself, printed because no table can hold it.
+
+    Every other block in this report is a comparison and says so. This one is
+    the observations, in the order they happened to land, and the heading says
+    *that* - "an exhibit, not a finding" - because a list of components beside
+    a list of big numbers is read as a claim about the components unless it is
+    told not to be.
+    """
+    print(RULE)
+    print("WHAT REACH ACTUALLY LOOKED LIKE  (every posted reel, no floors)")
+    print("  an exhibit and not a finding - nothing here is read as an effect")
+    listed = exhibit.get("rows") or []
+    unread = exhibit.get("unread") or 0
+    if not listed:
+        print("  no posted reel has a reach reading on it yet"
+              + (f" - {unread} waiting on python pipeline/instagram.py --fetch"
+                 if unread else "."))
+        return
+
+    # The components go on their own line under each reel rather than in a
+    # column, the way `_print_reasons` prints its notes: four component names
+    # do not fit beside a topic inside the rule this report is drawn to, and
+    # truncating them mid-word is how "curiosity" became "curi".
+    print(f"  {'reach':>6} {'share':>5} {'score':>5} {'read':>5}  topic")
+    for row in listed:
+        share = f"{row['share']:.0%}" if row.get("share") is not None else "-"
+        score = (f"{float(row['score']):.2f}"
+                 if row.get("score") is not None else "-")
+        hours = (f"{float(row['hours']):.0f}h"
+                 if row.get("hours") is not None else "-")
+        print(f"  {row['reach']:>6} {share:>5} {score:>5} {hours:>5}  "
+              f"{(row.get('topic') or row['run_id'])[:44]}")
+        # Indented like the notes under WHY THEY WERE BINNED rather than
+        # aligned under the topic column: alignment cost thirteen characters
+        # and thirteen characters was the difference between showing which
+        # curiosity signal fired and showing "explainer shape, ...".
+        print(f"             {_charged(row.get('components') or [])}")
+
+    total = exhibit.get("total") or 0
+    of = exhibit.get("of") or 0
+    concentration = exhibit.get("concentration")
+    if concentration is not None and of > 1:
+        print(f"  the best reel holds {concentration:.0%} of all {total} "
+              f"impression(s) across {of} reel(s)")
+        if concentration > _NO_MIDDLE_SHARE:
+            # Arithmetic, not a judgement: one reel outweighing all the others
+            # put together drags the mean above every observation but itself.
+            print(f"  that is more than all the others together: the mean "
+                  f"sits above {of - 1} of the {of},")
+            print(f"  so there is no ordinary reel here for the tables to "
+                  f"describe")
+
+    # The two orderings side by side, and nothing inferred from the pair. If
+    # the board's favourites are also the ones that reached people, these two
+    # lines agree and cost a glance; if they do not, that is the cheapest
+    # possible look at a weight nothing in this report can otherwise read.
+    by_score = exhibit.get("by_score") or []
+    if by_score and of > 1:
+        print("  ranked by the board's own score instead, the top "
+              f"{len(by_score)} were:")
+        for row in by_score:
+            print(f"    {float(row['score']):.2f}  "
+                  f"{(row.get('topic') or row['run_id'])[:44]:<44} "
+                  f"reached {row['reach']}")
+    if unread:
+        print(f"  {unread} posted reel(s) have no reach reading and are not "
+              f"listed - never asked is not nobody saw it")
+
+
 def _print_reasons(rows: list[dict]) -> None:
     """Why the binned reels were binned. The column that arrives first."""
     print(RULE)
@@ -2129,6 +2404,25 @@ def _print_audience(audience: dict, reach_median, own: int = 0,
         # were actually shown a reel, how many did anything about it.
         line += f" - {(real.get('likes') or 0) / seen:.2%} of them liked it"
     print(line)
+
+    # The line the report did not have. Said separately from ACTED because it
+    # is a different question - that line is what viewers did about a reel,
+    # this is what they did about the account - and because it has a third
+    # state those metrics do not: never asked for. A zero here and a blank
+    # here lead to opposite decisions.
+    if not real.get("follow_reels"):
+        print("FOLLOWED: not read on any reel - "
+              "python pipeline/instagram.py --fetch now asks for follows and "
+              "profile_visits; this stays blank if your token serves them "
+              "only account-wide")
+    else:
+        follows = real.get("follows") or 0
+        visits = real.get("profile_visits") or 0
+        line = (f"FOLLOWED: {follows} follow(s) and {visits} profile visit(s) "
+                f"across {real['follow_reels']} reel(s) read for them")
+        if seen > 0:
+            line += f" - {follows / seen:.2%} of those shown a reel followed"
+        print(line)
     print(f"          {own} own account(s) are taken out first "
           f"(PERFORMANCE_OWN_ACCOUNTS); a reel that did not clear that "
           f"reached nobody, so nothing it carries is counted")
@@ -2160,10 +2454,22 @@ def _print_report(data: dict) -> None:
         + (f"; median {data['reach_median']:g} accounts)"
            if data.get("reach_median") is not None else ")"),
         data.get("reached") or [], unit="x", min_samples=data["min_samples"])
+    # Directly under the table that asks the same question and cannot answer
+    # it. When HOW MANY SAW IT prints "nothing has reached n reels on both
+    # sides", this is what it was unable to say anything about, and leaving a
+    # reader to go and read the ledger for it is how the account's actual
+    # shape stayed unprinted for eight reels.
+    _print_reach_exhibit(data.get("reach_exhibit") or {})
     _print_table(f"HOW THEY DID  (1.00 = an ordinary reel for this account)",
                  data["performance"], unit="x", min_samples=data["min_samples"])
     _print_table("SAVED OR SENT  (1.00 = every reel got a save or a share)",
                  data["saved"], unit="", min_samples=data["min_samples"])
+    # Printed last because it is the last thing that happens, and the only
+    # outcome here that survives the reel. Everything above it is attention
+    # paid once; a follower is attention that comes back.
+    _print_table(
+        "FOLLOWED AFTER  (1.00 = every reel won a follow or a profile visit)",
+        data.get("followed") or [], unit="", min_samples=data["min_samples"])
 
     print(RULE)
     if data["warnings"]:
@@ -2252,6 +2558,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--saves", type=float, default=None)
     parser.add_argument("--shares", type=float, default=None)
     parser.add_argument("--follows", type=float, default=None)
+    parser.add_argument("--profile-visits", type=float, default=None,
+                        dest="profile_visits",
+                        help="viewers who opened the profile from this reel")
     parser.add_argument("--posted", default="", metavar="WHEN",
                         help="when it went out (YYYY-MM-DD). Without it the "
                              "age of the measurement is taken from when the "

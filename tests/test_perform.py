@@ -1271,6 +1271,73 @@ def test_was_kept_tells_a_zero_from_never_measured():
     assert perform.was_kept({}) is None
 
 
+# ---------------------------------------------------------------------------
+# Followed after - the one outcome that survives the reel
+# ---------------------------------------------------------------------------
+
+def test_won_a_follow_is_a_yes_no_not_a_count():
+    assert perform.won_a_follow({"metrics": {"follows": 2, "profile_visits": 0}}) == 1.0
+    assert perform.won_a_follow({"metrics": {"follows": 0, "profile_visits": 7}}) == 1.0
+    assert perform.won_a_follow({"metrics": {"follows": 0, "profile_visits": 0}}) == 0.0
+
+
+def test_won_a_follow_tells_a_zero_from_never_fetched():
+    """The distinction the whole fix turns on.
+
+    Every reel made before 2026-09-10 has no follows column, because the
+    ledger held one and no fetch ever filled it. That is unmeasured. Reading
+    it as 0 would print "nobody followed" over a question nothing had asked.
+    """
+    assert perform.won_a_follow({"metrics": {"follows": 0}}) == 0.0
+    assert perform.won_a_follow({"metrics": {"views": 400, "reach": 289}}) is None
+    assert perform.won_a_follow({}) is None
+
+
+def test_the_report_says_when_follows_were_never_read(paths):
+    """A blank column and an empty one lead to opposite decisions."""
+    ledger = perform.PerformanceLedger()
+    for day in range(6):
+        ledger.register(_features(f"r{day}", day=day))
+        ledger.record(f"r{day}", {"reach": 200, "watch_through": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=3)
+
+    assert "followed" in data
+    assert any("nothing fetched" in warning for warning in data["warnings"])
+
+
+def test_a_follows_column_of_zeros_is_not_the_same_warning(paths):
+    """Read and zero is the account's state; never read is a missing fetch."""
+    ledger = perform.PerformanceLedger()
+    for day in range(6):
+        ledger.register(_features(f"r{day}", day=day))
+        ledger.record(f"r{day}", {"reach": 200, "watch_through": 0.5,
+                                  "follows": 0, "profile_visits": 0})
+
+    data = perform.report(ledger=ledger, min_samples=3)
+
+    assert not any("nothing fetched" in warning for warning in data["warnings"])
+    assert any("column of zeros" in warning and "FOLLOWED AFTER" in warning
+               for warning in data["warnings"])
+
+
+def test_real_engagement_counts_follows_separately_from_reels(paths):
+    """A reel nothing asked for follows on is not a reel that won none."""
+    rows = [
+        {"status": "posted", "metrics": {"reach": 289, "likes": 4}},
+        {"status": "posted",
+         "metrics": {"reach": 300, "likes": 3, "follows": 2,
+                     "profile_visits": 11}},
+    ]
+
+    out = perform.real_engagement(rows, own=3)
+
+    assert out["reels"] == 2
+    assert out["follow_reels"] == 1
+    assert out["follows"] == 2
+    assert out["profile_visits"] == 11
+
+
 def test_a_metric_that_is_zero_everywhere_can_never_be_read_as_a_ratio(paths):
     """Why PERFORMANCE_METRIC was not simply switched to `saves`.
 
@@ -1797,6 +1864,132 @@ def test_the_report_says_what_an_ordinary_reach_is(paths):
     data = perform.report(ledger=ledger, min_samples=1)
 
     assert data["reach_median"] == 35.0
+
+
+# ---------------------------------------------------------------------------
+# The reach exhibit
+# ---------------------------------------------------------------------------
+
+def test_the_exhibit_lists_reels_no_table_is_allowed_to_compare(paths):
+    """Every floor that guards the ratio tables is off here, deliberately.
+
+    A sample floor of 99 and a reach floor of 30 between them empty every
+    other block in the report. This one is not a comparison, so neither
+    applies: it is the list of what happened.
+    """
+    ledger = _corpus(3)
+    ledger.record("r0", {"watch_ratio": 0.5, "reach": 2})
+    ledger.record("r1", {"watch_ratio": 0.5, "reach": 289})
+    ledger.record("r2", {"watch_ratio": 0.5, "reach": 9})
+
+    data = perform.report(ledger=ledger, min_samples=99, min_reach=30)
+
+    assert not [row for row in data["reached"] if row["readable"]]
+    assert [row["reach"] for row in data["reach_exhibit"]["rows"]] == [289, 9, 2]
+    assert data["reach_exhibit"]["of"] == 3
+
+
+def test_the_exhibit_keeps_a_reel_the_freshness_window_threw_out(paths):
+    """A week-late reading is a bad ratio and a perfectly good reach.
+
+    The window exists so ratios compare reels of a like age. Nothing in the
+    exhibit is a ratio, and dropping the oldest readings would cost most of
+    the observations there are.
+    """
+    old = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(
+        timespec="seconds")
+    ledger = _corpus(2)
+    ledger.record("r0", {"watch_ratio": 0.5, "reach": 64}, posted_at=old)
+    ledger.record("r1", {"watch_ratio": 0.5, "reach": 6})
+
+    data = perform.report(ledger=ledger, min_samples=1)
+
+    assert [row["reach"] for row in data["reach_exhibit"]["rows"]] == [64, 6]
+    assert any("after posting" in warning for warning in data["warnings"]),         "and it is still out of the tables"
+
+
+def test_one_reel_carrying_most_of_the_reach_is_said_out_loud(paths):
+    ledger = _corpus(4)
+    for day, reach in enumerate((289, 9, 6, 3)):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": reach})
+
+    exhibit = perform.report(ledger=ledger, min_samples=1)["reach_exhibit"]
+
+    assert exhibit["total"] == 307
+    assert exhibit["concentration"] == round(289 / 307, 3)
+    assert exhibit["concentration"] > perform._NO_MIDDLE_SHARE
+
+
+def test_an_even_spread_is_not_called_out_as_one_reel(paths):
+    """The sentence is arithmetic, so it has to stop being true."""
+    ledger = _corpus(4)
+    for day in range(4):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": 50})
+
+    exhibit = perform.report(ledger=ledger, min_samples=1)["reach_exhibit"]
+
+    assert exhibit["concentration"] == 0.25
+    assert exhibit["concentration"] < perform._NO_MIDDLE_SHARE
+
+
+def test_a_reel_nobody_asked_about_is_unread_and_not_a_zero(paths):
+    """Never asked is not nobody saw it - the call `won_a_follow` makes too."""
+    ledger = _corpus(3)
+    ledger.record("r0", {"watch_ratio": 0.5, "reach": 40})
+    ledger.record("r1", {"watch_ratio": 0.5})
+
+    exhibit = perform.report(ledger=ledger, min_samples=1)["reach_exhibit"]
+
+    assert exhibit["unread"] == 1
+    assert [row["reach"] for row in exhibit["rows"]] == [40]
+
+
+def test_the_board_ordering_is_printed_beside_the_reach_ordering(paths):
+    """Both orderings, and nothing inferred from the pair."""
+    ledger = perform.PerformanceLedger()
+    for day, (score, reach) in enumerate(((2.72, 289), (1.9, 6), (1.3, 64))):
+        features = _features(f"r{day}", day=day)
+        features["topic_score"] = score
+        ledger.register(features)
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": reach})
+
+    exhibit = perform.report(ledger=ledger, min_samples=1)["reach_exhibit"]
+
+    assert [row["reach"] for row in exhibit["rows"]] == [289, 64, 6]
+    assert [row["score"] for row in exhibit["by_score"]] == [2.72, 1.9]
+    assert exhibit["by_score"][1]["reach"] == 6,         "the board's second favourite was the worst reel in the file"
+
+
+def test_a_component_name_is_never_cut_in_half(paths):
+    """'curiosity (contradic' reads as a component nobody recognises."""
+    assert perform._charged(
+        ["niche match", "curiosity (contradiction)"], width=20
+    ) == "niche match, ..."
+    assert perform._charged([]) == "nothing recorded"
+    assert perform._charged(["averyverylongcomponentname"], width=10)         == "averyveryl", "one name too long to fit is all there is to print"
+
+
+def test_the_exhibit_says_out_loud_that_it_is_not_a_finding(paths, capsys):
+    ledger = _corpus(2)
+    ledger.record("r0", {"watch_ratio": 0.5, "reach": 289})
+    ledger.record("r1", {"watch_ratio": 0.5, "reach": 3})
+
+    perform._print_report(perform.report(ledger=ledger, min_samples=1))
+    out = capsys.readouterr().out
+
+    assert "WHAT REACH ACTUALLY LOOKED LIKE" in out
+    assert "not a finding" in out
+    assert "no ordinary reel" in out
+
+
+def test_nothing_posted_prints_the_exhibit_without_inventing_a_row(paths):
+    ledger = _corpus(3)
+
+    exhibit = perform.report(ledger=ledger, min_samples=1)["reach_exhibit"]
+
+    assert exhibit["rows"] == []
+    assert exhibit["concentration"] is None
+    assert exhibit["total"] == 0
 
 
 def test_a_batch_relabel_does_not_print_its_sentence_three_times(paths):

@@ -1789,10 +1789,22 @@ says so about itself rather than reading as "nothing fired".
   ```
   AUDIENCE: 2 follower(s) on @groundtruth.earth, 8 post(s) - your own
             accounts, so the audience here is nobody
-  REACHED : 356 impression(s) that were not yours, across 8 posted
-            reel(s); 4 of them reached nobody at all
+  REACHED : 360 impression(s) that were not yours, across 8 posted
+            reel(s); 3 of them reached nobody at all
   ACTED   : 1 like, 0 comments, 0 saves, 0 shares - 0.28% of them liked it
+  FOLLOWED: not read on any reel - python pipeline/instagram.py --fetch now
+            asks for follows and profile_visits; this stays blank if your
+            token serves them only account-wide
   ```
+
+  `FOLLOWED` is said on its own line rather than folded into `ACTED`, because
+  it answers a different question â€” that line is what viewers did about a
+  *reel*, this is what they did about the *account* â€” and because it has a
+  third state the others do not: **never asked for**. A zero and a blank lead
+  to opposite decisions, so the line names which one it is rather than
+  printing a number either way. Follows and profile visits are **not** netted
+  against `PERFORMANCE_OWN_ACCOUNTS`: those logins already follow and cannot
+  follow again, so unlike likes there is no per-reel floor to take out.
 
   A reel whose reach does not clear the floor **reached nobody**, so its
   likes and comments are the operator's own by definition and the whole row
@@ -1861,6 +1873,30 @@ KEPT OR BINNED  (1.00 = always posted; every reel counts)
   question                   answer         n    median   vs rest
   topic source               evergreen     11     0.91    +0.24
 
+HOW MANY SAW IT  (1.00 = an ordinary reach for this account; median 6 accounts)
+  question                   answer         n    median   vs rest
+  topic source               redditrss     11     2.40x   +1.51
+
+WHAT REACH ACTUALLY LOOKED LIKE  (every posted reel, no floors)
+  an exhibit and not a finding - nothing here is read as an effect
+   reach share score  read  topic
+     289   76%  2.72   78h  how rusting anchor chains can cause hypoxia
+             velocity, niche match, too long, footage
+      64   17%  1.30  168h  how a river delta builds new land
+             niche match, explainer shape, on a recent board, ...
+       9    2%  1.80   97h  what the sound of the deep ocean actually is
+             niche match, explainer shape, curiosity (contradiction), ...
+       3    1%  1.80  121h  why the seasons are not caused by distance
+             niche match, explainer shape, curiosity (contradiction), ...
+       0    0%  1.90   26h  how a forest talks through its roots
+             niche match, explainer shape, from the backlog, footage
+  the best reel holds 76% of all 381 impression(s) across 8 reel(s)
+  that is more than all the others together: the mean sits above 7 of the 8,
+  so there is no ordinary reel here for the tables to describe
+  ranked by the board's own score instead, the top 2 were:
+    2.72  how rusting anchor chains can cause hypoxia  reached 289
+    1.90  why leaves change colour before they fall    reached 6
+
 HOW THEY DID  (1.00 = an ordinary reel for this account)
   question                   answer         n    median   vs rest
   length                     40-50s        12     1.18x   +0.21
@@ -1869,7 +1905,89 @@ HOW THEY DID  (1.00 = an ordinary reel for this account)
 SAVED OR SENT  (1.00 = every reel got a save or a share)
   question                   answer         n    median   vs rest
   trial: takeaway            on            11     0.27    +0.18
+
+FOLLOWED AFTER  (1.00 = every reel won a follow or a profile visit)
+  question                   answer         n    median   vs rest
+  trial: takeaway            on            11     0.09    +0.09
 ```
+
+They are printed in that order on purpose, and it is the order the funnel
+happens in: a reel nobody was shown cannot be watched through, a reel nobody
+watched cannot be saved, and a reel nobody saved is not going to win a
+follower. Reading them bottom-up tells you which stage is actually costing you
+â€” and on a small account it is almost never the one the craft knobs move.
+
+**Why there is an exhibit in the middle of the tables, and why it has no
+floors.** Every table here asks the same shape of question â€” does answering
+something one way beat answering it the other â€” and none of them prints until
+`PERFORMANCE_MIN_SAMPLES` reels have landed on *each* side. On 2026-09-11, with
+eight reels posted, the honest count was `READS: 0 comparable`: the freshness
+window took five reels read past 48h and one read at 18h, and the reach floor
+took two of the two that were left. Four of the six tables had never printed a
+row in the life of the project, and the two that had were reading the same-day
+verdict, which needs no API at all.
+
+Reach does not need any of that machinery, and it is the one column that
+doesn't. It has a reading on every posted reel, it spans nought to several
+hundred, and the single thing worth knowing about it is precisely what a median
+destroys: **one reel out of eight carried 76% of every impression the account
+has ever earned.** So `reach_exhibit` is deliberately not run through
+`_segment`, and all three floors are off:
+
+  * **No freshness window.** The window exists so a ratio compares reels of a
+    like age. Nothing in the exhibit is a ratio. A reel read at 167h did have
+    longer to accumulate, which is why the read-age is printed in its own
+    column beside every row rather than used to drop it â€” at a spread of forty
+    to one, read-age is not what separates the top of the list from the bottom,
+    and filtering on it costs every observation there is in order to explain a
+    difference it cannot account for.
+  * **No reach floor.** `PERFORMANCE_MIN_REACH` keeps a reel out of the *ratio*
+    tables because a denominator of three measures whoever happened to open the
+    app. As an observation *of* reach, three is not a weak reading â€” it is the
+    reading, and it is the one this account keeps getting.
+  * **No sample floor.** Nothing here is read as an effect, so there is no n at
+    which it turns trustworthy. The heading says `an exhibit and not a finding`
+    on its own line, above the columns, because a list of component names
+    printed beside a list of big numbers is read as a claim about the
+    components unless it is told not to be.
+
+The components go on a line of their own under each reel, indented the way
+`WHY THEY WERE BINNED` indents its notes rather than aligned under the topic
+column. Alignment cost thirteen characters, and on the real corpus those
+thirteen characters were the difference between printing `curiosity
+(contradiction)` and printing `explainer shape, ...` â€” which is to say, the
+difference between the column answering the question and the column being
+decorative. The full list is always in `--report --json`; the ellipsis only
+ever means the line ran out of room, and a name is cut at a comma and never
+mid-word, because `curiosity (contradic` reads as a component nobody
+recognises rather than as a line that ran out.
+
+The last two lines are the point of the whole block, and they are two
+orderings printed side by side with nothing inferred from the pair. The board
+scores a topic and the exhibit ranks it by what it actually reached; if those
+agree, the two lines cost a glance. On the corpus above they do not â€” the
+board's own second favourite, at 1.90, reached six accounts, while the reel
+that reached 289 scored 2.72 and the reel that reached 64 scored **1.30, the
+lowest score in the file**. That is not enough to move a weight, and the report
+does not move one: `curiosity_component` is worth `CURIOSITY_SIGNAL_WEIGHT`
+0.5 against `NICHE_MATCH_WEIGHT` 2.0 and `VELOCITY_WEIGHT` 1.8, and those
+numbers are a declared prior that has now been *looked at* for the first time
+rather than validated.
+
+What the exhibit changes is that the question became answerable, and
+`PERFORMANCE_EXPLORE=curiosity` is the answer to it: a board trial that charges
+the component on alternate days and drops it on the rest, so the next twenty
+reels settle by measurement what eight reels can only suggest. Waiting was the
+alternative, and waiting does not work here â€” left alone the board charges
+curiosity every single day, so the column is constant and no number of further
+reels gives it a second side. That is the failure `one_sided` exists to shout
+about, and it is why the fix for a weight nobody trusts is a trial and not a
+rewrite.
+
+A reel with no reach reading is counted in `unread` and never listed as a zero.
+Never asked is not nobody saw it â€” the same distinction `won_a_follow` makes
+one stage further down the funnel, and the one that hid the follows column for
+the entire life of the project.
 
 The first table is a tally and not a segment, deliberately. With fourteen
 rejections spread over eight codes, crossing them with the component vocabulary
@@ -1896,6 +2014,27 @@ shares are read as a yes/no and reported as a share of reels, which is defined
 at zero and moves the first time one lands. While nothing has ever been saved
 the report says so outright, so a column of zeros is never mistaken for a
 finding.
+
+**Why FOLLOWED AFTER exists, and why it was blank until 2026-09-10.** Every
+other table here measures attention paid to one reel and spent there. A
+follower is the only outcome that survives the reel, and on an account at zero
+it is the only one that compounds â€” so it is the number that should have been
+hardest to avoid printing, and it was the one nothing fetched. The ledger had
+carried a `follows` column since it was written and `--follows` had always
+parsed; `METRIC_MAP` in `pipeline/instagram.py`, the set `--fetch` actually
+asks Meta for, simply never listed it. The column was empty on every reel ever
+made, and empty read exactly like zero.
+
+`follows` and `profile_visits` are now both asked for. Asking costs nothing by
+construction: `_insights` reads a refusal for which metric name offended and
+drops it, so if your token or API version serves these only account-wide you
+get a warning and the other seven metrics still come back. A profile visit
+counts alongside a follow because it is the same intent one step short of it,
+and because follows alone are too rare to move a table at this size. Like
+`SAVED OR SENT` this is a **rate**, not a metric, for exactly the reason set
+out above â€” and it distinguishes three states, not two: never read, read and
+zero, and read and moving. The report says which out loud, both in the warnings
+and on the `FOLLOWED` summary line above the tables.
 
 Be realistic about what a daily pipeline can support. With ~20 possible
 components and one reel a day, most segments never reach a readable n. The cuts
