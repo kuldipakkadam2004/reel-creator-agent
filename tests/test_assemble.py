@@ -2076,16 +2076,20 @@ def cover_manifest(**overrides) -> dict:
 
 
 def plan_a_cover(shots=None, manifest=None, probes=None, *, card="Hook card",
-                 card_seconds=2.2, source=None, warnings=None):
+                 card_seconds=2.2, source=None, looks=None, warnings=None):
     manifest = manifest if manifest is not None else cover_manifest()
     if shots is None:
         shots, _ = plan(manifest)
     probes = probes if probes is not None else probes_for(manifest)
     return assemble.plan_cover(
         shots, manifest, probes, card=card, card_seconds=card_seconds,
-        font_file=None, source=source,
+        font_file=None, source=source, looks=looks,
         warnings=warnings if warnings is not None else [],
     )
+
+
+def verdict(grade=2, ok=True, why="a clear shot"):
+    return {"grade": grade, "ok": ok, "why": why}
 
 
 def test_an_aspect_is_read_as_width_and_height():
@@ -2216,6 +2220,170 @@ def test_the_top_of_the_reel_is_preferred_to_the_end_of_it():
     early = assemble.cover_score(shot(duration=3.0, start=1.0), probe)
     late = assemble.cover_score(shot(duration=3.0, start=40.0), probe)
     assert early > late
+
+
+# --- and what the frame actually shows --------------------------------------
+
+def test_a_frame_nobody_looked_at_scores_what_it_always_did():
+    probe = {"width": 1080, "height": 1920, "ok": True}
+    assert (assemble.cover_score(shot(), probe, None)
+            == assemble.cover_score(shot(), probe))
+    assert (assemble.cover_score(shot(), probe, {})
+            == assemble.cover_score(shot(), probe))
+
+
+def test_a_better_looking_frame_outranks_a_duller_one():
+    probe = {"width": 1080, "height": 1920, "ok": True}
+    striking = assemble.cover_score(shot(), probe, verdict(grade=3))
+    flat = assemble.cover_score(shot(), probe, verdict(grade=1))
+    assert striking > flat
+
+
+def test_the_look_decides_between_candidates_the_proxies_cannot_separate():
+    # The case that actually comes up: the candidates are all early shots of
+    # similar length and resolution, so every blind term is close to a tie and
+    # the only thing left to choose on is what the frames show.
+    probe = {"width": 1080, "height": 1920, "ok": True}
+    dull = shot(index=0, duration=3.0, start=0.0)
+    striking = shot(index=1, duration=2.8, start=3.0)
+
+    assert assemble.cover_score(dull, probe) > assemble.cover_score(striking, probe)
+    assert (assemble.cover_score(striking, probe, verdict(grade=3))
+            > assemble.cover_score(dull, probe, verdict(grade=1)))
+
+
+def test_the_look_is_a_term_and_not_a_gate():
+    # Deliberately bounded. The model sees one frame; the proxies know things
+    # about the clip that one frame does not show, so a looped 0.8s scrap it
+    # likes must not beat a 4s native-vertical hero shot it is lukewarm about.
+    # If this ever needs to flip, COVER_LOOK_WEIGHT is the knob - not the rule.
+    ideal = shot(duration=4.0, start=0.0)
+    scrap = shot(index=9, duration=0.8, start=12.0, looped=True, reused=True)
+    good = {"width": 1080, "height": 1920, "ok": True}
+    poor = {"width": 3840, "height": 2160, "ok": True}
+
+    assert assemble.cover_score(ideal, good) > assemble.cover_score(scrap, poor)
+    assert (assemble.cover_score(ideal, good, verdict(grade=1))
+            > assemble.cover_score(scrap, poor, verdict(grade=3)))
+
+
+def test_a_vetoed_frame_falls_behind_one_that_was_merely_dull():
+    probe = {"width": 1080, "height": 1920, "ok": True}
+    vetoed = assemble.cover_score(shot(), probe, verdict(grade=2, ok=False))
+    dull = assemble.cover_score(shot(), probe, verdict(grade=0, ok=True))
+    assert vetoed < dull
+
+
+def footage_pool(shots):
+    """The candidates for a cover taken from the footage, not the hook card.
+
+    The card pool on this fixture is one shot deep - the card runs 2.2s and the
+    opening shot is longer than that - so the footage pool is the one with
+    anything to choose between.
+    """
+    return assemble.cover_candidates(
+        shots, card="", card_seconds=0.0, font_file=None,
+    )["pool"]
+
+
+def test_the_cover_the_model_likes_is_the_one_that_ships():
+    shots, _ = plan(cover_manifest())
+    pool = footage_pool(shots)
+    assert len(pool) > 1
+
+    # Hand the last candidate the only good grade and it should win, even
+    # though `cover_score` prefers the top of the reel on every other term.
+    last = pool[-1]
+    blind = plan_a_cover(shots=shots, card="", card_seconds=0.0)
+    assert blind["shot_index"] != last.index
+
+    looks = {assemble.cover_label(one): verdict(grade=0 if one is not last else 3)
+             for one in pool}
+    seen = plan_a_cover(shots=shots, card="", card_seconds=0.0, looks=looks)
+    assert seen["shot_index"] == last.index
+
+
+def test_a_cover_nobody_could_ship_is_still_shipped_and_said_out_loud():
+    shots, _ = plan(cover_manifest())
+    looks = {assemble.cover_label(one): verdict(grade=0, ok=False, why="too dark")
+             for one in footage_pool(shots)}
+
+    warnings = []
+    cover = plan_a_cover(shots=shots, card="", card_seconds=0.0, looks=looks,
+                         warnings=warnings)
+    assert cover is not None
+    assert any("would not ship any candidate" in note for note in warnings)
+    assert any("too dark" in note for note in warnings)
+
+
+def test_the_cover_records_what_it_beat_and_not_only_what_it_is():
+    shots, _ = plan(cover_manifest())
+    pool = footage_pool(shots)
+    looks = {assemble.cover_label(one): verdict(grade=index % 4)
+             for index, one in enumerate(pool)}
+
+    cover = plan_a_cover(shots=shots, card="", card_seconds=0.0, looks=looks)
+    assert cover["look"] is not None
+    assert len(cover["look_candidates"]) == len(pool)
+    assert {entry["shot_index"] for entry in cover["look_candidates"]} == {
+        one.index for one in pool
+    }
+    # Every candidate's grade is on the record, not only the winner's - which
+    # is what makes it possible to ask later whether the look changed anything.
+    assert all("grade" in entry for entry in cover["look_candidates"])
+
+
+def test_a_run_with_no_look_records_no_candidates_rather_than_empty_ones():
+    cover = plan_a_cover()
+    assert cover["look"] is None
+    assert cover["look_candidates"] == []
+
+
+def test_the_shortlist_the_look_sees_is_the_shortlist_that_is_ranked():
+    # Two callers compute this pool - the runner, to render previews, and
+    # `plan_cover`, to rank them. A verdict keyed off a different shortlist
+    # would be a verdict about a frame that was never in the running.
+    shots, _ = plan(cover_manifest())
+    kwargs = dict(card="Hook card", card_seconds=2.2, font_file=None)
+    first = assemble.cover_candidates(shots, **kwargs)
+    second = assemble.cover_candidates(shots, **kwargs)
+    assert [one.index for one in first["pool"]] == [one.index for one in second["pool"]]
+    assert first["want_card"] == second["want_card"]
+
+    chosen = plan_a_cover(shots=shots)
+    assert chosen["shot_index"] in {one.index for one in first["pool"]}
+
+
+def test_the_frame_a_candidate_is_previewed_at_is_the_frame_that_ships():
+    # `preview_cover_frames` and `plan_cover` both go through
+    # `cover_frame_time`, so the graded picture is the one that gets written.
+    one = shot(duration=4.0, start=0.0, source_start=1.5)
+    assert (assemble.cover_frame_time(one, card_seconds=2.2, want_card=False)
+            == assemble.cover_frame_time(one, card_seconds=2.2, want_card=False))
+
+    cover = plan_a_cover(shots=[one], card="", card_seconds=0.0)
+    _, source_time = assemble.cover_frame_time(one, card_seconds=0.0,
+                                               want_card=False)
+    assert cover["source_time"] == source_time
+
+
+def test_a_still_is_previewed_from_its_only_frame():
+    one = shot(kind="image", duration=3.0, source_start=0.0)
+    _, source_time = assemble.cover_frame_time(one, card_seconds=0.0,
+                                               want_card=False)
+    assert source_time == 0.0
+
+
+def test_frames_are_sent_smaller_than_they_ship_but_the_same_shape():
+    width, height = assemble._look_size()
+    assert width == config.LOOK_FRAME_WIDTH
+    assert height % 2 == 0
+    assert abs(width / height - config.VIDEO_WIDTH / config.VIDEO_HEIGHT) < 0.02
+
+
+def test_nothing_is_sampled_out_of_a_reel_that_is_not_there(tmp_path):
+    frames, notes = assemble.sample_reel_frames(tmp_path / "gone.mp4", 40.0)
+    assert frames == [] and notes == []
 
 
 # --- the choice -------------------------------------------------------------

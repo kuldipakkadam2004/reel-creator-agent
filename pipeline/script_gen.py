@@ -335,7 +335,7 @@ def _build_generation_config(model: str, *, system_instruction: str,
     return types.GenerateContentConfig(**kwargs)
 
 
-def client_http_options():
+def client_http_options(timeout: float | None = None):
     """Transport settings every Gemini client in the project is built with.
 
     Public because step 2 is not the only caller: the query writer and the
@@ -343,11 +343,17 @@ def client_http_options():
     import this module for the pro-model quirks. A timeout belongs in the same
     place for the same reason - otherwise one call site is left as the one that
     can wait forever, and it is never the one you are watching.
+
+    `timeout` overrides the default for one call. Step 5b is the only caller
+    that passes one: a multimodal call is slower than a text one by about the
+    time it takes to read the images, and GEMINI_TIMEOUT_SECONDS was tuned
+    against step 2's prose.
     """
     from google.genai import types
 
+    seconds = config.GEMINI_TIMEOUT_SECONDS if timeout is None else timeout
     # HttpOptions counts in milliseconds; the setting is in seconds.
-    return types.HttpOptions(timeout=int(config.GEMINI_TIMEOUT_SECONDS * 1000))
+    return types.HttpOptions(timeout=int(seconds * 1000))
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -387,6 +393,8 @@ def call_gemini(prompt: str, *, system_instruction: str,
                 max_output_tokens: int = MAX_OUTPUT_TOKENS,
                 thinking_budget: int | None = THINKING_BUDGET,
                 json_mode: bool = False,
+                images: list[tuple[str, bytes]] | None = None,
+                timeout: float | None = None,
                 model: str | None = None,
                 api_key: str | None = None) -> str:
     """One Gemini call, and the only place the SDK is spoken to.
@@ -403,6 +411,14 @@ def call_gemini(prompt: str, *, system_instruction: str,
         system_instruction: who the model is being asked to be.
         json_mode: ask for `application/json` back. The response is still text -
             the caller parses it, and should not assume it is well formed.
+        images: JPEG frames to show, each with the label it should be called
+            by. Labelled and interleaved rather than handed over as a bare
+            list, because the one failure that matters here is the model
+            answering about frame 3 under frame 2's name, and a caller that
+            reads verdicts back by position would never notice. See `look.py`,
+            which is the only step that passes any.
+        timeout: seconds to wait on this call, defaulting to
+            GEMINI_TIMEOUT_SECONDS. See `client_http_options`.
         model / api_key: default to config.GEMINI_MODEL and the .env key.
 
     Raises:
@@ -414,14 +430,26 @@ def call_gemini(prompt: str, *, system_instruction: str,
 
     from google import genai
 
+    contents: str | list = prompt
+    if images:
+        from google.genai import types
+
+        parts: list = []
+        for label, data in images:
+            parts.append(f"{label}:")
+            parts.append(types.Part.from_bytes(data=data, mime_type="image/jpeg"))
+        # The question goes last, after everything it is asked about.
+        parts.append(prompt)
+        contents = parts
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             client = genai.Client(
-                api_key=api_key, http_options=client_http_options()
+                api_key=api_key, http_options=client_http_options(timeout)
             )
             response = client.models.generate_content(
                 model=model,
-                contents=prompt,
+                contents=contents,
                 config=_build_generation_config(
                     model,
                     system_instruction=system_instruction,

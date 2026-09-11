@@ -92,7 +92,16 @@ from pipeline import visuals  # noqa: E402
 #: not a question the ledger could hold, whatever the tags were. The names make
 #: each tag a facet like any other. An older row has neither column and is not
 #: asked either question - "no cover" and "no such column" are not the same.
-FEATURES_VERSION = 5
+#: 6 adds step 5b's columns, and they are the first in this row that describe
+#: the reel rather than the plan for it. Everything above them - shots, beats,
+#: mean shot length, the cover's source, which components fired - is a record
+#: of what the run asked for. Nothing here had ever been read off the finished
+#: file, because until step 5b nothing in the pipeline decoded a frame, so the
+#: insights loop was regressing reach against a description of an intention.
+#: `look_graded` is the load-bearing one: a reel nobody looked at and a reel
+#: that was looked at and found clean both carry an empty `look_problems`, and
+#: scoring them together would put the whole back catalogue in the clean arm.
+FEATURES_VERSION = 6
 
 #: 2 adds `watch_ratio` and the `measurements` history, and both are derived
 #: for rows already in the file rather than left blank - the numbers needed
@@ -272,6 +281,11 @@ _COMPONENT_KINDS = (
     # already drops any name that fired on every reel or on none. A tag used
     # twice is asked about and never read, which is what `readable` is for.
     ("hashtag", "hashtag_names"),
+    # Not a scored decision either, and not a set that fired: a list of what
+    # step 5b could see wrong with the rendered frames. Same shape of question
+    # all the same - "did the reels with unreadable captions reach fewer
+    # people" is asked exactly like "did the reels tagged #ecology".
+    ("look", "look_problems"),
 )
 
 
@@ -339,6 +353,8 @@ def features_for(record: dict) -> dict:
     captions = _section(assembly, "captions")
     music = _section(assembly, "music")
     cover = _section(assembly, "cover")
+    seen = _section(assembly, "look")
+    cover_seen = cover.get("look") if isinstance(cover.get("look"), dict) else {}
     tiers = _section(post, "hashtag_tiers")
 
     bands: dict[str, int] = {}
@@ -405,6 +421,24 @@ def features_for(record: dict) -> dict:
         # that came from the footage.
         "cover_source": (str(cover.get("source") or "")
                          if cover.get("written") else ""),
+
+        # Step 5b. `look_graded` says whether anything looked at all, and is
+        # not redundant with the three below it: every reel made before this
+        # existed, and every reel whose look failed or was switched off, has a
+        # None grade and no problems - which reads identically to a clean one.
+        "look_graded": bool(seen.get("graded")),
+        "look_grade": seen.get("grade"),
+        "look_problems": sorted({
+            str(name).strip().lower() for name in (seen.get("problems") or [])
+            if str(name).strip()
+        }),
+        # The cover is graded separately and against a different question -
+        # "is this worth a tap", not "is this worth posting" - so it is its own
+        # column. It is also the one number here that moved a decision rather
+        # than only describing one, which is what makes it worth correlating:
+        # if the covers the model liked reach no better, the weight is wrong.
+        "cover_look_grade": (cover_seen.get("grade")
+                             if cover.get("written") else None),
 
         "post_mode": post.get("mode") or "",
         "hashtags": len(post.get("hashtags") or []),
@@ -1222,6 +1256,17 @@ def facets(features: dict, vocabulary: dict[str, list[str]]) -> list[tuple[str, 
     # asking them would score the whole back catalogue as one answer.
     if _written_since(features, 5) and features.get("cover_source"):
         pairs.append(("cover", str(features["cover_source"])))
+    # Version 6, and only where something actually looked: an ungraded reel is
+    # not a badly graded one, and every reel in the history before step 5b is
+    # ungraded. `look_graded` is asked of version 6 rows so that switching the
+    # look off stays visible as its own answer rather than as silence.
+    if _written_since(features, 6):
+        pairs.append(("looked at",
+                      "yes" if features.get("look_graded") else "no"))
+        if features.get("look_graded") and features.get("look_grade") is not None:
+            pairs.append(("look grade", str(features["look_grade"])))
+        if features.get("cover_look_grade") is not None:
+            pairs.append(("cover look grade", str(features["cover_look_grade"])))
     if features.get("aligner"):
         pairs.append(("captions", str(features["aligner"])))
     # Only from version 3: every earlier row records "" for the music whether
@@ -1245,6 +1290,11 @@ def facets(features: dict, vocabulary: dict[str, list[str]]) -> list[tuple[str, 
         # An older row lists no tags at all, and "this reel did not use
         # #ecology" is a different fact from "nobody wrote the tags down".
         if kind == "hashtag" and not _written_since(features, 5):
+            continue
+        # An ungraded reel has an empty problem list because nobody looked,
+        # not because there was nothing to find. Asking it "was this dark" and
+        # recording "no" is the version-gating mistake in its purest form.
+        if kind == "look" and not features.get("look_graded"):
             continue
         fired = {str(name) for name in features.get(key) or []}
         for name in vocabulary.get(kind, ()):

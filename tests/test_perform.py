@@ -2333,3 +2333,125 @@ def test_the_real_lines_are_absent_when_nobody_is_seeding(capsys):
     assert "REACHED" not in printed
     assert "ACTED" not in printed
     assert "1.50x that" in printed
+
+
+# ---------------------------------------------------------------------------
+# What the reel actually looks like - FEATURES_VERSION 6
+#
+# The first columns in this row read off the finished file rather than off the
+# plan that made it. Most of what is tested here is the distinction the rest of
+# the version gating exists for: a reel nobody looked at is not a clean one.
+# ---------------------------------------------------------------------------
+
+def _looked_at(tmp_path, **look):
+    run_dir = tmp_path / "out" / "2026-09-11" / "forest-1a2b3c"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"cover": {"written": True, "source": "footage"}}
+    if look:
+        payload["look"] = look
+    (run_dir / "assembly.json").write_text(json.dumps(payload),
+                                           encoding="utf-8")
+    return perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+
+
+def test_the_grade_of_the_finished_reel_is_recorded(paths, tmp_path):
+    features = _looked_at(tmp_path, graded=True, grade=2,
+                          problems=["dark", "off_topic"],
+                          summary="underexposed for the first half")
+
+    assert features["look_graded"] is True
+    assert features["look_grade"] == 2
+    assert features["look_problems"] == ["dark", "off_topic"]
+
+
+def test_a_reel_nobody_looked_at_is_not_a_clean_one(paths, tmp_path):
+    """The distinction the whole version gate exists for.
+
+    An ungraded reel and a flawless one both carry an empty problem list. Asked
+    the same questions they would score together, and the back catalogue - every
+    reel made before step 5b existed - would land in the clean arm.
+    """
+    ungraded = _looked_at(tmp_path, graded=False, grade=None, problems=[])
+    clean = _looked_at(tmp_path, graded=True, grade=3, problems=[])
+
+    assert ungraded["look_graded"] is False
+    assert clean["look_graded"] is True
+
+    vocabulary = {"look": ["dark"]}
+    assert ("looked at", "no") in perform.facets(ungraded, vocabulary)
+    assert ("looked at", "yes") in perform.facets(clean, vocabulary)
+
+    # And the ungraded one is not asked whether it was dark at all.
+    assert not any(q == "look: dark" for q, _ in perform.facets(ungraded,
+                                                                vocabulary))
+    assert ("look: dark", "absent") in perform.facets(clean, vocabulary)
+
+
+def test_an_ungraded_reel_is_not_asked_for_a_grade_it_does_not_have(paths,
+                                                                    tmp_path):
+    ungraded = _looked_at(tmp_path)
+    assert not any(q == "look grade" for q, _ in perform.facets(ungraded, {}))
+
+
+def test_a_reel_made_before_anything_looked_is_not_asked_whether_it_was(paths):
+    old = {**_features("r1"), "features_version": 5, "look_graded": False}
+    assert not any(q == "looked at" for q, _ in perform.facets(old, {}))
+
+
+def test_the_grade_is_a_question_with_the_grade_as_its_answer(paths, tmp_path):
+    features = _looked_at(tmp_path, graded=True, grade=1, problems=["blurry"])
+    assert ("look grade", "1") in perform.facets(features, {})
+
+
+def test_a_problem_is_asked_of_every_graded_reel_not_only_the_ones_it_hit(
+        paths, tmp_path):
+    vocabulary = {"look": ["caption_unreadable"]}
+    hit = _looked_at(tmp_path, graded=True, grade=1,
+                     problems=["caption_unreadable"])
+    missed = _looked_at(tmp_path, graded=True, grade=3, problems=[])
+
+    assert ("look: caption_unreadable", "fired") in perform.facets(hit,
+                                                                   vocabulary)
+    assert ("look: caption_unreadable", "absent") in perform.facets(missed,
+                                                                    vocabulary)
+
+
+def test_the_covers_own_grade_is_its_own_column(paths, tmp_path):
+    """A different question from the reel's: worth a tap, not worth posting."""
+    run_dir = tmp_path / "out" / "2026-09-11" / "forest-1a2b3c"
+    run_dir.mkdir(parents=True)
+    (run_dir / "assembly.json").write_text(json.dumps({
+        "cover": {"written": True, "source": "footage",
+                  "look": {"grade": 3, "ok": True, "why": "a glowing jellyfish"}},
+        "look": {"graded": True, "grade": 2, "problems": []},
+    }), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+
+    assert features["cover_look_grade"] == 3
+    assert features["look_grade"] == 2
+    assert ("cover look grade", "3") in perform.facets(features, {})
+
+
+def test_a_cover_that_was_never_written_has_no_grade_to_correlate(paths,
+                                                                  tmp_path):
+    run_dir = tmp_path / "out" / "2026-09-11" / "forest-1a2b3c"
+    run_dir.mkdir(parents=True)
+    (run_dir / "assembly.json").write_text(json.dumps({
+        "cover": {"written": False, "look": {"grade": 3}},
+    }), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "r", "run_dir": str(run_dir)})
+
+    assert features["cover_look_grade"] is None
+    assert not any(q == "cover look grade"
+                   for q, _ in perform.facets(features, {}))
+
+
+def test_a_run_with_no_assembly_at_all_still_reads(paths):
+    features = perform.features_for({"run_id": "r", "run_dir": "/nope"})
+    assert features["look_graded"] is False
+    assert features["look_grade"] is None
+    assert features["look_problems"] == []
+    assert features["cover_look_grade"] is None
+

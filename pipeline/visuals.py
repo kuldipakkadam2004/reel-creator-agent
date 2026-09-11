@@ -1792,8 +1792,10 @@ found for it, described in the stock library's own words.
 For every candidate, say whether it is usable over that beat's narration.
 
 Rules:
-- Judge only the subject. Framing, colour and production quality are \
-handled elsewhere and are not your concern.
+- Judge only the subject. You are reading a library's own words about a clip, \
+not looking at one, so framing, colour and production quality are not \
+something you can see from here and not your concern - step 5b looks at the \
+rendered frames and judges those.
 - Prefer keeping where the choice is genuinely close. These are the only \
 clips available and a loose match beats a blank screen, so reject what \
 would confuse or mislead a viewer, not what is merely imperfect.

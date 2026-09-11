@@ -68,6 +68,7 @@ rephrase the cover's alt text and `--no-alt` leaves it out.
 ```
 config.py           paths, .env loading, per-step key validation
 pipeline/           pipeline modules (one per step)
+pipeline/look.py    step 5b: the one place a picture is shown to the model
 pipeline/run.py     step 8: all of it, start to finish, unattended
 pipeline/schedule.py  registers step 8 with Windows Task Scheduler
 pipeline/perform.py step 9: how the reel did, and what that changes
@@ -111,6 +112,7 @@ moved or deployed without editing code.
 | 3 | TTS (ElevenLabs) | done |
 | 4 | Visual sourcing (Pexels / Pixabay / Openverse) | done |
 | 5 | Video assembly + burned-in captions + cover frame | done |
+| 5b | Looking at the rendered frames — the cover, and the reel | done |
 | 6 | Instagram caption + hashtags + cover alt text (Gemini) | done |
 | 7 | Telegram delivery | not started |
 | 8 | End-to-end pipeline + daily scheduling | done |
@@ -1173,6 +1175,11 @@ the reel that instant is the middle of the fade-in.
 **Which frame.** Every shot is scored — a different question from step 4's
 `score_candidate`, which asks whether a clip can carry a beat:
 
+* **what the frame actually shows**, from step 5b having been sent it. This is
+  the only term that is the question rather than a proxy for it, and it is
+  worth the most (`COVER_LOOK_WEIGHT`, with `COVER_LOOK_VETO` subtracted when
+  the model says the frame should not be a cover at all). Everything below it
+  was standing in for a look that until recently nobody took;
 * how long the assembler gave it, capped at `SHOT_TARGET_SECONDS`. A long slot
   means the beat had footage worth holding on;
 * whether it needs cropping at all. Native vertical shows the whole picture as
@@ -1212,10 +1219,85 @@ than a constant. At the 1080x1920 default the card sits 320px down:
 `hook_card` keeps the card regardless and says so; `footage` never uses it.
 
 Everything about the choice — which shot, which frame, which mode, the reason in
-words, and whether the card cleared the crop — goes into `assembly.json` under
-`cover`, so step 9 can put it against how the reel actually did. `--dry-run`
-makes the whole decision and writes no file, exactly as it plans a timeline
-without encoding one.
+words, whether the card cleared the crop, and what step 5b made of every
+candidate it chose between — goes into `assembly.json` under `cover`, so step 9
+can put it against how the reel actually did. `--dry-run` makes the whole
+decision and writes no file, exactly as it plans a timeline without encoding
+one; it skips the look, which costs an encoder pass and a model call, and a dry
+run is meant to cost neither.
+
+### Looking at it
+
+Until this existed, **nothing in the pipeline had ever decoded a frame.** Every
+judgement in ~23k lines was made on text: the script, the beat list, and the
+stock library's own words for a clip. Three things followed from that one
+absence, and they are the same hole seen from three sides.
+
+* `cover_score` asks in its own docstring whether a frame is *"worth a
+  stranger's tap"*, and answered with shot length, aspect ratio, resolution and
+  whether the clip had been reused. Every one of those is true and none of them
+  is about what the frame shows. For an account with no followers the cover is
+  the highest-leverage pixel in the run, and it was chosen sight-unseen.
+* Step 4's screener prompt told the model that framing, colour and production
+  quality were *"handled elsewhere and are not your concern."* They were handled
+  nowhere. The claim had been true of an intention and never of code.
+* The features row step 9 correlates against reach recorded `shots`, `beats`,
+  `mean_shot_seconds` — a description of the **plan**. An insights loop
+  regressing an outcome against what a run *meant* to make cannot see the thing
+  that was posted.
+
+`pipeline/look.py` is the one place a picture is put in front of the model. It
+knows nothing about ffmpeg, shots or run directories: `assemble.py` already owns
+an encoder, so it renders the frames and hands over JPEG bytes with the label
+each one should be called by, and gets verdicts back. Labels are interleaved
+with the images rather than sent as a list, because the failure that matters is
+the model answering about frame 3 under frame 2's name — which a caller reading
+verdicts back by position would never notice.
+
+**Two looks per run.**
+
+*Before the cover is chosen*, the candidate shots are rendered at
+`LOOK_FRAME_WIDTH` through the same `_render_cover_frame` that writes the real
+cover — the real crop, the hook card burned in through the same `build_ass`
+path — and graded 0–3 on whether they would stop a scroll, with the type judged
+as part of the picture. A card that cannot be read against what is behind it is
+a cover problem, and it is the most common way a cover fails.
+
+*After the encode*, `REEL_LOOK_FRAMES` frames are sampled evenly across
+`reel.mp4` (at the midpoint of each slice, so neither the fade-in nor the tail
+is graded as footage) and the reel is graded 0–3, with problems named from a
+closed list: `dark`, `blurry`, `watermark`, `static`, `off_topic`,
+`caption_unreadable`, `repetitive`, `artifact`. The list is closed because step
+9 turns each name into a facet, and free text would give a vocabulary of one-off
+phrasings with a sample size of one each — which `build_vocabulary` drops, so an
+open list would read as *"the model found nothing"* however much it found.
+
+**It is a term, not a gate.** The look outweighs any single proxy and a veto
+outweighs a strong blind score, but it is bounded: the model sees one frame, and
+the proxies know things about the clip that one frame does not show, so a looped
+0.8s scrap it likes should not beat a 4s native-vertical hero shot it is
+lukewarm about. Where every candidate is vetoed, a cover still ships — Instagram
+takes the first frame of the video when given none, and that is a caption
+mid-sentence over whatever was on screen at 0.0s, which is worse than all of
+them. The warning says so.
+
+**Nothing here can cost a reel.** A missing key, a failed call, a reply of the
+wrong shape: each comes back as a warning beside an empty verdict, and the
+caller keeps the blind score it already had. The reel grade runs after the
+encode, when the `.mp4` is already on disk. A grade at or below `REEL_LOOK_WARN_AT`
+is a warning on the run and never a failure.
+
+**What it found first.** Run against the reel posted 2026-09-10 (reach 14), the
+grade came back 1/3 — `dark`, `off_topic`:
+
+> The video explains glacial collapse using a mix of relevant glacial imagery
+> and unrelated clips of temperate, rocky landscapes.
+
+Two of its six frames were *"an aerial view of people on a tree-covered cliff"*
+and *"waves crashing against a rocky sea cliff"*, under narration about bedrock
+and glaciers. Step 4's screener had approved both, and was not wrong to: the
+library's words for those clips were accurate, and said nothing whatever about
+what they showed.
 
 ### The music bed
 
@@ -2138,6 +2220,29 @@ the point of storing them — the count and the band tally that earlier rows kep
 could not hold *"did #woodwideweb do anything"* whatever the tags were. The
 spine tags in `POST_HASHTAGS_ALWAYS` are the ones that will reach a readable n
 first, because they are the only ones on every post.
+
+**`FEATURES_VERSION` 6 is the first version that describes the reel rather than
+the plan for it.** Everything above it — `shots`, `beats`,
+`mean_shot_seconds`, `cover_source`, every component that fired — is a record
+of what the run *asked for*. None of it had ever been read off the finished
+file, because until step 5b nothing in the pipeline decoded a frame, so this
+loop was regressing reach against a description of an intention. Version 6 adds
+`look_graded`, `look_grade`, `look_problems` and `cover_look_grade`.
+
+`look_graded` is the load-bearing one, and it is the same version-gating rule
+as everywhere else in this file, in its purest form: **a reel nobody looked at
+and a reel that was looked at and found clean both carry an empty
+`look_problems`.** Scoring them together would put the entire back catalogue in
+the clean arm of a comparison it never took part in. So an ungraded row is not
+asked whether it was dark; it is asked only whether anything looked at all,
+which keeps switching the look off visible as its own answer rather than as
+silence.
+
+`cover_look_grade` is kept apart from `look_grade` because they answer
+different questions — *worth a tap* against *worth posting* — and because it is
+the one number here that **moved a decision** rather than only describing one.
+If the covers the model liked reach no better than the ones it did not,
+`COVER_LOOK_WEIGHT` is wrong, and that is a thing this ledger can now find out.
 
 ### What it changes
 

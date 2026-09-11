@@ -1467,8 +1467,98 @@ COVER_SEARCH_SECONDS = get_env_float("COVER_SEARCH_SECONDS", 15.0)
 #: back to footage and says so.
 COVER_SAFE_ASPECT = get_env("COVER_SAFE_ASPECT", "4:5")
 
+# Step 5b - looking at what was made
+#
+# Every other judgement in this pipeline is made on text: the script, the beat
+# list, and the stock library's own words for a clip. Nothing decoded a frame.
+# That left three holes, and they are one hole:
+#
+#   - `cover_score` asks in its own docstring "whether one frame of it, with no
+#     motion and no sound, is worth a stranger's tap", and answered with shot
+#     duration, aspect ratio and resolution. Not one term was about what the
+#     frame shows.
+#   - step 4's screener told the model that framing and production quality were
+#     "handled elsewhere". They were handled nowhere.
+#   - the features row step 9 correlates against reach described the *plan* -
+#     shots, beats, mean shot length - so the insights loop was regressing an
+#     outcome against a description of an intention.
+#
+# One mechanism closes all three: show the model the actual pixels. It is the
+# most expensive call in the pipeline per unit of judgement, so it is bounded
+# hard - a handful of downscaled frames, twice per run.
+
+LOOK_ENABLED = get_env_bool("LOOK_ENABLED", True)
+
+#: Frames are downscaled to this width before being sent. The cover is judged
+#: at 1080 wide and the reel is rendered at 1080, but "would a stranger stop on
+#: this" and "can these captions be read" both survive 540 intact, and the
+#: image token count goes with the area - so full resolution would be four
+#: times the cost for a question neither needs it to answer. Height follows the
+#: frame's own aspect.
+LOOK_FRAME_WIDTH = get_env_int("LOOK_FRAME_WIDTH", 540)
+
+#: ffmpeg's -q:v for those frames, 2 (near-lossless) to 31. Softer than the
+#: cover's own because these are read once by a model and thrown away, but not
+#: soft enough to invent the compression artefacts it is being asked about.
+LOOK_JPEG_QUALITY = get_env_int("LOOK_JPEG_QUALITY", 4)
+
+#: How long the model may take over one look, in seconds. Separate from
+#: GEMINI_TIMEOUT_SECONDS because a multimodal call is slower than a text one
+#: by roughly the time it takes to read the images, and the text default was
+#: tuned against step 2's prose calls.
+LOOK_TIMEOUT_SECONDS = get_env_float("LOOK_TIMEOUT_SECONDS", 180.0)
+
+# --- the cover ---------------------------------------------------------------
+
+#: Show the model the candidate cover frames before choosing between them.
+COVER_LOOK_ENABLED = get_env_bool("COVER_LOOK_ENABLED", True)
+
+#: At most this many candidates are rendered and sent. COVER_SEARCH_SECONDS
+#: with a ~2.4s mean shot puts about six shots in the window; the cap is what
+#: stops an unusually fast cut list turning one cover into fifteen images.
+#: Candidates are dropped worst-first by the blind score, so the cap never
+#: discards a frame the old code would have chosen.
+COVER_LOOK_MAX_CANDIDATES = get_env_int("COVER_LOOK_MAX_CANDIDATES", 6)
+
+#: What a perfect look is worth in `cover_score`. Deliberately the largest term
+#: in that function - the others are proxies for "is this frame any good" and
+#: this one is the question itself - but not unbounded: a 4K native-vertical
+#: hero shot the model is lukewarm about should still beat a looped scrap it
+#: likes, because the model sees one frame and the blind terms know things
+#: about the clip that one frame does not show.
+COVER_LOOK_WEIGHT = get_env_float("COVER_LOOK_WEIGHT", 5.0)
+
+#: Subtracted when the model says the frame should not be a cover at all.
+#: Larger than the weight, so a veto beats a merely-strong blind score, and
+#: finite, so a run where every candidate is vetoed still ships a cover rather
+#: than none. Vetoes are recorded in assembly.json either way.
+COVER_LOOK_VETO = get_env_float("COVER_LOOK_VETO", 6.0)
+
+# --- the finished reel -------------------------------------------------------
+
+#: Sample the rendered reel and grade it. Runs after the encode, changes
+#: nothing about the file, and exists to put a column in the ledger that
+#: describes the artifact instead of the plan.
+REEL_LOOK_ENABLED = get_env_bool("REEL_LOOK_ENABLED", True)
+
+#: How many frames are sampled across the reel, evenly spaced. Six covers a
+#: ~40s reel at about one every seven seconds, which is enough to catch footage
+#: that is dark, static, watermarked or wrong, and captions that collide with
+#: what is behind them. More frames would read the reel more closely; this is
+#: the number where the cost stopped being rounding error.
+REEL_LOOK_FRAMES = get_env_int("REEL_LOOK_FRAMES", 6)
+
+#: A grade at or below this is worth a warning on the run. 0-3 scale, so 1
+#: means "the model found something it would not have shipped". It is a
+#: warning and never a failure: the .mp4 is already on disk by the time this
+#: runs, and a reel nobody looked at is still better than no reel.
+REEL_LOOK_WARN_AT = get_env_float("REEL_LOOK_WARN_AT", 1.0)
+
 #: Nothing is required: captions fall back to `estimate` with no key at all, and
-#: ffmpeg comes from the imageio-ffmpeg wheel if the system has none.
+#: ffmpeg comes from the imageio-ffmpeg wheel if the system has none. The look
+#: needs GEMINI_API_KEY, and is skipped with a warning when it is absent, for
+#: the same reason step 4's screener is - it improves a reel, it does not make
+#: one.
 REQUIRED_ASSEMBLE: tuple[str, ...] = ()
 
 
@@ -2164,6 +2254,15 @@ def _report() -> None:
         ("COVER", (f"{COVER_SOURCE}, from the first {COVER_SEARCH_SECONDS:g}s, "
                    f"safe at {COVER_SAFE_ASPECT} -> {COVER_FILENAME}")
                   if COVER_ENABLED else "off"),
+        ("LOOK", (", ".join(
+            filter(None, (
+                (f"cover: <={COVER_LOOK_MAX_CANDIDATES} frames, "
+                 f"weight {COVER_LOOK_WEIGHT:g}/veto {COVER_LOOK_VETO:g}")
+                if COVER_LOOK_ENABLED else "cover: off",
+                (f"reel: {REEL_LOOK_FRAMES} frames, warn at "
+                 f"{REEL_LOOK_WARN_AT:g}") if REEL_LOOK_ENABLED else "reel: off",
+                f"{LOOK_FRAME_WIDTH}px wide",
+            ))) if LOOK_ENABLED else "off")),
         ("VIDEO_RUN_DIR", f"output/<{VIDEO_RUN_DATE_FORMAT}>/<run id>/"
                           f"{VIDEO_FILENAME}"),
         ("MUSIC", (f"{MUSIC_LOUDNESS_TARGET:g} LUFS"

@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
+from pipeline import look  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tunables. The look (resolution, font, colours, pacing) is config.py's job -
@@ -205,7 +207,15 @@ _COVER_EDGE_SECONDS = 0.25
 #: nothing downstream had to change - but step 9 correlates on these, and a
 #: version 2 file having none of them is the difference between "zero" and
 #: "not measured".
-ASSEMBLY_VERSION = 3
+#: Bumped to 4 for step 5b: the file gained a top-level `look` with the grade
+#: the rendered reel was given, and `cover` gained `look`/`look_candidates`
+#: with what the model made of the frames it chose between. Additive again,
+#: and the same distinction again - a version 3 file is not a reel that was
+#: looked at and found clean, it is a reel from before anything looked. Step 9
+#: draws that line with `look_graded` rather than by reading this number, so
+#: the two stay independent: switching the look off has to be visible on a
+#: current run, not only on an old one.
+ASSEMBLY_VERSION = 4
 
 
 # ---------------------------------------------------------------------------
@@ -2247,14 +2257,36 @@ def _cover_depiction(asset: dict) -> tuple[str, str]:
     return "", "none"
 
 
-def cover_score(shot: Shot, probe: dict) -> float:
+def cover_score(shot: Shot, probe: dict, verdict: dict | None = None) -> float:
     """Rank a shot as a candidate for the cover. Higher is better.
 
     A different question from `score_candidate` in step 4, which asks whether a
     clip can carry a beat. This asks whether one frame of it, with no motion and
     no sound, is worth a stranger's tap.
+
+    `verdict` is step 5b's answer to exactly that question, from having been
+    shown the frame - see `look.judge_covers`. Everything below it is a proxy
+    standing in for a look that until now nobody took: a long slot means the
+    beat had footage worth holding on, native vertical means no crop, more
+    pixels means fewer artefacts. All three are true and none of them is about
+    what the frame shows, which is why the look outweighs any one of them and
+    a veto outweighs all of them together. It stays a term rather than a gate
+    because the model sees one frame and the proxies know things about the clip
+    that one frame does not: with no verdict, the score is what it always was.
     """
     score = 0.0
+
+    if verdict:
+        if verdict.get("ok", True):
+            score += config.COVER_LOOK_WEIGHT * (
+                _clamped_grade(verdict) / look.GRADE_MAX
+            )
+        else:
+            # Not disqualifying. A run where the model dislikes every candidate
+            # must still ship a cover, and Instagram takes the first frame of
+            # the video when it is given none - which is a caption mid-sentence
+            # over whatever was on screen at 0.0s, and worse than all of them.
+            score -= config.COVER_LOOK_VETO
 
     # The assembler gave this shot a long slot, which means the beat it belongs
     # to had footage worth holding on.
@@ -2281,21 +2313,29 @@ def cover_score(shot: Shot, probe: dict) -> float:
     return round(score, 4)
 
 
-def plan_cover(shots: list[Shot], manifest: dict, probes: dict[int, dict], *,
-               card: str, card_seconds: float, font_file: Path | None,
-               source: str | None = None,
-               warnings: list[str] | None = None) -> dict | None:
-    """Choose the cover frame. Decides everything; writes nothing.
+def _clamped_grade(verdict: dict) -> float:
+    """A verdict's grade, trusted no further than the scale it is on."""
+    try:
+        return max(0.0, min(float(look.GRADE_MAX), float(verdict.get("grade") or 0)))
+    except (TypeError, ValueError):
+        return 0.0
 
-    Split from `write_cover` the way `plan_timeline` is split from `render`, so
-    the choice can be tested without an encoder and honoured by --dry-run.
 
-    Returns the cover record for assembly.json, or None when covers are off or
-    there is nothing to take one from.
+def cover_candidates(shots: list[Shot], *, card: str, card_seconds: float,
+                     font_file: Path | None, source: str | None = None,
+                     warnings: list[str] | None = None) -> dict:
+    """Which shots the cover could be taken from, and under what. Pure.
+
+    Split out of `plan_cover` so the shortlist can be rendered and looked at
+    before it is ranked. The two callers have to agree exactly: a preview of a
+    shot that was never in the running spends a model call on nothing, and one
+    rendered without the headline card the reel puts over it would be judged on
+    a frame the reel does not contain.
+
+    Returns the shortlist and everything decided on the way to it - which mode
+    was honoured, whether there is a card and whether it survives the crop.
     """
     notes = warnings if warnings is not None else []
-    if not config.COVER_ENABLED or not shots:
-        return None
 
     mode = str(source or config.COVER_SOURCE).strip().lower()
     if mode not in ("auto", "hook_card", "footage"):
@@ -2307,7 +2347,6 @@ def plan_cover(shots: list[Shot], manifest: dict, probes: dict[int, dict], *,
     clears, clearance = (card_clears_crop(card, font_file, aspect)
                          if has_card else (False, ""))
 
-    # --- which shot ---------------------------------------------------------
     window = max(0.0, config.COVER_SEARCH_SECONDS)
     early = [shot for shot in shots if shot.start < window] or [shots[0]]
 
@@ -2343,26 +2382,90 @@ def plan_cover(shots: list[Shot], manifest: dict, probes: dict[int, dict], *,
         pool = [shot for shot in early if shot.start >= card_seconds] or early
         reason = "the strongest footage shot near the top of the reel"
 
-    chosen = max(pool, key=lambda shot: (cover_score(shot, probes.get(shot.asset_index, {})),
-                                         -shot.index))
-    probe = probes.get(chosen.asset_index, {})
+    return {"pool": pool, "want_card": want_card, "reason": reason,
+            "mode": mode, "has_card": has_card, "clears": clears,
+            "aspect": aspect}
 
-    # --- which frame of it --------------------------------------------------
-    edge = min(_COVER_EDGE_SECONDS, chosen.duration / 3)
-    offset = min(max(chosen.duration * _COVER_SHOT_POSITION, edge),
-                 max(edge, chosen.duration - edge))
+
+def cover_frame_time(shot: Shot, *, card_seconds: float,
+                     want_card: bool) -> tuple[float, float]:
+    """Which frame of `shot` the cover is: (time in the reel, time in the file).
+
+    Stills have one frame; clips are seeked inside the same in-point the edit
+    uses, so the cover is a frame the reel genuinely contains.
+    """
+    edge = min(_COVER_EDGE_SECONDS, shot.duration / 3)
+    offset = min(max(shot.duration * _COVER_SHOT_POSITION, edge),
+                 max(edge, shot.duration - edge))
     if want_card:
         # Has to land while the card is actually up, or the cover is a frame of
         # footage with a headline pasted on that the viewer never sees.
-        offset = min(offset, max(edge, card_seconds - chosen.start - edge))
+        offset = min(offset, max(edge, card_seconds - shot.start - edge))
         offset = max(0.0, offset)
-    time = round(chosen.start + offset, 3)
-
-    # Stills have one frame; clips are seeked inside the same in-point the edit
-    # uses, so the cover is a frame the reel genuinely contains.
-    source_time = 0.0 if chosen.kind == "image" else round(
-        chosen.source_start + offset, 3
+    source_time = 0.0 if shot.kind == "image" else round(
+        shot.source_start + offset, 3
     )
+    return round(shot.start + offset, 3), source_time
+
+
+def cover_label(shot: Shot) -> str:
+    """What a candidate frame is called when it is put in front of the model.
+
+    The shot index rather than a letter, so a verdict read back into
+    assembly.json lines up against the timeline beside it without counting.
+    """
+    return f"shot {shot.index}"
+
+
+def plan_cover(shots: list[Shot], manifest: dict, probes: dict[int, dict], *,
+               card: str, card_seconds: float, font_file: Path | None,
+               source: str | None = None,
+               looks: dict[str, dict] | None = None,
+               warnings: list[str] | None = None) -> dict | None:
+    """Choose the cover frame. Decides everything; writes nothing.
+
+    Split from `write_cover` the way `plan_timeline` is split from `render`, so
+    the choice can be tested without an encoder and honoured by --dry-run.
+
+    `looks` is step 5b's verdict per candidate, keyed by `cover_label`, from
+    having been shown the rendered frames. It is passed in rather than fetched
+    here for the same reason `probes` is: this function stays pure, and a dry
+    run gets the whole decision without a model call or an encoder.
+
+    Returns the cover record for assembly.json, or None when covers are off or
+    there is nothing to take one from.
+    """
+    notes = warnings if warnings is not None else []
+    if not config.COVER_ENABLED or not shots:
+        return None
+
+    verdicts = looks or {}
+    choice = cover_candidates(shots, card=card, card_seconds=card_seconds,
+                              font_file=font_file, source=source,
+                              warnings=notes)
+    pool, want_card = choice["pool"], choice["want_card"]
+    aspect, reason = choice["aspect"], choice["reason"]
+
+    chosen = max(pool, key=lambda shot: (
+        cover_score(shot, probes.get(shot.asset_index, {}),
+                    verdicts.get(cover_label(shot))),
+        -shot.index,
+    ))
+    probe = probes.get(chosen.asset_index, {})
+    verdict = verdicts.get(cover_label(chosen))
+
+    if verdict and not verdict.get("ok", True):
+        # Either every candidate was vetoed, or the vetoed one still outscored
+        # the rest. Both mean the cover that ships is one the model said not to
+        # ship, which belongs in the warnings and not only in the JSON.
+        why = str(verdict.get("why") or "").strip()
+        notes.append(
+            f"the cover look would not ship any candidate; kept "
+            f"{cover_label(chosen)}" + (f" ({why})" if why else "")
+        )
+
+    time, source_time = cover_frame_time(chosen, card_seconds=card_seconds,
+                                         want_card=want_card)
 
     assets = manifest.get("assets") or []
     asset = (assets[chosen.asset_index]
@@ -2379,7 +2482,7 @@ def plan_cover(shots: list[Shot], manifest: dict, probes: dict[int, dict], *,
         "filename": config.COVER_FILENAME,
         "written": False,
         "source": "hook_card" if want_card else "footage",
-        "mode": mode,
+        "mode": choice["mode"],
         "reason": reason,
         "time": time,
         "source_time": source_time,
@@ -2392,12 +2495,91 @@ def plan_cover(shots: list[Shot], manifest: dict, probes: dict[int, dict], *,
         "depicts": depicts,
         "depicts_source": depicts_source,
         "safe_aspect": aspect,
-        "card_in_safe_band": clears if has_card else None,
-        "score": cover_score(chosen, probe),
+        "card_in_safe_band": choice["clears"] if choice["has_card"] else None,
+        "score": cover_score(chosen, probe, verdict),
+        # What the model said about the frame that shipped, and about the ones
+        # it beat. Both, because "this cover graded 3" is worth much less than
+        # "this cover graded 3 and the two it beat graded 1" - the second says
+        # whether the look changed the choice, which is the only way to find
+        # out later whether it was worth the call it costs.
+        "look": verdict,
+        "look_candidates": [
+            {"label": cover_label(shot), "shot_index": shot.index,
+             **(verdicts.get(cover_label(shot)) or {})}
+            for shot in pool
+        ] if verdicts else [],
         "width": config.VIDEO_WIDTH,
         "height": config.VIDEO_HEIGHT,
         "bytes": 0,
     }
+
+
+def _cover_frame_filters(width: int, height: int) -> list[str]:
+    """The scale-and-crop the cover is built with. One definition, two callers.
+
+    `write_cover` and `preview_cover_frames` have to agree or the look is
+    taken on a picture the cover is not: the same principle the hook card
+    already follows by being drawn through the same `build_ass` path as the
+    video's.
+    """
+    return [
+        f"scale={width}:{height}:force_original_aspect_ratio=increase"
+        f":flags=lanczos",
+        f"crop={width}:{height}",
+        "setsar=1",
+    ]
+
+
+def _render_cover_frame(shot: Shot, source_time: float, card_text: str,
+                        output: Path, *, font_name: str,
+                        font_file: Path | None, fonts_dir: Path | None,
+                        width: int, height: int, quality: int,
+                        ass_path: Path) -> list[str]:
+    """One frame of one shot, cropped and captioned the way the cover is.
+
+    Extracted from `write_cover` so candidate frames can be rendered before the
+    cover is chosen, through this exact code rather than something that looks
+    like it.
+    """
+    args = [ffmpeg_binary(), "-hide_banner", "-nostdin", "-y"]
+    if shot.kind != "image" and source_time > 0:
+        args += ["-ss", f"{source_time:.3f}"]
+    args += ["-i", str(shot.path)]
+
+    steps = _cover_frame_filters(width, height)
+
+    if card_text:
+        # A card-only subtitle file, built by the same function that builds the
+        # reel's - so the cover's headline wraps, shrinks and sits exactly where
+        # the video's does. No fade: this is one frame at t=0, which in the reel
+        # is the middle of the fade-in. libass carries the reference resolution
+        # as PlayRes and scales to whatever it is rendered at, so a preview at a
+        # smaller size gets the card at the same proportion of the frame.
+        ass_path.write_text(
+            build_ass([], font_name, font_file,
+                      hook=card_text, hook_seconds=1.0, hook_fade_ms=0),
+            encoding="utf-8",
+        )
+        burn = f"subtitles=filename={_filter_path(ass_path)}"
+        if fonts_dir is not None:
+            burn += f":fontsdir={_filter_path(fonts_dir)}"
+        steps.append(burn)
+
+    args += ["-vf", ",".join(steps), "-frames:v", "1", "-update", "1",
+             "-q:v", str(quality), str(output)]
+
+    try:
+        done = subprocess.run(
+            args, capture_output=True, text=True, errors="replace",
+            timeout=FFMPEG_TIMEOUT, cwd=str(config.BASE_DIR),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"could not write {output.name}: {exc}"]
+
+    if done.returncode != 0 or not output.is_file():
+        return [f"ffmpeg could not write {output.name}: "
+                + (done.stderr or "")[-400:].strip()]
+    return []
 
 
 def write_cover(cover: dict, shots: list[Shot], destination: Path, *,
@@ -2412,57 +2594,137 @@ def write_cover(cover: dict, shots: list[Shot], destination: Path, *,
     if shot is None:
         return ["the planned cover shot is not on the timeline"]
 
-    args = [ffmpeg_binary(), "-hide_banner", "-nostdin", "-y"]
-    if shot.kind != "image" and cover["source_time"] > 0:
-        args += ["-ss", f"{cover['source_time']:.3f}"]
-    args += ["-i", str(shot.path)]
-
-    width, height = config.VIDEO_WIDTH, config.VIDEO_HEIGHT
-    steps = [
-        f"scale={width}:{height}:force_original_aspect_ratio=increase"
-        f":flags=lanczos",
-        f"crop={width}:{height}",
-        "setsar=1",
-    ]
-
-    ass_path: Path | None = None
-    if cover["hook_card_text"]:
-        # A card-only subtitle file, built by the same function that builds the
-        # reel's - so the cover's headline wraps, shrinks and sits exactly where
-        # the video's does. No fade: this is one frame at t=0, which in the reel
-        # is the middle of the fade-in.
-        ass_path = destination / COVER_ASS_NAME
-        ass_path.write_text(
-            build_ass([], font_name, font_file,
-                      hook=cover["hook_card_text"], hook_seconds=1.0,
-                      hook_fade_ms=0),
-            encoding="utf-8",
-        )
-        burn = f"subtitles=filename={_filter_path(ass_path)}"
-        if fonts_dir is not None:
-            burn += f":fontsdir={_filter_path(fonts_dir)}"
-        steps.append(burn)
-
     output = destination / config.COVER_FILENAME
-    args += ["-vf", ",".join(steps), "-frames:v", "1", "-update", "1",
-             "-q:v", str(config.COVER_JPEG_QUALITY), str(output)]
-
-    try:
-        done = subprocess.run(
-            args, capture_output=True, text=True, errors="replace",
-            timeout=FFMPEG_TIMEOUT, cwd=str(config.BASE_DIR),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return [f"could not write the cover frame: {exc}"]
-
-    if done.returncode != 0 or not output.is_file():
-        return ["ffmpeg could not write the cover frame: "
-                + (done.stderr or "")[-400:].strip()]
+    problems = _render_cover_frame(
+        shot, cover["source_time"], cover["hook_card_text"], output,
+        font_name=font_name, font_file=font_file, fonts_dir=fonts_dir,
+        width=config.VIDEO_WIDTH, height=config.VIDEO_HEIGHT,
+        quality=config.COVER_JPEG_QUALITY,
+        ass_path=destination / COVER_ASS_NAME,
+    )
+    if problems:
+        return problems
 
     cover["path"] = str(output.resolve())
     cover["written"] = True
     cover["bytes"] = output.stat().st_size
     return []
+
+
+# ---------------------------------------------------------------------------
+# Frames for step 5b
+#
+# The only two places this project turns a video back into pictures. Both write
+# into a temporary directory and hand bytes to `look.py`, which is what keeps
+# the run directory free of a dozen JPEGs nobody will open: what is worth
+# keeping is the verdict, and that goes into assembly.json.
+# ---------------------------------------------------------------------------
+
+def _look_size() -> tuple[int, int]:
+    """The size a frame is sent at, keeping the output's own aspect."""
+    width = max(64, int(config.LOOK_FRAME_WIDTH))
+    height = max(2, round(width * config.VIDEO_HEIGHT / config.VIDEO_WIDTH))
+    return width, height - (height % 2)
+
+
+def preview_cover_frames(pool: list[Shot], *, card: str, card_seconds: float,
+                         want_card: bool, font_name: str,
+                         font_file: Path | None, fonts_dir: Path | None,
+                         ) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """Render the candidate covers so they can be looked at before choosing.
+
+    Returns (labelled JPEG bytes, warnings). Candidates past
+    COVER_LOOK_MAX_CANDIDATES are dropped from the end of `pool`, which arrives
+    in timeline order - so what is dropped is the latest in the reel, and the
+    top of the reel is where `cover_score` already prefers to look.
+
+    A shot that will not render is skipped rather than fatal. It keeps its
+    blind score and competes ungraded, and `look.judge_covers` says so.
+    """
+    if not pool:
+        return [], []
+
+    width, height = _look_size()
+    cap = max(1, int(config.COVER_LOOK_MAX_CANDIDATES))
+    shortlist = pool[:cap]
+    notes: list[str] = []
+    if len(pool) > cap:
+        notes.append(f"the cover look saw {cap} of {len(pool)} candidates "
+                     f"(COVER_LOOK_MAX_CANDIDATES)")
+
+    frames: list[tuple[str, bytes]] = []
+    with tempfile.TemporaryDirectory(prefix="cover-look-") as work:
+        work_dir = Path(work)
+        for shot in shortlist:
+            _, source_time = cover_frame_time(
+                shot, card_seconds=card_seconds, want_card=want_card
+            )
+            output = work_dir / f"candidate-{shot.index}.jpg"
+            problems = _render_cover_frame(
+                shot, source_time, card if want_card else "", output,
+                font_name=font_name, font_file=font_file, fonts_dir=fonts_dir,
+                width=width, height=height,
+                quality=config.LOOK_JPEG_QUALITY,
+                ass_path=work_dir / f"candidate-{shot.index}.ass",
+            )
+            if problems:
+                notes += problems
+                continue
+            frames.append((cover_label(shot), output.read_bytes()))
+    return frames, notes
+
+
+def sample_reel_frames(video_path: Path, duration: float, *,
+                       count: int | None = None,
+                       ) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """Take evenly spaced frames out of the finished reel.
+
+    Sampled at the midpoint of each equal slice rather than at the boundaries,
+    so neither the first nor the last frame is taken: the reel opens on a
+    fade-in and ends on a tail, and both would be graded as footage when they
+    are transitions.
+
+    Labels are timestamps, because that is what makes a verdict actionable -
+    "dark at 22.4s" names a shot on the timeline in assembly.json, where
+    "frame 4" names nothing.
+    """
+    wanted = int(config.REEL_LOOK_FRAMES if count is None else count)
+    if wanted < 1 or duration <= 0 or not Path(video_path).is_file():
+        return [], []
+
+    width, height = _look_size()
+    frames: list[tuple[str, bytes]] = []
+    notes: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="reel-look-") as work:
+        work_dir = Path(work)
+        for position in range(wanted):
+            at = duration * (position + 0.5) / wanted
+            output = work_dir / f"frame-{position}.jpg"
+            args = [
+                ffmpeg_binary(), "-hide_banner", "-nostdin", "-y",
+                "-ss", f"{at:.3f}", "-i", str(video_path),
+                "-vf", f"scale={width}:{height}:flags=lanczos",
+                "-frames:v", "1", "-update", "1",
+                "-q:v", str(config.LOOK_JPEG_QUALITY), str(output),
+            ]
+            try:
+                done = subprocess.run(
+                    args, capture_output=True, text=True, errors="replace",
+                    timeout=FFMPEG_TIMEOUT, cwd=str(config.BASE_DIR),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                notes.append(f"could not sample the reel at {at:.1f}s: {exc}")
+                continue
+            if done.returncode != 0 or not output.is_file():
+                notes.append(f"ffmpeg could not sample the reel at {at:.1f}s")
+                continue
+            frames.append((f"{at:.1f}s", output.read_bytes()))
+
+    if not frames and wanted:
+        notes.append("no frame of the finished reel could be read back; "
+                     "it ships ungraded")
+    return frames, notes
 
 
 # ---------------------------------------------------------------------------
@@ -3397,12 +3659,38 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
     # Planned here and written after the encode. A dry run gets the whole
     # decision - which shot, which frame, why - and no file, the same way it
     # gets a timeline and no .mp4.
+    #
+    # Step 5b goes first, because after the choice there is nothing left to
+    # choose: the candidates are rendered at look size and graded, and those
+    # verdicts are what `cover_score` weighs against its proxies. Skipped on a
+    # dry run - it costs an encoder pass and a model call, and a dry run is
+    # meant to cost neither.
+    cover_looks: dict[str, dict] = {}
+    if (cover is not False and config.COVER_ENABLED and shots and not dry_run
+            and config.LOOK_ENABLED and config.COVER_LOOK_ENABLED):
+        shortlist = cover_candidates(
+            shots, card=card, card_seconds=card_seconds,
+            font_file=font_file, source=cover,
+        )
+        previews, notes = preview_cover_frames(
+            shortlist["pool"], card=card, card_seconds=card_seconds,
+            want_card=shortlist["want_card"], font_name=font_name,
+            font_file=font_file, fonts_dir=fonts_dir,
+        )
+        warnings += notes
+        cover_looks, notes = look.judge_covers(
+            previews, topic=manifest.get("topic") or "", hook=card,
+        )
+        warnings += notes
+
     cover = None if cover is False else plan_cover(
         shots, manifest, probes, card=card, card_seconds=card_seconds,
-        font_file=font_file, source=cover, warnings=warnings,
+        font_file=font_file, source=cover, looks=cover_looks,
+        warnings=warnings,
     )
 
     # --- render ------------------------------------------------------------
+    reel_look = look.blank_grade()
     if dry_run:
         rendered = {"duration": total, "ok": False}
     else:
@@ -3431,6 +3719,22 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             warnings += write_cover(cover, shots, destination,
                                     font_name=font_name, font_file=font_file,
                                     fonts_dir=fonts_dir)
+
+        # --- step 5b: grade what was rendered, not what was planned --------
+        # Reads reel.mp4 back and changes nothing about it. The file is already
+        # on disk, so this cannot cost a reel - what it costs is the honesty of
+        # the row step 9 stores, which until now described the plan.
+        if config.LOOK_ENABLED and config.REEL_LOOK_ENABLED:
+            frames, notes = sample_reel_frames(
+                video_path, float(rendered.get("duration") or total)
+            )
+            warnings += notes
+            reel_look, notes = look.grade_reel(
+                frames,
+                topic=manifest.get("topic") or "",
+                script=str(manifest.get("script") or ""),
+            )
+            warnings += notes
 
     # --- carry step 4's attribution forward --------------------------------
     credits = collect_attribution(manifest, shots)
@@ -3468,6 +3772,10 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             "source": card_source,
         },
         "cover": cover,
+        # The only part of this file written by something that saw the video.
+        # Everything else here - the timeline, the stats, the shot list - is a
+        # record of what was asked for.
+        "look": reel_look,
         "sfx": [cue.to_dict() for cue in sfx_cues],
         "timeline": [
             {
@@ -3587,8 +3895,30 @@ def _print_result(assembly: dict) -> None:
               f"(shot {cover['shot_index']}, {cover['file'][:34]})"
               + ("" if cover["written"] else "  (dry run - not written)"))
         print(f"          {cover['reason']}")
+        seen = cover.get("look") or {}
+        if seen:
+            others = [entry for entry in cover.get("look_candidates") or []
+                      if entry.get("shot_index") != cover["shot_index"]
+                      and entry.get("grade") is not None]
+            against = (" (others "
+                       + "/".join(str(entry["grade"]) for entry in others) + ")"
+                       if others else "")
+            print(f"          looked at: {seen.get('grade')}/{look.GRADE_MAX}"
+                  + ("" if seen.get("ok", True) else " REJECTED")
+                  + f"{against} - {seen.get('why') or 'no reason given'}")
+
     elif config.COVER_ENABLED:
         print("COVER   : none")
+
+    graded = assembly.get("look") or {}
+    if graded.get("graded"):
+        problems = ", ".join(graded.get("problems") or []) or "nothing flagged"
+        print(f"LOOK    : {graded['grade']}/{look.GRADE_MAX} over "
+              f"{len(graded.get('frames') or [])} frames ({problems})")
+        if graded.get("summary"):
+            print(f"          {graded['summary']}")
+    elif config.LOOK_ENABLED and config.REEL_LOOK_ENABLED and not assembly["dry_run"]:
+        print("LOOK    : ungraded")
 
     if stats["file_bytes"]:
         print(f"SIZE    : {stats['file_bytes'] / 1024 / 1024:.1f} MB")
