@@ -45,8 +45,10 @@ python pipeline/perform.py --report                 # what that has added up to
 `script_gen.py` command for each — including how long that reel should be, in
 `-d`; `--take N` marks one as made so no later board offers it again,
 `--sources-status` shows which sources have their keys, `--no-probe` skips the
-stock-footage check, `--niche-mode` sets how hard the niche is enforced, and
-`--no-phrases` makes the whole step spend nothing on Gemini.
+stock-footage check, `--niche-mode` sets how hard the niche is enforced,
+`--no-curiosity` scores the board without the curiosity component — the `off`
+arm of `PERFORMANCE_EXPLORE=curiosity`, runnable by hand against an ordinary
+board — and `--no-phrases` makes the whole step spend nothing on Gemini.
 `python pipeline/script_gen.py` writes the script to
 `output/scripts/<topic-slug>.txt` and prints the exact `tts.py` command to run
 next; `-d` is the target length (step 0 suggests one per topic; without it the
@@ -1798,8 +1800,8 @@ says so about itself rather than reading as "nothing fired".
   ```
 
   `FOLLOWED` is said on its own line rather than folded into `ACTED`, because
-  it answers a different question â€” that line is what viewers did about a
-  *reel*, this is what they did about the *account* â€” and because it has a
+  it answers a different question — that line is what viewers did about a
+  *reel*, this is what they did about the *account* — and because it has a
   third state the others do not: **never asked for**. A zero and a blank lead
   to opposite decisions, so the line names which one it is rather than
   printing a number either way. Follows and profile visits are **not** netted
@@ -1847,20 +1849,65 @@ a day.
 
 `PERFORMANCE_EXPLORE` fixes it by varying one thing deliberately:
 
-| value | what alternates |
-|-------|-----------------|
-| `off` | nothing — the default |
-| `hook` | the hook pass runs on every other reel |
-| `structure` | the structure pass runs on every other reel |
-| `duration` | one step shorter, then one step longer than step 0 suggested |
+| value | what alternates | spent at |
+|-------|-----------------|----------|
+| `off` | nothing — the default | — |
+| `curiosity` | the curiosity component is charged on the board, or not | step 0 |
+| `hook` | the hook pass runs on every other reel | step 2 |
+| `structure` | the structure pass runs on every other reel | step 2 |
+| `takeaway` | the hand-over pass runs on every other reel | step 2 |
+| `duration` | one step shorter, then one step longer than step 0 suggested | step 2 |
+| `music` | a bed under every other reel, silence under the rest | step 5 |
+| `motion` | shots move on every other reel, are locked off on the rest | step 5 |
 
 Arms **alternate**; they are not randomised. At thirty observations randomising
 can hand you nineteen of one arm and eleven of the other by luck alone, which
 is not a comparison, and there is no second month to spend discovering that.
 
+**Why the third column matters, and why `curiosity` is the odd one.** The arm
+is spent by one of three functions, hours apart in a run: `arm_board` answers
+step 0 before there is a topic, `apply_arm` answers step 2 once there is one,
+and `arm_assembly` answers step 5 once the footage is down. Everything below
+`curiosity` in that table takes the topic as given and varies the *treatment* —
+a `hook` segment compares two ways of opening the same kind of reel.
+`curiosity` is the only arm that changes **which topic gets made**, so its
+segment answers a different question: not "was this reel treated better" but
+"did the board pick a better reel". `perform.BOARD_TRIALS` names that subset,
+and `run_once` chooses the arm before it builds the board rather than inside
+`_make_reel` where the others are chosen — an arm decided after the board has
+already been scored would be recorded as taken and have changed nothing.
+
+**Why there is a `curiosity` arm at all.** The reach exhibit below asked a
+question no table could answer. Across the eight reels posted by 2026-09-11 the
+board's own score did not order reach: the two reels carrying 353 of 381
+impressions scored 2.72 and 1.30 — the highest and the lowest in the file —
+while the five the board rated 1.80–1.90 reached 28 accounts between them. And
+`curiosity_component`, the one part of the score whose job is *will a stranger
+stop*, had fired on neither of the two that reached anybody and on three of the
+four worst. That is enough to stop trusting `CURIOSITY_SIGNAL_WEIGHT` and
+nowhere near enough to replace it.
+
+So the arm turns the component **off** rather than reweighting it. Any other
+number to compare 0.5 against would be a second prior invented to test the
+first, and the question being asked is precisely whether the first one earns
+its place. `score_candidate(..., curiosity=False)` drops the component
+entirely; `None` and `True` are both "charge it as usual", so the control arm
+is bit-for-bit what every other caller has always got. The margin is real
+enough to reorder a board — on the live corpus the component is worth 0.5 to
+1.0 against top scores that sit inside a point of each other — which matters,
+because a trial that never changes the pick is not a trial.
+
+`python pipeline/topics.py --no-curiosity` scores today's board the same way
+without waiting for the rota, so both boards can be read side by side in one
+sitting. Nothing else about the run changes: `apply_arm` and `arm_assembly`
+both return empty for a board trial, because an arm that moved step 2 as well
+would produce a segment answering two questions and readable as neither.
+
 ### Reading the report
 
-Four tables, because four different columns are being read:
+Six tables, in funnel order, because six different columns are being read —
+and one exhibit that is not a table at all, wedged in where the tables run out
+of evidence:
 
 ```
 WHY THEY WERE BINNED  (the same-day verdict; no API involved)
@@ -1915,11 +1962,11 @@ They are printed in that order on purpose, and it is the order the funnel
 happens in: a reel nobody was shown cannot be watched through, a reel nobody
 watched cannot be saved, and a reel nobody saved is not going to win a
 follower. Reading them bottom-up tells you which stage is actually costing you
-â€” and on a small account it is almost never the one the craft knobs move.
+— and on a small account it is almost never the one the craft knobs move.
 
 **Why there is an exhibit in the middle of the tables, and why it has no
-floors.** Every table here asks the same shape of question â€” does answering
-something one way beat answering it the other â€” and none of them prints until
+floors.** Every table here asks the same shape of question — does answering
+something one way beat answering it the other — and none of them prints until
 `PERFORMANCE_MIN_SAMPLES` reels have landed on *each* side. On 2026-09-11, with
 eight reels posted, the honest count was `READS: 0 comparable`: the freshness
 window took five reels read past 48h and one read at 18h, and the reach floor
@@ -1937,13 +1984,13 @@ has ever earned.** So `reach_exhibit` is deliberately not run through
   * **No freshness window.** The window exists so a ratio compares reels of a
     like age. Nothing in the exhibit is a ratio. A reel read at 167h did have
     longer to accumulate, which is why the read-age is printed in its own
-    column beside every row rather than used to drop it â€” at a spread of forty
+    column beside every row rather than used to drop it — at a spread of forty
     to one, read-age is not what separates the top of the list from the bottom,
     and filtering on it costs every observation there is in order to explain a
     difference it cannot account for.
   * **No reach floor.** `PERFORMANCE_MIN_REACH` keeps a reel out of the *ratio*
     tables because a denominator of three measures whoever happened to open the
-    app. As an observation *of* reach, three is not a weak reading â€” it is the
+    app. As an observation *of* reach, three is not a weak reading — it is the
     reading, and it is the one this account keeps getting.
   * **No sample floor.** Nothing here is read as an effect, so there is no n at
     which it turns trustworthy. The heading says `an exhibit and not a finding`
@@ -1955,7 +2002,7 @@ The components go on a line of their own under each reel, indented the way
 `WHY THEY WERE BINNED` indents its notes rather than aligned under the topic
 column. Alignment cost thirteen characters, and on the real corpus those
 thirteen characters were the difference between printing `curiosity
-(contradiction)` and printing `explainer shape, ...` â€” which is to say, the
+(contradiction)` and printing `explainer shape, ...` — which is to say, the
 difference between the column answering the question and the column being
 decorative. The full list is always in `--report --json`; the ellipsis only
 ever means the line ran out of room, and a name is cut at a comma and never
@@ -1965,7 +2012,7 @@ recognises rather than as a line that ran out.
 The last two lines are the point of the whole block, and they are two
 orderings printed side by side with nothing inferred from the pair. The board
 scores a topic and the exhibit ranks it by what it actually reached; if those
-agree, the two lines cost a glance. On the corpus above they do not â€” the
+agree, the two lines cost a glance. On the corpus above they do not — the
 board's own second favourite, at 1.90, reached six accounts, while the reel
 that reached 289 scored 2.72 and the reel that reached 64 scored **1.30, the
 lowest score in the file**. That is not enough to move a weight, and the report
@@ -1978,14 +2025,14 @@ What the exhibit changes is that the question became answerable, and
 `PERFORMANCE_EXPLORE=curiosity` is the answer to it: a board trial that charges
 the component on alternate days and drops it on the rest, so the next twenty
 reels settle by measurement what eight reels can only suggest. Waiting was the
-alternative, and waiting does not work here â€” left alone the board charges
+alternative, and waiting does not work here — left alone the board charges
 curiosity every single day, so the column is constant and no number of further
 reels gives it a second side. That is the failure `one_sided` exists to shout
 about, and it is why the fix for a weight nobody trusts is a trial and not a
 rewrite.
 
 A reel with no reach reading is counted in `unread` and never listed as a zero.
-Never asked is not nobody saw it â€” the same distinction `won_a_follow` makes
+Never asked is not nobody saw it — the same distinction `won_a_follow` makes
 one stage further down the funnel, and the one that hid the follows column for
 the entire life of the project.
 
@@ -2018,7 +2065,7 @@ finding.
 **Why FOLLOWED AFTER exists, and why it was blank until 2026-09-10.** Every
 other table here measures attention paid to one reel and spent there. A
 follower is the only outcome that survives the reel, and on an account at zero
-it is the only one that compounds â€” so it is the number that should have been
+it is the only one that compounds — so it is the number that should have been
 hardest to avoid printing, and it was the one nothing fetched. The ledger had
 carried a `follows` column since it was written and `--follows` had always
 parsed; `METRIC_MAP` in `pipeline/instagram.py`, the set `--fetch` actually
@@ -2032,7 +2079,7 @@ get a warning and the other seven metrics still come back. A profile visit
 counts alongside a follow because it is the same intent one step short of it,
 and because follows alone are too rare to move a table at this size. Like
 `SAVED OR SENT` this is a **rate**, not a metric, for exactly the reason set
-out above â€” and it distinguishes three states, not two: never read, read and
+out above — and it distinguishes three states, not two: never read, read and
 zero, and read and moving. The report says which out loud, both in the warnings
 and on the `FOLLOWED` summary line above the tables.
 

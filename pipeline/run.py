@@ -627,6 +627,19 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
             print(f"error: {exc}", file=sys.stderr)
             return finish("failed", _one_line(exc))
 
+    # --- the one thing this reel does differently -------------------------
+    # Chosen here rather than inside `_make_reel`, where it used to be, because
+    # the `curiosity` arm has to be decided before the board is built: it
+    # changes what step 0 charges, and so which topic wins. The later arms are
+    # spent exactly where they were - `apply_arm` at step 2, `arm_assembly` at
+    # step 5 - and now read a trial that was already settled rather than each
+    # asking for one. Deciding it once also means a run that falls through to
+    # a second candidate keeps the arm it started on, instead of re-deriving
+    # it from a count that has not moved.
+    trial = perform.choose_arm()
+    if trial:
+        record["trial"] = trial
+
     # --- step 0: what is this reel about? ---------------------------------
     step_started = time.monotonic()
     if topic:
@@ -638,6 +651,10 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
         _announce(1, "topics",
                   "scouting" + (" (no Gemini calls)" if no_phrases else ""))
         try:
+            if trial.get("name") in perform.BOARD_TRIALS:
+                _announce(1, "topics",
+                          f"trial \"{trial['name']}\": this board takes the "
+                          f"\"{trial['arm']}\" arm")
             board = topics.find_topics(
                 # Left on the configured modes even for a dry run. Turning
                 # step 0's Gemini calls off makes the scout free, and it also
@@ -647,6 +664,10 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
                 # make is worse than no preview.
                 phrases="heuristic" if no_phrases else None,
                 niche_match="terms" if no_phrases else None,
+                # A board trial is the one arm that changes what gets made
+                # rather than how it is made, so it is spent here, before a
+                # candidate exists to apply anything to.
+                **perform.arm_board(trial),
             )
         except (topics.TopicsError, config.MissingConfigError, ValueError) as exc:
             print(f"error: topics: {exc}", file=sys.stderr)
@@ -689,7 +710,7 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
                    "failed_at": "", "error": "", "refused_path": ""}
         record["attempts"].append(attempt)
         try:
-            _make_reel(record, candidate, duration=duration)
+            _make_reel(record, candidate, duration=duration, trial=trial)
         except _TOPIC_FAILURES as exc:
             step = _step_of(exc)
             attempt.update(failed_at=step, error=str(exc))
@@ -753,7 +774,8 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
     return finish("failed", last_error or "no candidate could be made")
 
 
-def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
+def _make_reel(record: dict, candidate: dict, *, duration: int | None,
+               trial: dict | None = None) -> None:
     """Steps 2-6 for one topic. Fills `record` as it goes.
 
     Written to mutate the record rather than return one so that a run which
@@ -770,14 +792,20 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None) -> None:
     target = duration if duration is not None else candidate.get("duration")
 
     # The one thing this reel does differently from the last one, so that step
-    # 9 has something to compare. Off by default; a trial only ever moves a
-    # choice the pipeline was otherwise making the same way every day.
-    trial = perform.choose_arm()
+    # 9 has something to compare. Chosen by `run_once` before the board was
+    # built and handed down; this is where the arms that act on a *chosen*
+    # topic are spent. Off by default; a trial only ever moves a choice the
+    # pipeline was otherwise making the same way every day.
+    trial = trial or {}
     if trial:
         target, hooks, shape, keep = perform.apply_arm(trial, duration=target)
         record["trial"] = trial
-        _announce(2, "script", f"trial \"{trial['name']}\": this reel takes "
-                               f"the \"{trial['arm']}\" arm")
+        # A board trial has already said its piece at step 1, where it was
+        # actually spent. Saying it again here would claim step 2 did
+        # something differently, and step 2 did not.
+        if trial.get("name") not in perform.BOARD_TRIALS:
+            _announce(2, "script", f"trial \"{trial['name']}\": this reel "
+                                   f"takes the \"{trial['arm']}\" arm")
     else:
         hooks = shape = keep = None
 

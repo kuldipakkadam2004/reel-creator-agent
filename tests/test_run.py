@@ -551,6 +551,75 @@ def test_no_phrases_also_applies_to_a_real_run(steps):
     assert steps.seen["find_topics_kwargs"]["phrases"] == "heuristic"
 
 
+def test_a_board_trial_arms_step_0_before_the_board_is_built(steps, monkeypatch):
+    """The curiosity arm has to be decided before `find_topics`, not after.
+
+    Every other arm takes the topic as given; this one changes which topic
+    wins, so a run that chose it where the others are chosen - inside
+    `_make_reel`, after the board had already been scored - would record an
+    arm it never actually took.
+    """
+    monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "curiosity")
+    monkeypatch.setattr(perform, "choose_arm",
+                        lambda *a, **k: {"name": "curiosity", "arm": "off",
+                                         "index": 1})
+
+    record = run.run_pipeline()
+
+    assert steps.seen["find_topics_kwargs"]["curiosity"] is False
+    assert record["trial"] == {"name": "curiosity", "arm": "off", "index": 1}
+
+
+def test_the_control_arm_of_a_board_trial_leaves_step_0_alone(steps, monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "curiosity")
+    monkeypatch.setattr(perform, "choose_arm",
+                        lambda *a, **k: {"name": "curiosity", "arm": "on",
+                                         "index": 0})
+
+    run.run_pipeline()
+
+    assert "curiosity" not in steps.seen["find_topics_kwargs"],         "the on arm is what every other caller gets, not an explicit True"
+
+
+def test_a_trial_on_something_else_never_reaches_the_board(steps, monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "hook")
+    monkeypatch.setattr(perform, "choose_arm",
+                        lambda *a, **k: {"name": "hook", "arm": "off",
+                                         "index": 1})
+
+    record = run.run_pipeline()
+
+    assert "curiosity" not in steps.seen["find_topics_kwargs"]
+    assert record["trial"]["name"] == "hook", "and it is still recorded"
+
+
+def test_a_board_trial_is_announced_where_it_is_spent(steps, monkeypatch, capsys):
+    """At step 1, and only there. Announcing it again at step 2 would claim
+    the script pass did something differently, and it did not."""
+    monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "curiosity")
+    monkeypatch.setattr(perform, "choose_arm",
+                        lambda *a, **k: {"name": "curiosity", "arm": "off",
+                                         "index": 1})
+
+    run.run_pipeline()
+    out = capsys.readouterr().out
+
+    assert out.count('trial "curiosity"') == 1
+    assert 'this board takes the "off" arm' in out
+
+
+def test_a_dry_run_previews_the_arm_it_would_have_taken(steps, monkeypatch):
+    """A preview scored on a different board is a preview of nothing."""
+    monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "curiosity")
+    monkeypatch.setattr(perform, "choose_arm",
+                        lambda *a, **k: {"name": "curiosity", "arm": "off",
+                                         "index": 1})
+
+    run.run_pipeline(dry_run=True)
+
+    assert steps.seen["find_topics_kwargs"]["curiosity"] is False
+
+
 def test_a_dry_run_ignores_the_once_per_day_guard(steps):
     run.run_pipeline()
     assert run.run_pipeline(dry_run=True)["status"] == "skipped"

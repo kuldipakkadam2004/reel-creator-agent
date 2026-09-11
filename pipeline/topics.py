@@ -2170,7 +2170,7 @@ def _parse_rfc822(raw: str):
 def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None,
                     banned: tuple[str, ...] = (), max_age_hours: float | None = None,
                     seen: bool = False, on_niche: bool | None = None,
-                    refused: int = 0) -> dict:
+                    refused: int = 0, curiosity: bool | None = None) -> dict:
     """Score one candidate. Higher is better.
 
     Returns the score and the parts it was built from. Sourceability is not
@@ -2192,6 +2192,13 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
     `refused` is how many drafts for this topic the fact-check has thrown away.
     It is charged once whatever the count, and the count itself is a filter in
     `find_topics` rather than more arithmetic here.
+
+    `curiosity` False stops the curiosity component being charged at all. It
+    exists for the `curiosity` arm of PERFORMANCE_EXPLORE, and it turns a
+    component off rather than reweighting it because the question the trial
+    asks is whether `CURIOSITY_SIGNAL_WEIGHT` is earning its place - and any
+    other number to compare it against would be a second prior invented to
+    test the first. None leaves it charged, which is every other caller.
     """
     topic = candidate.topic or candidate.title
     lowered = topic.lower()
@@ -2226,10 +2233,11 @@ def score_candidate(candidate: Candidate, *, niche_terms: set[str] | None = None
     elif fits is False:
         parts["off the niche"] = NICHE_MISS_PENALTY
 
-    curiosity, signals = curiosity_component(topic)
-    if signals:
-        # Named after what fired, so the printed board argues its own case.
-        parts[f"curiosity ({', '.join(signals)})"] = curiosity
+    if curiosity is not False:
+        worth, signals = curiosity_component(topic)
+        if signals:
+            # Named after what fired, so the printed board argues its own case.
+            parts[f"curiosity ({', '.join(signals)})"] = worth
 
     if hype_words(topic):
         parts["hype in the title"] = HYPE_PENALTY
@@ -3169,6 +3177,7 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
                 per_source: int | None = None, sourceability: str | None = None,
                 phrases: str | None = None, niche_mode: str | None = None,
                 niche_match: str | None = None, subreddits=None, keywords=None,
+                curiosity: bool | None = None,
                 ledger: TopicLedger | None = None) -> dict:
     """Scout topic candidates and return a ranked board.
 
@@ -3185,6 +3194,8 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
         niche_match: "llm" or "terms" - how on-niche is decided. Defaults to
             config.TOPIC_NICHE_MATCH.
         subreddits / keywords: override the reddit and youtube inputs.
+        curiosity: False stops the curiosity component being charged, which is
+            the "off" arm of the `curiosity` trial. See `score_candidate`.
         ledger: an open TopicLedger, for a caller running several boards.
 
     Returns:
@@ -3305,7 +3316,7 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
         result = score_candidate(
             candidate, niche_terms=niche_terms, banned=banned,
             seen=ledger.seen_recently(candidate.key), on_niche=verdict,
-            refused=ledger.refusals(candidate.key),
+            refused=ledger.refusals(candidate.key), curiosity=curiosity,
         )
         candidate.score = result["score"]
         candidate.components = result["components"]
@@ -3387,7 +3398,7 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
             candidate, niche_terms=niche_terms, banned=banned,
             seen=ledger.seen_recently(candidate.key),
             on_niche=verdict_by_key.get(candidate.key),
-            refused=ledger.refusals(candidate.key),
+            refused=ledger.refusals(candidate.key), curiosity=curiosity,
         )
         candidate.score = result["score"]
         candidate.components = result["components"]
@@ -3762,6 +3773,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="make no Gemini calls at all - keep the cleaned "
                              "headlines as topics and decide the niche on "
                              "words. Overridden by an explicit --niche-match")
+    parser.add_argument("--no-curiosity", action="store_true",
+                        help="score the board without the curiosity component, "
+                             "which is the 'off' arm of PERFORMANCE_EXPLORE="
+                             "curiosity. Run it against an ordinary board with "
+                             "--rescout to see whether the 0.5 changes who wins")
     parser.add_argument("--take", type=int, default=None, metavar="N",
                         help="mark candidate N as made, so no later board "
                              "offers it, and print its script_gen command")
@@ -3808,6 +3824,7 @@ def main(argv: list[str] | None = None) -> int:
                              or ("terms" if args.no_phrases else None)),
                 subreddits=args.subreddits,
                 keywords=args.keywords,
+                curiosity=False if args.no_curiosity else None,
             )
         except (ValueError, config.MissingConfigError, TopicsError) as exc:
             print(f"error: {exc}", file=sys.stderr)

@@ -417,6 +417,68 @@ def test_curiosity_counts_distinct_signals_not_repeated_ones():
     assert once[0] == twice[0] == topics.CURIOSITY_SIGNAL_WEIGHT
 
 
+def test_the_off_arm_does_not_charge_curiosity_at_all(ledger):
+    """The 'off' arm of PERFORMANCE_EXPLORE=curiosity, at the scorer.
+
+    Turned off rather than reweighted on purpose: the trial asks whether
+    CURIOSITY_SIGNAL_WEIGHT earns its place, and any other number to compare
+    0.5 against would be a second prior invented to test the first.
+    """
+    topic = candidate("why 90 percent of the deepest ocean is unexplored")
+
+    on = topics.score_candidate(topic)
+    off = topics.score_candidate(topic, curiosity=False)
+
+    assert any(key.startswith("curiosity") for key in on["components"])
+    assert not any(key.startswith("curiosity") for key in off["components"])
+    assert round(on["score"] - off["score"], 3) == round(
+        2 * topics.CURIOSITY_SIGNAL_WEIGHT, 3)
+
+
+def test_the_on_arm_is_exactly_what_every_other_caller_gets(ledger):
+    """None and True both mean "charge it" - there is no third state."""
+    topic = candidate("why 90 percent of the deepest ocean is unexplored")
+
+    assert (topics.score_candidate(topic, curiosity=None)["score"]
+            == topics.score_candidate(topic)["score"])
+    assert (topics.score_candidate(topic, curiosity=True)["score"]
+            == topics.score_candidate(topic)["score"])
+
+
+def test_turning_curiosity_off_leaves_every_other_component_alone():
+    """The arm has to move one thing, or its segment answers two questions."""
+    topic = candidate("why 90 percent of the deepest ocean is unexplored")
+
+    on = topics.score_candidate(topic)["components"]
+    off = topics.score_candidate(topic, curiosity=False)["components"]
+
+    assert {key: value for key, value in on.items()
+            if not key.startswith("curiosity")} == off
+
+
+def test_the_off_arm_can_change_which_candidate_wins():
+    """A trial that never changes the pick is not a trial.
+
+    One signal is worth 0.5 against a real board whose top scores sit inside a
+    point of each other, so the arm reorders it rather than nudging it - which
+    is the whole reason it is worth a day of the rota. The margin here is set
+    with `discussion`, the one component that takes a continuous value, so the
+    two candidates differ by 0.2 before curiosity is charged and by -0.3
+    after.
+    """
+    # 1.2 explainer + 0.3 discussion, and nothing curiosity can touch.
+    plain = candidate("how a river delta builds new land", comments=1, reach=20)
+    # 1.2 explainer + 0.5 for one contradiction signal.
+    curious = candidate("why the seasons are not caused by distance")
+
+    def winner(**kwargs):
+        return max(((topics.score_candidate(item, **kwargs)["score"], item.topic)
+                    for item in (plain, curious)))[1]
+
+    assert winner() == curious.topic
+    assert winner(curiosity=False) == plain.topic
+
+
 def test_a_superlative_inside_a_longer_word_is_not_a_superlative():
     """"epic" lives inside "epicentre", and on an earth-science account a
     substring match would fire on half the board."""

@@ -189,7 +189,24 @@ TRIALS = {
     # remedy.
     "music": ("on", "off"),
     "motion": ("on", "off"),
+    # The only trial that acts at step 0, before a word is written, and the
+    # only one whose arm changes *which topic gets made* rather than how a
+    # chosen topic is treated. It is here because the reach exhibit asked a
+    # question no table could answer: on the eight reels posted by
+    # 2026-09-11 the board's score did not order reach, and `curiosity` -
+    # the one component whose job is "will a stranger stop" - had fired on
+    # none of the reels that reached anybody. Rewriting the lexicon off eight
+    # rows would be inventing a finding; alternating it is how the ledger
+    # settles it instead.
+    "curiosity": ("on", "off"),
 }
+
+#: The trials whose arm is spent on the topic board, before there is a topic.
+#: They are called out separately because a run has to decide them earlier than
+#: the rest - `run_once` arms the board, where every other arm is applied once
+#: a candidate exists - and because their segment answers a different question:
+#: not "was this reel treated better" but "was a better reel picked".
+BOARD_TRIALS = ("curiosity",)
 
 
 class PerformanceError(RuntimeError):
@@ -1953,6 +1970,35 @@ def arm_assembly(trial: dict) -> dict:
         return {"music": False} if arm == "off" else {}
     if name == "motion":
         return {"motion": "off"} if arm == "off" else {}
+    return {}
+
+
+def arm_board(trial: dict) -> dict:
+    """What a trial arm changes about step 0, as keyword arguments for it.
+
+    The third of these, and the earliest: `arm_board` answers the topic board
+    before there is a topic, `apply_arm` answers step 2 once there is one, and
+    `arm_assembly` answers step 5 once the footage is down. They are three
+    functions and not one because a run spends them hours apart, and because
+    only this one can change what the reel is *about* - every other arm takes
+    the topic as given and varies the treatment.
+
+    That difference is worth stating plainly, because it changes how the
+    resulting segment reads. A `hook` arm compares two ways of opening the
+    same kind of reel. A `curiosity` arm compares two different *boards*, and
+    what it measures is not "does this wording do better" but "does charging
+    this component pick better topics" - which is the question the board's
+    weights have never been asked.
+
+    Anything not named here is left to config, which is what a trial on some
+    other question wants.
+    """
+    name, arm = (trial or {}).get("name"), (trial or {}).get("arm")
+    if name == "curiosity":
+        # False, not 0.0: `score_candidate` reads False as "do not charge it"
+        # and None as "charge it at CURIOSITY_SIGNAL_WEIGHT as usual". A zero
+        # weight would be a third state nothing else in the file has.
+        return {"curiosity": False} if arm == "off" else {}
     return {}
 
 

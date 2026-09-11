@@ -1787,6 +1787,55 @@ def test_the_music_and_motion_arms_alternate_like_the_rest(paths):
     assert perform.choose_arm("music", ledger=ledger)["arm"] == "off"
 
 
+def test_a_curiosity_arm_is_spent_on_the_board_and_nowhere_else(paths):
+    """The only arm that acts at step 0, so it must not act anywhere else.
+
+    If it also moved step 2 or step 5, its segment would be answering two
+    questions and could not be read as either.
+    """
+    off = {"name": "curiosity", "arm": "off"}
+
+    assert perform.arm_board(off) == {"curiosity": False},         "False is 'do not charge it'; None is 'charge it as usual'"
+    assert perform.arm_board({"name": "curiosity", "arm": "on"}) == {}
+    assert perform.apply_arm(off, duration=40) == (40, None, None, None)
+    assert perform.arm_assembly(off) == {}
+
+
+def test_a_trial_on_something_else_changes_nothing_about_the_board(paths):
+    assert perform.arm_board({"name": "hook", "arm": "off"}) == {}
+    assert perform.arm_board({"name": "music", "arm": "off"}) == {}
+    assert perform.arm_board({}) == {}
+
+
+def test_the_curiosity_arm_alternates_like_the_rest(paths):
+    ledger = _ledger(_features("r1", trial={"name": "curiosity", "arm": "on"}))
+
+    assert perform.choose_arm("curiosity", ledger=ledger)["arm"] == "off"
+
+
+def test_every_board_trial_is_a_trial(paths):
+    """BOARD_TRIALS names a subset, and a name in it that nothing alternates
+    would be a trial the rota skips and the report still offers."""
+    assert set(perform.BOARD_TRIALS) <= set(perform.TRIALS)
+    for name in perform.BOARD_TRIALS:
+        assert perform.arm_board({"name": name, "arm": "off"}),             f"{name} is named a board trial and arms nothing"
+
+
+def test_the_report_offers_the_curiosity_arm_by_name(paths):
+    """The warning that names PERFORMANCE_EXPLORE reads TRIALS, so a trial
+    added without touching that sentence is still offered - which is the bug
+    music and motion were added to fix."""
+    ledger = _corpus(4)
+    for day in range(4):
+        ledger.record(f"r{day}", {"watch_ratio": 0.5, "reach": 40})
+
+    data = perform.report(ledger=ledger, min_samples=1)
+    named = [warning for warning in data["warnings"]
+             if "PERFORMANCE_EXPLORE=" in warning]
+
+    assert named and "curiosity" in named[0]
+
+
 # ---------------------------------------------------------------------------
 # How many people saw it, and when it went out
 # ---------------------------------------------------------------------------
