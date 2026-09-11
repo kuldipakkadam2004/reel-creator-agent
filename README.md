@@ -1837,7 +1837,36 @@ says so about itself rather than reading as "nothing fired".
   it was judged on forever. A posted reel is asked about again until its
   reading is `PERFORMANCE_SETTLE_HOURS` (36) old, and each answer is *appended*
   — `measurements` holds what the reel had at every age it was read at, which
-  is worth more than the last number alone.
+  is worth more than the last number alone;
+* **the screen says when each reel is due, because the window is easy to
+  miss.** Those three constants describe a window that opens once per reel and
+  never reopens, and `unsettled` already selected on it exactly — but nothing
+  ever said the hour out loud, so read by hand it had to be worked out in
+  somebody's head. It wasn't. The two reels read after the insights loop went
+  live were read at **18h** and **26h**: one comparable by luck, one not
+  comparable at all.
+
+  Worse, the screen listed `pending` while `--fetch` asked about `unsettled`,
+  and those are different sets. A reel that was posted and read too early is
+  still waiting for the reading that counts — and it was not on the screen.
+  Read on 2026-09-11 that hid a reel six hours from the end of its window;
+  read again in time, `why-some-trees` went from **reach 7 to reach 20**. The
+  same reel. The 18h reading was not a weak result, it was an early one.
+
+  ```
+  WAITING FOR NUMBERS   (1 ready to read now)
+    2026-09-10   what-is-a-bedrock-and-glacial-collapse-291cef1a
+      what is a bedrock and glacial collapse
+      read at 17.3h, too early - ripe in 6h42m, then 1d to read it
+  ```
+
+  Five states, and `missed` is the one worth naming: a reel never read inside
+  24–48h cannot be compared however many times it is read afterwards, so the
+  line says so rather than printing a due time that has already passed.
+  `done` and `missed` are both terminal and they are not the same outcome.
+  A reel nothing has recorded as posted gets **no** due hour at all —
+  `posted_at` falls back to when the reel was *made*, and naming an hour off
+  that would dress a guess up as a clock.
 
 ### Without a trial there is nothing to compare
 

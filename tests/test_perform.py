@@ -883,6 +883,104 @@ def test_the_settle_ceiling_still_stops_the_asking(paths):
     assert not ledger.unsettled(settle_hours=36)
 
 
+# ---------------------------------------------------------------------------
+# When a reel is due to be read
+# ---------------------------------------------------------------------------
+
+NOW = datetime(2026, 9, 11, 5, 12, tzinfo=timezone.utc)
+
+
+def _went_out(hours_ago: float, read_at: float | None = None, **extra) -> dict:
+    """A posted reel that went out `hours_ago`, optionally already read once."""
+    row = {
+        "run_id": "r0",
+        "status": "posted",
+        "posted_at": (NOW - timedelta(hours=hours_ago)).isoformat(),
+        "hours_after_post": read_at,
+    }
+    row.update(extra)
+    return row
+
+
+def test_a_reel_too_young_to_read_says_when_it_will_be_ripe(paths):
+    window = perform.read_window(_went_out(17.3, read_at=17.3), now=NOW)
+
+    assert window["state"] == "early"
+    assert window["opens_in"] == pytest.approx(6.7, abs=0.1)
+    assert "ripe in 6h42m" in perform.read_due_line(_went_out(17.3, read_at=17.3), NOW)
+
+
+def test_a_reel_inside_its_window_says_read_it_now(paths):
+    row = _went_out(41.4, read_at=18.1)
+
+    window = perform.read_window(row, now=NOW)
+
+    assert window["state"] == "ripe"
+    assert window["shuts_in"] == pytest.approx(6.6, abs=0.1)
+    assert "READ NOW" in perform.read_due_line(row, NOW)
+
+
+def test_a_reel_past_its_window_says_so_rather_than_going_quiet(paths):
+    """The state worth naming: nothing can be done, and that is the point.
+
+    A reel that was never read inside 24-48h cannot be compared with the rest
+    however many times it is read afterwards, so the screen has to say that out
+    loud instead of printing a due time that has already passed.
+    """
+    row = _went_out(70.0, read_at=5.6)
+
+    window = perform.read_window(row, now=NOW)
+
+    assert window["state"] == "missed"
+    assert "no longer be compared" in perform.read_due_line(row, NOW)
+
+
+def test_a_reel_already_read_inside_the_window_is_done(paths):
+    row = _went_out(96.0, read_at=41.4)
+
+    assert perform.read_window(row, now=NOW)["state"] == "done"
+
+
+def test_an_assumed_posting_time_is_not_a_clock(paths):
+    """`posted_at` falls back to when the reel was *made*, which is a guess.
+
+    Naming a due hour off it would dress that guess up as a measurement, and
+    the hour is the whole reason this exists.
+    """
+    row = _went_out(30.0, read_at=None, posted_at_assumed=True)
+
+    assert perform.read_window(row, now=NOW)["state"] == "unposted"
+
+
+def test_a_reel_nothing_has_posted_has_no_window_yet(paths):
+    row = {"run_id": "r0", "status": "pending"}
+
+    window = perform.read_window(row, now=NOW)
+
+    assert window["state"] == "unposted"
+    assert "not recorded as posted" in perform.read_due_line(row, NOW)
+
+
+def test_the_screen_lists_a_posted_reel_that_was_read_too_early(paths, capsys):
+    """The defect this whole readout exists for.
+
+    The screen listed `pending` and `--fetch` asked about `unsettled`, and
+    those are different sets: a reel posted and read at 18h is waiting for the
+    reading that counts, and the screen left it out entirely. Measured on
+    2026-09-11 that was a reel six hours from the end of a window nothing had
+    named - and read again in time, it went from reach 7 to reach 20.
+    """
+    ledger = _corpus(2)
+    ledger.record("r0", {"views": 11})
+    ledger.entry("r0")["hours_after_post"] = 18.1   # posted, and read too early
+    ledger.entry("r0")["posted_at_assumed"] = False
+
+    perform._print_pending(ledger)
+
+    printed = capsys.readouterr().out
+    assert "r0" in printed, "the reel --fetch would ask about was not listed"
+
+
 def test_re_reading_keeps_the_earlier_reading(paths):
     ledger = _corpus(1)
     ledger.record("r0", {"views": 3})

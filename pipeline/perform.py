@@ -55,7 +55,7 @@ import argparse
 import json
 import statistics
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
 
@@ -2120,31 +2120,171 @@ def fetch(*, ledger: PerformanceLedger | None = None, provider=None,
 RULE = "-" * 78
 
 
+def _hours_words(hours: float) -> str:
+    """`6.73` as `6h44m`. Minutes, because the last hour of a window matters."""
+    if hours < 0:
+        hours = 0.0
+    whole = int(hours)
+    minutes = int(round((hours - whole) * 60))
+    if minutes == 60:
+        whole, minutes = whole + 1, 0
+    if whole >= 24:
+        days, spare = divmod(whole, 24)
+        return f"{days}d{spare}h" if spare else f"{days}d"
+    return f"{whole}h{minutes:02d}m"
+
+
+def read_window(row: dict, now: datetime | None = None) -> dict:
+    """When this reel should be read, and whether that moment has come.
+
+    Every part of this was already in the ledger - when the reel went out, how
+    old its last reading is, and the two constants that bound a comparable
+    reading - and `unsettled` already selects on it. What nothing did was say
+    it out loud, so read by hand the window had to be worked out in the head of
+    whoever remembered to look. The two reels read since the insights loop went
+    live were read at 18h and 26h: one comparable by luck and one not
+    comparable at all. That is not a small loss - read at 18h,
+    `why-some-trees` was reach 7; the same reel read again at 41h was reach 20.
+
+    `state` is one of:
+
+      unposted  nothing has recorded it as posted, so there is no clock yet
+      early     too young to read, and `opens_in` hours from being worth it
+      ripe      read it now; `shuts_in` hours before it stops counting
+      missed    the window shut with no comparable reading, and will not reopen
+      done      it already has a reading inside the window; nothing to do
+
+    `done` and `missed` are both terminal, and they are different: one of them
+    is a measurement and the other is a reel that can never be compared with
+    the rest, however many times it is read afterwards.
+    """
+    now = now or datetime.now(timezone.utc)
+    opens = float(config.PERFORMANCE_MIN_AGE_HOURS)
+    shuts = float(config.PERFORMANCE_WINDOW_HOURS)
+    blank = {"state": "", "age": None, "opens_in": None, "shuts_in": None,
+             "opens_at": None, "shuts_at": None, "reading": None}
+
+    reading = row.get("hours_after_post")
+    reading = None if reading is None else float(reading)
+    status = row.get("status", "pending")
+
+    # A reading at or past the lower edge is the one the report will use and
+    # `unsettled` retires the reel on it, so there is no window left to report.
+    if status == "posted" and reading is not None and reading >= opens:
+        return {**blank, "state": "done", "reading": reading}
+
+    # An assumed posting time is the time the reel was *made*. Naming a due
+    # hour off it would dress a guess up as a clock, and the clock is the whole
+    # point of this - so a reel nothing has posted has no window, it has a
+    # missing fact, and the line says which.
+    posted = None
+    if status == "posted" and not row.get("posted_at_assumed"):
+        posted = _parse_stamp(row.get("posted_at"))
+    if posted is None:
+        return {**blank, "state": "unposted", "reading": reading}
+
+    age = (now - posted).total_seconds() / 3600.0
+    window = {
+        "age": age,
+        "reading": reading,
+        "opens_at": posted + timedelta(hours=opens),
+        "shuts_at": posted + timedelta(hours=shuts),
+    }
+    if age < opens:
+        return {**window, "state": "early",
+                "opens_in": opens - age, "shuts_in": shuts - age}
+    if age <= shuts:
+        return {**window, "state": "ripe",
+                "opens_in": 0.0, "shuts_in": shuts - age}
+    return {**window, "state": "missed", "opens_in": 0.0, "shuts_in": 0.0}
+
+
+def read_due_line(row: dict, now: datetime | None = None) -> str:
+    """`read_window` as the one line that goes under a reel on the screen."""
+    return _due_words(read_window(row, now))
+
+
+def _due_words(window: dict) -> str:
+    """The line, from a window that has already been computed."""
+    state = window["state"]
+    reading = window["reading"]
+    was = ("never read" if reading is None
+           else f"read at {reading:g}h, too early")
+
+    if state == "unposted":
+        return "not recorded as posted - nothing is counting yet"
+    if state == "early":
+        return (f"{was} - ripe in {_hours_words(window['opens_in'])}, "
+                f"then {_hours_words(window['shuts_in'] - window['opens_in'])} "
+                f"to read it")
+    if state == "ripe":
+        return (f"{was} - READ NOW, the window shuts in "
+                f"{_hours_words(window['shuts_in'])}")
+    if state == "missed":
+        return (f"{was} - the window shut "
+                f"{_hours_words(window['age'] - float(config.PERFORMANCE_WINDOW_HOURS))}"
+                f" ago; it can no longer be compared")
+    if state == "done":
+        return f"read at {reading:g}h - comparable, nothing to do"
+    return ""
+
+
+#: The order the screen puts them in. Not the order they were made: a window
+#: that shuts today outranks one that opens tomorrow, and `missed` sits at the
+#: bottom because nothing can be done about it.
+_DUE_ORDER = {"ripe": 0, "early": 1, "unposted": 2, "missed": 3, "done": 4}
+
+
 def _print_pending(ledger: PerformanceLedger, limit: int = 14) -> None:
-    """What is waiting for numbers, and the command that records each one."""
+    """What is waiting for numbers, when each is due, and the command for it.
+
+    Listed off `unsettled` and not off `pending`, which is the fix here. Those
+    two are different sets and the screen was showing the smaller one: a reel
+    that was posted and read too early is still waiting for the reading that
+    counts, `--fetch` asks about it, and the screen left it out entirely. Read
+    on 2026-09-11 the difference was the whole story - one reel listed, and a
+    second one six hours from the end of a window nothing had mentioned.
+    """
     rows = ledger.rows()
     if not rows:
         print("no reels recorded yet.")
         print("  python pipeline/run.py     makes one, and registers it here")
         return
 
-    waiting = ledger.pending()[-limit:]
+    now = datetime.now(timezone.utc)
+    # Paired with its window once, because `read_window` reads the clock and a
+    # row sorted by one call and printed by another can disagree with itself.
+    due = [(row, read_window(row, now)) for row in ledger.unsettled()]
+    due.sort(key=lambda pair: (_DUE_ORDER.get(pair[1]["state"], 9),
+                               -(pair[1]["age"] or 0.0)))
+    due = due[:limit]
+
     print(f"{len(rows)} reel(s) known: "
           f"{sum(1 for r in rows if r.get('status') == 'posted')} posted, "
           f"{sum(1 for r in rows if r.get('status') == 'skipped')} skipped, "
-          f"{len(ledger.pending())} waiting.")
-    if not waiting:
-        print("nothing is waiting. python pipeline/perform.py --report")
+          f"{len(ledger.pending())} never recorded as posted.")
+    if not due:
+        print("every posted reel has a reading inside its window. "
+              "python pipeline/perform.py --report")
         return
 
+    ripe = sum(1 for _, window in due if window["state"] == "ripe")
     print(RULE)
-    print("WAITING FOR NUMBERS")
-    for row in waiting:
+    print(f"WAITING FOR NUMBERS   ({ripe} ready to read now)"
+          if ripe else "WAITING FOR NUMBERS")
+    for row, window in due:
         features = row.get("features") or {}
         print(f"  {features.get('day', '?'):<12} {row['run_id']}")
         print(f"    {features.get('topic') or '(no topic recorded)'}")
+        print(f"    {_due_words(window)}")
     print(RULE)
-    example = waiting[-1]["run_id"].rsplit("-", 1)[-1]
+    print(f"a reading counts only between {config.PERFORMANCE_MIN_AGE_HOURS}h "
+          f"and {config.PERFORMANCE_WINDOW_HOURS}h after posting, and each reel "
+          f"gets one shot at it")
+    if config.PERFORMANCE_PROVIDER:
+        print("  python pipeline/perform.py --fetch"
+              "        reads every one of them off Instagram")
+    example = due[-1][0]["run_id"].rsplit("-", 1)[-1]
     print("record how one did, or that it never went out:")
     print(f"  python pipeline/perform.py {example} --views 4200 --watched 61 --saves 30")
     print(f"  python pipeline/perform.py {example} --skipped footage"
