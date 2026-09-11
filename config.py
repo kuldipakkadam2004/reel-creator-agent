@@ -821,12 +821,31 @@ VISUAL_PROVIDER_KEYS: dict[str, tuple[str, ...]] = {
     "nasa": (),
 }
 
-#: Resolution floor, measured AFTER a centre crop to the 9:16 frame: a 4K
-#: landscape clip passes (2160px tall leaves 1215px of width), a 1920x1080 one
-#: does not (1080px tall leaves only 608px). Set below VIDEO_* to accept
-#: footage that will be upscaled slightly.
-VISUAL_MIN_WIDTH = get_env_int("VISUAL_MIN_WIDTH", VIDEO_WIDTH)
-VISUAL_MIN_HEIGHT = get_env_int("VISUAL_MIN_HEIGHT", VIDEO_HEIGHT)
+#: Resolution floor, measured AFTER a centre crop to the 9:16 frame.
+#:
+#: 608x1080 is exactly what an ordinary 1920x1080 source leaves after the crop,
+#: and the default is that rather than VIDEO_* because the number describes the
+#: shape of the stock libraries, not the shape of the output: 16:9 1080p is what
+#: most of the world uploads, and a floor at the frame excludes all of it.
+#:
+#: This used to default to VIDEO_*, and the cost was measured over the 30 run
+#: manifests on disk: the floor rejected 1,169 candidates against 60 for every
+#: other reason combined, while only 468 clips were ever placed. It discarded
+#: 2.5x more footage than the pipeline used, and 93% of that was 1080p
+#: landscape. Relaxing it partway is pointless - the distribution is bimodal, so
+#: a 90% floor recovers 42 where this recovers 1,088.
+#:
+#: Raising it back is safe to try and worth understanding first. The floor was
+#: doing `score_candidate`'s job: that scorer already pays portrait 3.0 against
+#: landscape 0.0 plus a resolution term, so a native vertical 1080p clip scores
+#: 9.28 against 5.50 for a 1920x1080 one - a gap that WIDENS at this floor.
+#: Upscaled landscape is therefore admitted but ranked last, and can only reach
+#: a beat that had nothing sharp and on-topic to show. What that beat got under
+#: the old floor was not a better clip; it was an off-topic neutral shot, or its
+#: seconds absorbed by a neighbour. Genuinely poor sources still die here: 720p
+#: landscape crops to 405x720 and is rejected.
+VISUAL_MIN_WIDTH = get_env_int("VISUAL_MIN_WIDTH", 608)
+VISUAL_MIN_HEIGHT = get_env_int("VISUAL_MIN_HEIGHT", 1080)
 
 
 def _parse_provider_floors(raw: str | None) -> dict[str, tuple[int, int]]:
@@ -852,14 +871,26 @@ def _parse_provider_floors(raw: str | None) -> dict[str, tuple[int, int]]:
 #: Per-provider overrides of the floor above, as `name:WIDTHxHEIGHT` pairs.
 #:
 #: Providers do not all draw from the same shaped library, so one number cannot
-#: serve them all. Pexels and Pixabay are portrait-first and clear 1080x1920
-#: comfortably. YouTube is a 16:9 library, where clearing it means being
-#: genuinely 4K - a slice small enough to make the provider barely worth
-#: enabling. Hence the default below: 608x1080 is exactly what a 1920x1080
-#: source leaves after the 9:16 crop, so ordinary 1080p uploads qualify and are
-#: upscaled ~78% in the final frame. That is a real quality cost, and it is
-#: confined to the one provider that needs it - dropping VISUAL_MIN_WIDTH
-#: instead would have let weaker stock back in everywhere.
+#: serve them all - a provider whose catalogue is a different shape from the
+#: rest wants its own bar rather than an argument about the global one.
+#:
+#: The youtube entry below is now the same value as VISUAL_MIN_* and so does
+#: nothing at the shipped default. It is kept because it stops meaning nothing
+#: the moment the global floor is raised, which is the case it was written for.
+#:
+#: It used to carry the argument for keeping the global floor at the frame:
+#: that admitting 1080p landscape everywhere "would have let weaker stock back
+#: in everywhere", so the exception belonged to the one provider that needed it.
+#: The premise is that admitting a clip means using it, and `score_candidate`
+#: makes that false - it ranks a native vertical clip 3.78 above a cropped
+#: 1920x1080 one, so weaker stock is admitted to the bottom of the ranking and
+#: surfaces only where nothing better exists. Measured, the old global floor was
+#: not protecting quality; it was discarding 1,169 candidates against 60 for
+#: every other reason. See VISUAL_MIN_WIDTH above.
+#:
+#: The other half of that comment was wrong on its facts: Pixabay is not
+#: portrait-first and its photos never cleared 1080x1920 at all - every one is
+#: capped at a 1280px longest edge before it gets here.
 VISUAL_PROVIDER_FLOORS = _parse_provider_floors(
     get_env("VISUAL_PROVIDER_FLOORS", "youtube:608x1080")
 )

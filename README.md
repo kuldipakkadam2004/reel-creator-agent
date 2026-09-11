@@ -933,8 +933,12 @@ of downloaded assets and a `manifest.json` for step 5.
   had. An earlier draft rejected both and left three beats of a ten-beat reel
   with nothing at all;
 * candidates are filtered by a **crop-aware resolution floor**: the test is what
-  survives a centre crop to 9:16, so a 4K landscape clip passes and a 1080p one
-  does not;
+  survives a centre crop to 9:16, so the bar is 608x1080 — what an ordinary
+  1920x1080 source leaves after that crop. It used to be the full 1080x1920
+  frame, which over 30 runs rejected 1,169 candidates against 60 for every
+  other reason combined, while 468 were placed in all. Footage that has to be
+  upscaled is admitted but ranked last, so it only reaches a beat with nothing
+  sharp and on-topic to show;
 * **the opening beat is not scored like the others.** Everywhere else a still is
   honest filler; on the first shot it is the reel announcing that nothing is
   going to happen, over the second and a half in which the viewer decides. Beat
