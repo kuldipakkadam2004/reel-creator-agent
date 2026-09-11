@@ -305,6 +305,7 @@ def ledger_entry(record: dict) -> dict:
         "log_path": record.get("log_path") or "",
         "scheduled": bool(record.get("scheduled")),
         "tts_characters": (record.get("spend") or {}).get("tts_characters", 0),
+        "gemini": (record.get("spend") or {}).get("gemini") or {},
         "attempts": len(record.get("attempts") or []),
     }
 
@@ -528,7 +529,8 @@ def new_record(*, scheduled: bool = False, dry_run: bool = False,
         "duration_seconds": None,
         "attempts": [],
         "steps": {},
-        "spend": {"tts_characters": 0, "downloaded_bytes": 0},
+        "spend": {"tts_characters": 0, "downloaded_bytes": 0,
+                  "gemini": {}},
         "warnings": [],
     }
 
@@ -593,12 +595,19 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
     """
     started = time.monotonic()
     record = new_record(scheduled=scheduled, dry_run=dry_run, log_path=log_path)
+    # Zeroed here rather than at import, so a second run in the same process -
+    # the tests, and `--attempts 2` after a refusal - does not inherit the
+    # first one's tokens.
+    script_gen.USAGE.reset()
 
     def finish(status: str, reason: str = "") -> dict:
         record["status"] = status
         record["reason"] = reason
         record["seconds"] = round(time.monotonic() - started, 1)
         record["finished_at"] = _now()
+        # Read on every exit, not just the happy one: a run that refused three
+        # scripts and gave up is exactly the run worth knowing the cost of.
+        record["spend"]["gemini"] = script_gen.USAGE.as_dict()
         _collect(record, "ledger", append_run(record, ledger_path))
         return record
 
@@ -993,6 +1002,14 @@ def _print_summary(record: dict) -> None:
         print(f"SPENT   : {record['spend']['tts_characters']} ElevenLabs "
               f"characters, {record['spend']['downloaded_bytes'] / 1024 / 1024:.1f} MB "
               f"of footage")
+    gemini = record["spend"].get("gemini") or {}
+    if gemini.get("calls"):
+        # Thinking is billed at the output rate and is most of the output, so
+        # it is named rather than folded silently into the total.
+        print(f"TOKENS  : {gemini['calls']} Gemini call(s), "
+              f"{gemini['input_tokens']:,} in / {gemini['output_tokens']:,} out"
+              + (f" (of which {gemini['thinking_tokens']:,} thinking)"
+                 if gemini.get("thinking_tokens") else ""))
     if len(record["attempts"]) > 1:
         print(f"TOPICS  : {len(record['attempts'])} tried - "
               + "; ".join(f"{a['topic']} ({a['status']})"

@@ -798,7 +798,12 @@ VIDEO_FPS = get_env_int("VIDEO_FPS", 30)
 #:   nasa      - photo only, NO KEY NEEDED, public domain. Off by default
 #:               because it only has anything to say about space and earth
 #:               science - on a matching account it is the best source here.
-VISUAL_PROVIDERS = get_env_list("VISUAL_PROVIDERS", "pexels,pixabay,openverse")
+#: Named rather than inlined so the shipped default can be asserted on without
+#: reading whichever .env happens to be on the machine - a test that checks
+#: VISUAL_PROVIDERS for what is off by default is testing the operator, and
+#: fails the moment one of them opts in.
+VISUAL_PROVIDERS_DEFAULT = "pexels,pixabay,openverse"
+VISUAL_PROVIDERS = get_env_list("VISUAL_PROVIDERS", VISUAL_PROVIDERS_DEFAULT)
 
 #: STOCK_API_KEY was the step-1 placeholder; still honoured as the Pexels key so
 #: an .env written before the provider was chosen keeps working.

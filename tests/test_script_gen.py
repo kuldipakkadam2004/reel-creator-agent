@@ -1566,6 +1566,108 @@ def test_the_bare_figure_trim_still_respects_the_floor():
     assert script_gen.hook_card_text("Only 400,000") == "Only 400,000"
 
 
+def test_a_spelled_out_figure_is_a_bare_figure_too():
+    """The shipped case, from the sunflower sea star reel on 2026-09-11.
+
+    Step 2 writes what step 3 has to pronounce, so a narration script states
+    its quantities in words and never in digits - which made the digit rule
+    unable to fire on the only text it is ever given. The card went onto the
+    cover and into the alt text having dropped "arms", the noun the hook turns
+    on.
+    """
+    assert script_gen.hook_card_text(
+        "This is a monster with twenty-four arms."
+    ) == "This is a monster"
+    assert script_gen.hook_card_text(
+        "The storm dropped rain for ninety straight hours."
+    ) == "The storm dropped rain"
+
+
+def test_a_spelled_out_figure_with_its_unit_is_left_alone():
+    """Same rule as the digit case: a number cut off from what it counts, not
+    numbers. Both of these finish their measurement inside the cap."""
+    assert script_gen.hook_card_text(
+        "This glacier has retreated ninety metres every year."
+    ) == "This glacier has retreated ninety metres"
+
+
+def test_one_is_a_pronoun_before_it_is_a_number():
+    """"one" folds to a digit and is far more often a word that ends a thought
+    cleanly. Trimming it would have been the fold's worst false positive."""
+    assert not script_gen._is_bare_figure("one")
+    assert script_gen.hook_card_text(
+        "There is no one left to hear it."
+    ) == "There is no one left"
+    assert script_gen.hook_card_text(
+        "This whole forest grew from one seed."
+    ) == "This whole forest grew from one"
+
+
+def test_a_spelled_out_magnitude_word_is_not_a_bare_figure():
+    """The fold reaches "million" as readily as "twenty-four", and reinstating
+    the magnitude rule by that route is what `_HOOK_CARD_FIGURE_EXCEPT` is
+    for. The 2026-09-09 measurement rejected that rule; it stays rejected."""
+    for word in ("hundred", "thousand", "million", "billion"):
+        assert not script_gen._is_bare_figure(word)
+    assert script_gen.hook_card_text(
+        "This cave system holds a million bats."
+    ) == "This cave system holds a million"
+
+
+class _Usage:
+    """What the SDK hands back on a response."""
+
+    def __init__(self, prompt=0, candidates=0, thoughts=None):
+        self.prompt_token_count = prompt
+        self.candidates_token_count = candidates
+        if thoughts is not None:
+            self.thoughts_token_count = thoughts
+
+
+def test_thinking_tokens_count_as_output():
+    """Gemini reports thinking separately and does not fold it into
+    candidates_token_count, but bills it at the output rate. Counting only the
+    candidates would have under-reported the 2026-09-11 run by ~87%."""
+    meter = script_gen._UsageMeter()
+    meter.record("gemini-2.5-pro", _Usage(prompt=1500, candidates=400, thoughts=2600))
+    assert meter.input_tokens == 1500
+    assert meter.output_tokens == 3000       # 400 + 2600
+    assert meter.thinking_tokens == 2600
+    assert meter.calls == 1
+
+
+def test_a_response_without_usage_is_not_counted_as_a_call():
+    """A call that came back without usage metadata still happened, but
+    nothing is known about it - and inventing a zero would read as a free
+    call rather than an unmeasured one."""
+    meter = script_gen._UsageMeter()
+    meter.record("gemini-2.5-pro", None)
+    assert meter.calls == 0
+    assert meter.as_dict()["input_tokens"] == 0
+
+
+def test_a_usage_object_missing_fields_does_not_break_a_paid_run():
+    """The call is already paid for by the time this runs, so a renamed or
+    absent field must never raise."""
+    meter = script_gen._UsageMeter()
+    meter.record("gemini-2.5-pro", _Usage(prompt=100))   # no thoughts attribute
+    assert meter.output_tokens == 0
+    assert meter.thinking_tokens == 0
+    assert meter.calls == 1
+
+
+def test_usage_totals_split_by_model_and_reset():
+    meter = script_gen._UsageMeter()
+    meter.record("gemini-2.5-pro", _Usage(prompt=10, candidates=5))
+    meter.record("gemini-2.5-flash", _Usage(prompt=20, candidates=7))
+    data = meter.as_dict()
+    assert data["calls"] == 2 and data["input_tokens"] == 30
+    assert set(data["by_model"]) == {"gemini-2.5-pro", "gemini-2.5-flash"}
+    assert data["by_model"]["gemini-2.5-flash"]["input_tokens"] == 20
+    meter.reset()
+    assert meter.as_dict()["calls"] == 0
+
+
 def test_an_empty_hook_yields_an_empty_card():
     assert script_gen.hook_card_text("") == ""
     assert script_gen.hook_card_text(None) == ""

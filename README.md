@@ -92,7 +92,12 @@ output/captions/hashtag_usage.json  which tags recent posts used
 output/captions/hashtag_volume.json known post counts per tag, and the
                     cache behind TAG_VOLUME_PROVIDER
 output/logs/        one transcript per step-8 run, pruned after 30 days
-output/runs.json    one line per step-8 run: what it made, cost and how it ended
+output/runs.json    one line per step-8 run: what it made, how it ended, and
+                    what it spent - ElevenLabs characters, and the Gemini
+                    tokens read off each response (input, output, and how
+                    much of the output was thinking, which is billed at the
+                    output rate). Tokens, not money: prices change and
+                    differ per tier
 output/<date>/<run>/features.json  what that reel was, in the terms step 9
                     compares: which components fired, not what they scored
 output/performance.json  one entry per reel: what it was, and what it did

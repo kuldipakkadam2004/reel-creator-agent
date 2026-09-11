@@ -1411,10 +1411,18 @@ class NasaProvider(Provider):
     SEARCH_URL = "https://images-api.nasa.gov/search"
     LICENSE = "Public domain (NASA)"
 
-    #: What an unmeasured NASA still claims to be. Set to exactly the default
-    #: floor, so the guess is never the reason something passes by more than a
+    #: What an unmeasured NASA still claims to be: exactly the floor it has to
+    #: clear, so the guess is never the reason something passes by more than a
     #: hair - the post-download probe is.
-    NOMINAL_SIZE = (1080, 1920)
+    #:
+    #: Read from the configured floor rather than frozen at the shipped default.
+    #: As a constant it silently became a claim to be *larger* than the bar the
+    #: moment the floor was lowered, which is the one thing this must never be:
+    #: a nominal above the floor lets a still past the pre-filter on the
+    #: strength of a number nobody measured.
+    @classmethod
+    def nominal_size(cls) -> tuple[int, int]:
+        return (config.VISUAL_MIN_WIDTH, config.VISUAL_MIN_HEIGHT)
 
     def search(self, query: str, kind: str, limit: int) -> list[Candidate]:
         if kind != "image":
@@ -1446,8 +1454,8 @@ class NasaProvider(Provider):
                 provider=self.name,
                 provider_id=nasa_id,
                 kind="image",
-                width=self.NOMINAL_SIZE[0],
-                height=self.NOMINAL_SIZE[1],
+                width=self.nominal_size()[0],
+                height=self.nominal_size()[1],
                 download_url=link,
                 source_url=f"https://images.nasa.gov/details/{nasa_id}",
                 creator=(data.get("center") or "NASA").strip(),
@@ -1801,6 +1809,11 @@ clips available and a loose match beats a blank screen, so reject what \
 would confuse or mislead a viewer, not what is merely imperfect.
 - A clip that shows the wrong kind of thing entirely is always a reject, \
 no matter how well it is shot.
+- So is a clip that matches only by word association. A library can use \
+the narration's own words about a clip from another world entirely: a \
+"disease" that kills sea stars is not a surgical mask, and a "sunflower" \
+sea star is not a flower. Ask what the clip is of, not which words it \
+shares with the line.
 - So is a clip belonging to a different named culture or place than the \
 narration's subject. Check the topic as well as the beat: a beat may say \
 only "stone carving" while the video is about the Inca.
@@ -2668,12 +2681,29 @@ def _neutral_plan(
     beat: Beat, providers: list[Provider], settings: dict, ledger: UsageLedger,
     run_id: str, state: "_RunState", rejections: dict[str, int],
     warnings: list[str], seen: set[str],
+    rejected_keys: set[str] | None = None,
 ) -> list[tuple[float, Candidate, str]]:
     """Ranked candidates for this beat's neutral shot, or [] if there are none.
 
     The neutral query is written to be landscape, architecture or material with
     nobody in it, so it is not screened: the subject test has nothing to catch,
     and by the time this is reached there is no better candidate to promote.
+
+    That argument holds for what the neutral query is *meant* to return, and
+    not for what it does return. `seen` only covers the rows this beat already
+    ranked, so the search was free to hand back a clip another beat had put in
+    front of the screen and had rejected by name - and being unscreened, this
+    path then placed it without anything recorded. Measured on the sunflower
+    sea star reel of 2026-09-11: four beats fell back to the neutral shot
+    "underwater kelp forest" and all four of them filled the slot with a
+    reject - an aquarium, a diver, a stingray and a herd of sea otters. Beats 2
+    and 3 swapped: each shipped the clip the other had just thrown out.
+
+    A verdict on what a clip *shows* does not expire when the beat changes, so
+    `rejected_keys` is honoured here too. This spends nothing extra - no clip
+    is screened twice, the run simply declines to re-place one it has already
+    condemned - and it cannot empty the beat, because the caller treats an
+    empty neutral plan exactly as it treated one before.
     """
     neutral = (beat.neutral_query or "").strip()
     if not neutral:
@@ -2682,7 +2712,10 @@ def _neutral_plan(
                               queries=(neutral,), seen=seen)
     if not pool:
         return []
-    return _rank_pool(pool, beat, settings, ledger, run_id, state, rejections)
+    ranked = _rank_pool(pool, beat, settings, ledger, run_id, state, rejections)
+    if not rejected_keys:
+        return ranked
+    return [row for row in ranked if row[1].key not in rejected_keys]
 
 
 def _screen_beats(
@@ -2893,7 +2926,7 @@ def _screen_beats(
 
         seen = {row[1].key for row in plans.get(beat.index, [])}
         safe = _neutral_plan(beat, providers, settings, ledger, run_id, state,
-                             rejections, warnings, seen)
+                             rejections, warnings, seen, rejected_keys)
         if not safe:
             warnings.append(
                 f"beat {beat.index}: {trouble} {beat.query!r} and the neutral "
@@ -3531,7 +3564,8 @@ def source_visuals(
             if len(acquired) < want and (rejects or unscreened):
                 seen = {row[1].key for row in ranked}
                 safe = _neutral_plan(beat, active, settings, ledger, run_id,
-                                     state, rejections, warnings, seen)
+                                     state, rejections, warnings, seen,
+                                     rejected_keys)
                 taken = take(safe, want - len(acquired), beat)
                 if taken:
                     acquired += taken

@@ -278,6 +278,14 @@ def test_crop_to_aspect(width, height, expected):
     assert visuals.crop_to_aspect(width, height) == expected
 
 
+#: The floor these tests measure against, pinned rather than read from
+#: `config`. `config.VISUAL_MIN_*` resolves whatever .env the machine happens
+#: to carry, so asserting against it made the suite fail whenever the floor was
+#: legitimately retuned - it was testing the operator's configuration instead of
+#: the function. The function is what has a contract; the setting is a setting.
+FRAME_FLOOR = {"min_width": 1080, "min_height": 1920}
+
+
 @pytest.mark.parametrize("width,height,passes", [
     (1080, 1920, True),      # exactly the frame
     (2160, 3840, True),      # 4K vertical
@@ -287,11 +295,13 @@ def test_crop_to_aspect(width, height, expected):
     (1000, 1000, False),
 ])
 def test_resolution_floor_is_measured_after_the_crop(width, height, passes):
-    assert visuals.meets_resolution_floor(width, height) is passes
+    assert visuals.meets_resolution_floor(
+        width, height, **FRAME_FLOOR
+    ) is passes
 
 
 def test_floor_can_be_overridden_per_call():
-    assert not visuals.meets_resolution_floor(720, 1280)
+    assert not visuals.meets_resolution_floor(720, 1280, **FRAME_FLOOR)
     assert visuals.meets_resolution_floor(720, 1280, min_width=720, min_height=1280)
 
 
@@ -321,8 +331,13 @@ def test_usable_candidate_is_not_rejected():
 
 
 def test_below_floor_is_rejected_with_the_crop_in_the_message():
+    """The message has to name the crop, not the source size: "1920x1080" looks
+    like plenty and 608x1080 is the number that explains the rejection. Pinned
+    to the frame floor so this tests the message rather than today's setting."""
     candidate = make_candidate(1, width=1920, height=1080)
-    reason = visuals.reject_reason(candidate, _settings())
+    reason = visuals.reject_reason(
+        candidate, _settings(min_width=1080, min_height=1920)
+    )
     assert "608x1080" in reason and "floor" in reason
 
 
@@ -758,6 +773,87 @@ def test_a_beat_with_nothing_honest_falls_back_to_the_neutral_shot(monkeypatch):
     assert "v30" in ordered and "v31" in ordered
     assert any("neutral shot" in note for note in notes[0])
     assert any("rather than a contradicting one" in w for w in warnings)
+
+
+def test_the_neutral_shot_will_not_place_a_clip_the_run_rejected(monkeypatch):
+    """The sunflower sea star leak, from the reel of 2026-09-11.
+
+    Two beats, and the aquarium clip is in both pools. Beat 0 puts it in front
+    of the screen, which rejects it by name. Beat 1 never ranks it, finds
+    nothing it can keep, and falls back to its neutral shot - whose query
+    returns that same aquarium. Because the neutral path is deliberately
+    unscreened, it used to place the reject with nothing recorded.
+
+    On the shipped reel this happened to four beats out of eight, and beats 2
+    and 3 swapped: each shipped the clip the other had just thrown out. A
+    verdict on what a clip shows does not expire when the beat changes.
+    """
+    aquarium = _described(40, "fishes-and-plants-in-aquarium")
+    rejected = Beat(
+        index=0, start=0.0, end=6.0, query="sunflower sea star hunting",
+        text="It glides a meter a minute across the ocean floor.",
+    )
+    falls_back = Beat(
+        index=1, start=6.0, end=12.0, query="purple sea urchin grazing",
+        text="Its main course is the purple sea urchin.",
+        neutral_query="underwater kelp forest",
+    )
+    served = {
+        "purple sea urchin grazing": [_described(41, "a-stingray-is-swimming")],
+        "underwater kelp forest": [aquarium],
+    }
+    provider = _query_aware_provider(served)(session=None)
+    monkeypatch.setattr(visuals, "llm_screen", _reject_everything)
+
+    plans = {
+        0: [(9.0, aquarium, "sunflower sea star hunting")],
+        1: [(9.0, served["purple sea urchin grazing"][0],
+             "purple sea urchin grazing")],
+    }
+    rejected_keys: set[str] = set()
+    warnings = []
+    visuals._screen_beats(
+        plans, [rejected, falls_back], "why sunflower sea stars matter",
+        [provider], _retry_settings(), visuals.UsageLedger(), "run",
+        visuals._RunState(), {}, warnings, rejected_keys,
+    )
+
+    assert aquarium.key in rejected_keys, "beat 0 did not reject the aquarium"
+    placed = [row[1].key for row in plans[1]]
+    assert aquarium.key not in placed, (
+        "the neutral shot re-placed a clip this run had already rejected: "
+        f"{placed}"
+    )
+
+
+def test_the_neutral_shot_still_fills_a_beat_when_nothing_was_rejected(monkeypatch):
+    """The guard only ever subtracts, and must not cost the neutral shot the
+    beats it was written for - `_neutral_plan` with an empty rejection set
+    behaves exactly as it did before."""
+    beat = _inca_beat()
+    served = {
+        "ancient construction workers": [
+            _described(50, "a-man-is-working-on-a-cement-mixer"),
+        ],
+        "historical laborers": [
+            _described(51, "construction-worker-setting-up-scaffolding"),
+        ],
+        "Andes mountain landscape": [
+            _described(52, "snow-covered-andes-peaks-at-dawn"),
+        ],
+    }
+    provider = _query_aware_provider(served)(session=None)
+    monkeypatch.setattr(visuals, "llm_screen", _reject_everything)
+
+    plans = {0: [(9.0, served["ancient construction workers"][0],
+                  "ancient construction workers")]}
+    notes = visuals._screen_beats(
+        plans, [beat], "how the Inca built roads without the wheel", [provider],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, [],
+    )
+    assert [row[1].provider_id for row in plans[0]][0] == "v52"
+    assert any("neutral shot" in note for note in notes[0])
 
 
 def test_a_beat_no_provider_answered_still_reaches_the_neutral_shot(monkeypatch):
@@ -1364,7 +1460,7 @@ def test_pexels_videos_parse_and_pick_the_cheapest_passing_rendition():
         "id": 7, "duration": 12, "url": "https://pexels.com/video/7",
         "image": "prev.jpg", "alt": "a wave", "user": {"name": "Ana", "url": "u"},
         "video_files": [
-            {"link": "sd.mp4", "width": 640, "height": 1138},      # under the floor
+            {"link": "sd.mp4", "width": 426, "height": 758},       # under any floor
             {"link": "hd.mp4", "width": 1080, "height": 1920},     # cheapest pass
             {"link": "uhd.mp4", "width": 2160, "height": 3840},    # overkill
         ],
@@ -1395,7 +1491,15 @@ def test_pixabay_photos_report_the_size_actually_served():
     [candidate] = provider._photos(payload)
 
     assert candidate.height == 1280 and candidate.width == 853
-    assert not visuals.meets_resolution_floor(candidate.width, candidate.height)
+    # Never clears the full 1080x1920 frame, so a Pixabay photo is always an
+    # upscale. It does clear a lowered floor, which is how it can be sourced at
+    # all - see VISUAL_MIN_WIDTH/HEIGHT.
+    assert not visuals.meets_resolution_floor(
+        candidate.width, candidate.height, **FRAME_FLOOR
+    )
+    assert visuals.meets_resolution_floor(
+        candidate.width, candidate.height, min_width=608, min_height=1080
+    )
 
 
 def test_pixabay_videos_take_the_largest_stream():
@@ -1661,7 +1765,7 @@ def test_nasa_survives_a_dead_manifest():
 def test_nasa_claims_no_more_than_the_floor_it_must_clear():
     """The nominal size only buys a ticket past reject_reason, which drops
     anything reporting no dimensions. probe_image_size settles it for real."""
-    assert visuals.NasaProvider.NOMINAL_SIZE == (
+    assert visuals.NasaProvider.nominal_size() == (
         config.VISUAL_MIN_WIDTH, config.VISUAL_MIN_HEIGHT
     )
 
@@ -1714,10 +1818,23 @@ def test_both_new_providers_are_registered():
 
 
 def test_the_new_providers_are_opt_in():
-    """Enabling youtube spends the topic scout's quota and needs yt-dlp; nasa
-    only knows about space. Neither belongs in a default run."""
-    assert "youtube" not in config.VISUAL_PROVIDERS
-    assert "nasa" not in config.VISUAL_PROVIDERS
+    """Enabling youtube spends the topic scout's quota and needs yt-dlp, so it
+    does not belong in a default run. Nor does nasa, which has nothing to say
+    outside space and earth science.
+
+    This asserts on the *default*, not on `config.VISUAL_PROVIDERS`. Reading
+    the resolved value made the test fail the moment a machine opted in, which
+    is the one thing an opt-in is supposed to allow: it was measuring this
+    checkout's .env rather than the code's shipped default, and an .env is not
+    what ships. `config.py` loads .env on import, so reloading the module does
+    not get back to the default either - only the named constant does.
+    """
+    default = config.get_env_list(
+        "_UNSET_PROVIDERS_", config.VISUAL_PROVIDERS_DEFAULT
+    )
+    assert "youtube" not in default
+    assert "nasa" not in default
+    assert default == ("pexels", "pixabay", "openverse")
 
 
 def test_provider_readiness_reflects_the_configured_keys(monkeypatch):
@@ -2275,7 +2392,7 @@ def test_rate_limited_provider_is_benched_not_hammered(sandbox):
 
 
 def test_everything_below_the_floor_means_no_assets(sandbox):
-    StubProvider.catalog = [make_candidate(i, width=1920, height=1080) for i in range(5)]
+    StubProvider.catalog = [make_candidate(i, width=1280, height=720) for i in range(5)]
     with pytest.raises(visuals.NoAssetsError):
         run_visuals()
 
@@ -2283,7 +2400,7 @@ def test_everything_below_the_floor_means_no_assets(sandbox):
 def test_rejections_are_counted_for_diagnosis(sandbox):
     StubProvider.catalog = [
         make_candidate(0),
-        *[make_candidate(i, width=1920, height=1080) for i in range(1, 6)],
+        *[make_candidate(i, width=1280, height=720) for i in range(1, 6)],
     ]
     manifest = run_visuals(assets_per_beat=1)
     rejected = manifest["stats"]["rejected_candidates"]

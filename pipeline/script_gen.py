@@ -94,6 +94,85 @@ MAX_DURATION_SECONDS = 180
 # queries and step 6 to heuristic copy, and the reel comes out worse with only
 # a warning line to say why. Cheap retries buy all three steps their good path.
 
+#: What every Gemini call in this run cost, in tokens.
+#:
+#: The SDK hands back `usage_metadata` on each response and this project threw
+#: it away, so "what did that reel cost" had no answer on disk - `runs.json`
+#: recorded `tts_characters` and nothing else, while README.md claimed it
+#: recorded cost. Reconstructing it afterwards is guesswork precisely where it
+#: matters most: `GEMINI_MODEL` is a pro model, `_build_generation_config`
+#: leaves its thinking budget unset because pro rejects a zero one, and
+#: thinking is billed at the output rate. Measured against a mid estimate for
+#: the 2026-09-11 run, output was 94% of the bill.
+#:
+#: A module-level meter rather than a return value: `call_gemini` has eleven
+#: call sites across five modules, all of which want the text and none of
+#: which want the accounting. Step 8 reads the totals at the end of a run.
+#:
+#: Prices are not stored here. They change, they differ per tier, and a stale
+#: constant that looks authoritative is worse than no constant - the tokens are
+#: the measurement, the rupees are the reader's arithmetic.
+class _UsageMeter:
+    """Running totals of token usage, by model."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.thinking_tokens = 0
+        self.by_model: dict[str, dict[str, int]] = {}
+
+    def record(self, model: str, usage) -> None:
+        """Fold one response's `usage_metadata` into the totals.
+
+        Tolerant by design: a missing field, a None, or an SDK that renames
+        something must not take down a run that has already paid for the call.
+        """
+        if usage is None:
+            return
+
+        def count(*names: str) -> int:
+            for name in names:
+                value = getattr(usage, name, None)
+                if isinstance(value, (int, float)):
+                    return int(value)
+            return 0
+
+        # Gemini reports thinking separately and does NOT include it in
+        # candidates_token_count, so the billable output is the sum of the two.
+        thinking = count("thoughts_token_count", "thinking_token_count")
+        output = count("candidates_token_count", "output_token_count") + thinking
+        inputs = count("prompt_token_count", "input_token_count")
+
+        self.calls += 1
+        self.input_tokens += inputs
+        self.output_tokens += output
+        self.thinking_tokens += thinking
+        row = self.by_model.setdefault(
+            model, {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                    "thinking_tokens": 0}
+        )
+        row["calls"] += 1
+        row["input_tokens"] += inputs
+        row["output_tokens"] += output
+        row["thinking_tokens"] += thinking
+
+    def as_dict(self) -> dict:
+        return {
+            "calls": self.calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "thinking_tokens": self.thinking_tokens,
+            "by_model": {m: dict(r) for m, r in self.by_model.items()},
+        }
+
+
+USAGE = _UsageMeter()
+
+
 #: Attempts per call, including the first.
 MAX_ATTEMPTS = 3
 
@@ -473,6 +552,7 @@ def call_gemini(prompt: str, *, system_instruction: str,
         else:
             # A blocked prompt or an empty candidate is settled, not transient:
             # _extract_text raises from out here so it is never retried.
+            USAGE.record(model, getattr(response, "usage_metadata", None))
             return _extract_text(response)
 
     raise AssertionError("unreachable")
@@ -726,6 +806,46 @@ _HOOK_CARD_MIN_WORDS = 2
 #: have fired on 1 and it is good.
 _HOOK_CARD_BARE_NUMBER = re.compile(r"^\d[\d,.]*$")
 
+#: The same figure, spelled out. `_HOOK_CARD_BARE_NUMBER` reads digits, and a
+#: narration script has none: step 2 writes what step 3 has to pronounce, so
+#: every quantity reaches this function as words - "twenty-four", "twenty
+#: thirteen", "over ninety percent". Measured over the 31 cards in
+#: output/scripts/ on 2026-09-11, the digit rule fires on 0 of them, which is
+#: not the absence of the fault it was written for but the absence of its
+#: alphabet.
+#:
+#: The shipped case: "This is a monster with twenty-four arms." cut at six
+#: words gives "This is a monster with twenty-four", which went onto the cover
+#: and into the alt text having dropped the noun the whole hook turns on.
+#: Backing off the figure uncovers the "with" holding it up and lands on "This
+#: is a monster".
+#:
+#: `_fold_number_word` already knows "twenty-four" is 24 - it was written for
+#: the restatement rule - so this asks it rather than listing the words again.
+#: Two exclusions keep the measured call above intact:
+#:
+#: - the magnitude words, which fold to digits but end a thought perfectly
+#:   well. That is the rule the 2026-09-09 measurement rejected, and folding
+#:   would have reinstated it by the back door.
+#: - "one", which folds to 1 and is far more often a pronoun than a count:
+#:   "no one", "the only one", "this one" all end a card cleanly.
+_HOOK_CARD_FIGURE_EXCEPT = frozenset(
+    ("one", "hundred", "thousand", "million", "billion")
+)
+
+
+def _is_bare_figure(word: str) -> bool:
+    """Whether `word` is a quantity cut off from whatever it was counting.
+
+    True for a figure in digits and for the same figure spelled out, false for
+    the magnitude words and for "one" - see `_HOOK_CARD_FIGURE_EXCEPT`.
+    """
+    if _HOOK_CARD_BARE_NUMBER.match(word):
+        return True
+    if word in _HOOK_CARD_FIGURE_EXCEPT:
+        return False
+    return _fold_number_word(word).isdigit()
+
 
 def _echoes_body(hook: str, body: str) -> str:
     """The sentence near the top of `body` that restates `hook`, or "".
@@ -977,9 +1097,11 @@ def _trim_dangling(words: list[str]) -> list[str]:
     trimming below `_HOOK_CARD_MIN_WORDS` - at which point the plain cut is
     the lesser of the two bad options.
 
-    A bare figure counts as one of those words, and popping it often uncovers
-    another: "They entombed the reactor in 400,000" loses the number, then
-    loses the "in" holding it up, and lands on "They entombed the reactor".
+    A bare figure counts as one of those words, in digits or spelled out, and
+    popping it often uncovers another: "They entombed the reactor in 400,000"
+    loses the number, then loses the "in" holding it up, and lands on "They
+    entombed the reactor"; "This is a monster with twenty-four" loses the
+    figure, then the "with", and lands on "This is a monster".
 
     What this cannot see is a trailing transitive verb - "The ground you walk
     on hides", "This anchor chain can suffocate". Those are the other half of
@@ -992,7 +1114,7 @@ def _trim_dangling(words: list[str]) -> list[str]:
     while len(kept) > _HOOK_CARD_MIN_WORDS:
         last = kept[-1].lower().strip(_HOOK_CLAUSE_END + ".!?\"'’")
         if (last not in _HOOK_CARD_DANGLING
-                and not _HOOK_CARD_BARE_NUMBER.match(last)):
+                and not _is_bare_figure(last)):
             break
         kept.pop()
     return kept if len(kept) >= _HOOK_CARD_MIN_WORDS else list(words)
