@@ -998,9 +998,17 @@ def test_the_retry_is_screened_by_the_model_not_the_lexical_check(monkeypatch):
         {}, [],
     )
 
-    assert len(seen_shortlists) == 2, "the re-searched beat was not screened again"
+    # Three calls, in order: the shortlist, the re-search, and the neutral
+    # shot the re-search fell through to - which is screened on the same
+    # standard since 2026-09-12 and is why this is not 2.
+    assert len(seen_shortlists) == 3, "the re-searched beat was not screened again"
     retried = [c.provider_id for c in seen_shortlists[1][0]]
     assert retried == ["v37"], retried
+    assert [c.provider_id for c in seen_shortlists[2][0]] == ["v38"], (
+        "the neutral shot was placed without being screened"
+    )
+    # Rejected by the stub like everything else, and still first: demotion
+    # reorders, and there is nothing here to promote above it.
     assert [row[1].provider_id for row in plans[0]][0] == "v38"
 
 
@@ -2861,3 +2869,82 @@ def test_ytdl_console_output_is_swallowed():
         getattr(logger, level)("[youtube] xyz: This video is not available")
 
     assert options["quiet"] is True
+
+
+def _mole_rat_beat():
+    """Beat 3 of the naked mole-rat reel of 2026-09-12, as it ran."""
+    return Beat(
+        index=3, start=15.055, end=19.222, query="naked mole rat moving slowly",
+        text="shifts. Its metabolism crashes. It slows to a crawl.",
+        alt_queries=("sleeping naked mole rat",),
+        neutral_query="underground dirt tunnels",
+    )
+
+
+def test_the_neutral_shot_is_screened_like_everything_else(monkeypatch):
+    """A monastery is not an underground dirt tunnel.
+
+    The neutral query is written to be landscape or material with nobody in
+    it, and `_neutral_plan` used to take that as licence not to screen what
+    came back. On the naked mole-rat reel of 2026-09-12 beat 3 filled both of
+    its slots from the neutral shot "underground dirt tunnels" with a person
+    sitting in a boat and Sumela monastery, placed them without anything
+    recorded, and the beat finished "ok".
+    """
+    beat = _mole_rat_beat()
+    tunnel = _described(80, "exploring-a-dark-earth-tunnel")
+    monastery = _described(81, "sumela-manastiri")
+    # Monastery first, so the assertion below is about demotion and not about
+    # the order the provider happened to return.
+    provider = _query_aware_provider(
+        {"underground dirt tunnels": [monastery, tunnel]}
+    )(session=None)
+
+    def screen(shortlists, beats, topic):
+        # The subject test, standing in for the model: it is told the beat was
+        # searched for the neutral query, not for the narration's words.
+        assert [b.query for b in beats] == ["underground dirt tunnels"]
+        verdicts = {}
+        for index, candidates in shortlists.items():
+            verdicts[index] = {
+                position: (True, "") if "tunnel" in (c.source_url or "")
+                else (False, "shows a monastery")
+                for position, c in enumerate(candidates)
+            }
+        return verdicts, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+
+    notes: list[str] = []
+    ranked = visuals._neutral_plan(
+        beat, [provider], _retry_settings(), visuals.UsageLedger(), "run",
+        visuals._RunState(), {}, [], set(),
+        topic="how naked mole-rats survive without oxygen", notes=notes,
+    )
+
+    assert [row[1].provider_id for row in ranked] == ["v80", "v81"], (
+        "the monastery was not demoted below the tunnel"
+    )
+    assert any("monastery" in note for note in notes), notes
+
+
+def test_an_unscreened_neutral_shot_is_still_survivable(monkeypatch):
+    """Screening the neutral shot must not be a way to empty it.
+
+    `_screen_beats` and acquisition both treat an empty neutral plan as "fall
+    through to the rows the screen never saw", which are worse. So a screen
+    that rejects everything here demotes and returns, exactly as the main one
+    does - it does not drop.
+    """
+    beat = _mole_rat_beat()
+    provider = _query_aware_provider(
+        {"underground dirt tunnels": [_described(82, "a-person-in-a-boat")]}
+    )(session=None)
+    monkeypatch.setattr(visuals, "llm_screen", _reject_everything)
+
+    ranked = visuals._neutral_plan(
+        beat, [provider], _retry_settings(), visuals.UsageLedger(), "run",
+        visuals._RunState(), {}, [], set(), topic="naked mole-rats",
+    )
+
+    assert [row[1].provider_id for row in ranked] == ["v82"]

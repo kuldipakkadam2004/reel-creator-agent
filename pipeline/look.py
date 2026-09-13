@@ -99,6 +99,15 @@ crop, or nothing identifiable in it at all.
 Set "ok" to false where you would not ship the frame as a cover at all - which \
 is every 0, and any frame at any grade carrying something disqualifying.
 
+Two things are disqualifying however striking the frame is, because a cover \
+that wins the tap on a promise the video does not keep costs more than a dull \
+one. First, a frame that would make a viewer expect a different video: judge \
+it against the topic above, not against the opening line, which is often a \
+contrast drawn with something the video is not about. Second, a frame that \
+uses a real person's illness, injury or distress to illustrate a line they \
+are not the subject of - a reel about an animal opening on a patient in a \
+hospital bed is not a cover, it is a bait.
+
 Where a headline card is drawn over the frame, judge the type as part of it: a \
 card that cannot be read against what is behind it is a cover problem, not a \
 typography problem, and it is the most common way a cover fails.

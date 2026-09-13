@@ -2150,6 +2150,25 @@ def test_a_comma_separated_tag_list_survives_readably():
     assert assemble._describe("ocean,  waves,sea") == "ocean, waves, sea"
 
 
+def test_an_apostrophe_the_slug_dropped_is_put_back():
+    """The cover of the mole-rat reel of 2026-09-12, as Pexels spelled it."""
+    assert assemble._describe(
+        "a-doctor-using-tablet-while-looking-the-patient-s-results"
+    ) == "a doctor using tablet while looking the patient's results"
+    assert assemble._describe("it-doesn-t-work") == "it doesn't work"
+
+
+def test_a_bare_t_that_heads_a_word_is_left_alone():
+    """"t-shirt" and "t-cell" are stock-library staples, and neither is a
+    contraction. Attaching every orphan "t" backwards spelled them "a't
+    shirt" and "and't cells" - in alt text, which is read aloud."""
+    assert assemble._describe("a-t-shirt") == "a t shirt"
+    assert assemble._describe("vitamin-c-and-t-cells") == "vitamin c and t cells"
+    # Both rules on one slug: the possessive is restored, the compound is not
+    # touched.
+    assert assemble._describe("the-dog-s-t-shirt") == "the dog's t shirt"
+
+
 def test_the_providers_own_title_is_preferred_over_everything_else():
     described, source = assemble._cover_depiction({
         "title": "A jellyfish drifting in open water",

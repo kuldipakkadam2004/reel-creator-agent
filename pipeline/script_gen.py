@@ -2994,6 +2994,25 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
                 f"re-cut from it: {card!r}"
             )
 
+    # The word budget is enforced on every rewrite that is offered and was
+    # never enforced on the script that actually ships. Each pass only checks
+    # the rewrite in front of it, so a draft that arrives under budget - or
+    # one the fact-check shortens on its way through, which is what happened
+    # on the mole-rat reel of 2026-09-12 - falls between all four of them. That
+    # reel went out at 88 words against a 91-124 budget and ran 33.7s against
+    # the 40s step 0 chose, and the only length the run mentioned was the one
+    # it had already decided to keep.
+    warnings: list[str] = []
+    wanted = target_duration(duration_seconds)
+    low, high = word_band(wanted)
+    words = count_words(script)
+    if not low <= words <= high:
+        warnings.append(
+            f"the script ships at {words} words against a {low}-{high} word "
+            f"budget for {wanted}s, so the reel will run about "
+            f"{estimate_duration(script)}s"
+        )
+
     return {
         "topic": topic.strip(),
         "script": script,
@@ -3003,6 +3022,7 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
         "structure": shape,
         "takeaway": keep,
         "claims": claims,
+        "warnings": warnings,
     }
 
 

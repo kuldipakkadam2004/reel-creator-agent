@@ -842,6 +842,9 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None,
     # away or a fact-check that could not be reached. They were being dropped.
     for pass_name in ("hook", "structure", "takeaway", "claims"):
         _collect(record, "script", (script.get(pass_name) or {}).get("warnings"))
+    # Step 2's own warnings, as opposed to those of the four passes it runs:
+    # what the script is after all of them have had their turn.
+    _collect(record, "script", script.get("warnings"))
 
     claims = script.get("claims") or {}
     # A pass that did not run leaves no findings and no warnings, which reads

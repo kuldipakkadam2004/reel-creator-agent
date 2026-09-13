@@ -2165,6 +2165,22 @@ _SLUG_NOISE = ("free stock video", "stock footage", "stock video",
                "vertical video of", "vertical video", "video of", "footage of",
                "free video", "video", "footage", "clip", "vertical")
 
+#: Words that own a bare "t" once the slug has dropped the apostrophe. A
+#: bare "t" is not treated like a bare "s", because the two orphans are not
+#: the same problem. "s" is left over from a possessive and a stock library
+#: has almost no other use for it; "t" heads two of the commonest words in
+#: one - "t-shirt" and "t-cell" arrive here as "t shirt" and "t cell" - so
+#: attaching every orphan "t" backwards turns "a t shirt" into "a't shirt"
+#: and "vitamin c and t cells" into "and't cells". Every English "t"
+#: contraction is "n't", which makes the set of stems closed and short
+#: enough to name, so the rule can be about contractions rather than about
+#: the letter.
+_CONTRACTION_STEMS = frozenset((
+    "ain", "aren", "can", "couldn", "didn", "doesn", "don", "hadn", "hasn",
+    "haven", "isn", "mightn", "mustn", "needn", "shan", "shouldn", "wasn",
+    "weren", "won", "wouldn",
+))
+
 
 def parse_aspect(text: str) -> tuple[int, int]:
     """"4:5" -> (4, 5). Anything unreadable falls back to the frame's own."""
@@ -2222,6 +2238,20 @@ def _describe(text: str) -> str:
     words = words.replace("-", " ").replace("_", " ")
     words = re.sub(r"\s*,\s*", ", ", words)
     words = " ".join(words.split())
+
+    # A slug drops the apostrophe before it is ever split, so Pexels'
+    # "...looking-the-patient-s-results..." arrives here as "the patient s
+    # results" and ships in alt text, which is the one line on a post written
+    # to be read aloud. An orphan "s" belongs to the word in front of it; an
+    # orphan "t" only does when that word is a contraction stem, for the
+    # reason _CONTRACTION_STEMS gives.
+    words = re.sub(r"(?<=[^\W\d_])\s+s\b", "'s", words)
+    words = re.sub(
+        r"\b(\w+)\s+t\b",
+        lambda m: (f"{m[1]}'t" if m[1].lower() in _CONTRACTION_STEMS
+                   else m[0]),
+        words,
+    )
 
     lowered = words.lower()
     for noise in _SLUG_NOISE:

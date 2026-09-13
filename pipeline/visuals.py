@@ -39,7 +39,7 @@ import shutil
 import sys
 import time
 import unicodedata
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field, replace as dataclass_replace
 from datetime import datetime, timezone
 from hashlib import sha1, sha256
 from pathlib import Path
@@ -1817,6 +1817,16 @@ shares with the line.
 - So is a clip belonging to a different named culture or place than the \
 narration's subject. Check the topic as well as the beat: a beat may say \
 only "stone carving" while the video is about the Inca.
+- A clip of people attending to a thing is not a clip of the thing. Where \
+the beat asks for an object, a place or a scientific image, a description \
+whose subject is a person - a doctor at a bedside, a technician at a \
+console, a patient being examined - is a reject: it shows the room the \
+thing is used in, not the thing. A brain scan is the scan, not a ward \
+round; a telescope image is the image, not an astronomer.
+- Reject a clip that uses a real person's illness, injury or distress as \
+decoration for a line they are not the subject of. An animal's biology \
+illustrated by a patient in a hospital bed is a reject however well it \
+matches the words.
 - A modern stand-in is judged by the test in your instructions: keep it \
 if the thing shown is unchanged by the centuries, reject it if the \
 description names present-day machinery, vehicles, workwear, offices, \
@@ -2682,12 +2692,15 @@ def _neutral_plan(
     run_id: str, state: "_RunState", rejections: dict[str, int],
     warnings: list[str], seen: set[str],
     rejected_keys: set[str] | None = None,
+    topic: str = "", notes: list[str] | None = None,
 ) -> list[tuple[float, Candidate, str]]:
     """Ranked candidates for this beat's neutral shot, or [] if there are none.
 
-    The neutral query is written to be landscape, architecture or material with
-    nobody in it, so it is not screened: the subject test has nothing to catch,
-    and by the time this is reached there is no better candidate to promote.
+    The neutral query is written to be landscape, architecture or material
+    with nobody in it. That used to be the argument for not screening what it
+    returned - the subject test would have nothing to catch - and it is an
+    argument about the query, not about the answer, so this path now screens
+    too. See the comment on the screen below for what it was shipping.
 
     That argument holds for what the neutral query is *meant* to return, and
     not for what it does return. `seen` only covers the rows this beat already
@@ -2713,9 +2726,40 @@ def _neutral_plan(
     if not pool:
         return []
     ranked = _rank_pool(pool, beat, settings, ledger, run_id, state, rejections)
-    if not rejected_keys:
+    if rejected_keys:
+        ranked = [row for row in ranked if row[1].key not in rejected_keys]
+    if not ranked or settings.get("relevance_mode") != "llm":
         return ranked
-    return [row for row in ranked if row[1].key not in rejected_keys]
+
+    # Everything above is about what the neutral query is *meant* to return.
+    # This is about what it does. On the naked mole-rat reel of 2026-09-12 the
+    # neutral shot "underground dirt tunnels" filled four slots across three
+    # beats - a subway platform at night, a person sitting in a boat, and
+    # Sumela monastery - and none of them was ever looked at, because this
+    # path trusted the words it had searched for over the words that came
+    # back. Beat 3 shipped two of them and the run reported `beats_ok = 7`.
+    #
+    # Judged against the neutral query rather than the beat's narration: an
+    # establishing shot is chosen for having none of the narration's words in
+    # it, so the lexical screen scores every one of these zero and a floor
+    # here would reject the good with the bad. Only the subject test can tell
+    # a tunnel from a monastery, and it is the reason this pass costs a call.
+    shortlist_size = max(1, int(settings.get("relevance_shortlist") or 1))
+    verdicts, screen_warnings = llm_screen(
+        {beat.index: [row[1] for row in ranked[:shortlist_size]]},
+        [dataclass_replace(beat, query=neutral)], topic,
+    )
+    warnings.extend(screen_warnings)
+    judged = verdicts.get(beat.index)
+    if not judged:
+        return ranked
+    # Demoted, not dropped, for the reason `_demote_rejects` gives: the caller
+    # survives an empty neutral plan but is no better off for one, and the
+    # rows below this plan are the ones the screen never saw at all.
+    ranked, demoted = _demote_rejects(ranked, judged)
+    if notes is not None:
+        notes.extend(f"neutral shot {neutral!r}: {note}" for note in demoted)
+    return ranked
 
 
 def _screen_beats(
@@ -2926,7 +2970,8 @@ def _screen_beats(
 
         seen = {row[1].key for row in plans.get(beat.index, [])}
         safe = _neutral_plan(beat, providers, settings, ledger, run_id, state,
-                             rejections, warnings, seen, rejected_keys)
+                             rejections, warnings, seen, rejected_keys,
+                             topic=topic, notes=notes.setdefault(beat.index, []))
         if not safe:
             warnings.append(
                 f"beat {beat.index}: {trouble} {beat.query!r} and the neutral "
@@ -3565,7 +3610,8 @@ def source_visuals(
                 seen = {row[1].key for row in ranked}
                 safe = _neutral_plan(beat, active, settings, ledger, run_id,
                                      state, rejections, warnings, seen,
-                                     rejected_keys)
+                                     rejected_keys, topic=topic,
+                                     notes=record["notes"])
                 taken = take(safe, want - len(acquired), beat)
                 if taken:
                     acquired += taken
@@ -3573,6 +3619,19 @@ def source_visuals(
                         f"filled {len(taken)} slot(s) from the neutral shot "
                         f"{beat.neutral_query!r}: "
                         f"{_shortfall_reason(keepers, acquired, want, state)}"
+                    )
+                    # A manifest note is not read by anyone deciding whether to
+                    # post. The mole-rat reel of 2026-09-12 filled four slots
+                    # this way across three beats, finished `beats_ok = 7`, and
+                    # printed no warning at all - so the one line the run said
+                    # about its footage was that every beat was fine. A beat
+                    # showing the subject's world instead of the subject is a
+                    # thing worth reading before the reel goes out.
+                    warnings.append(
+                        f"beat {beat.index} ({beat.query!r}): filled "
+                        f"{len(taken)} of {want} slot(s) from the neutral shot "
+                        f"{beat.neutral_query!r} - it shows the subject's "
+                        f"world, not the subject"
                     )
                 ranked = ranked + safe
 
@@ -3766,6 +3825,14 @@ def source_visuals(
             "beats_ok": sum(1 for b in beat_records if b["status"] == "ok"),
             "beats_partial": sum(1 for b in beat_records if b["status"] == "partial"),
             "beats_failed": sum(1 for b in beat_records if b["status"] == "failed"),
+            # "ok" means the beat was filled, not that it was filled with the
+            # subject: a beat that took every slot from its neutral shot is
+            # "ok" too. Counted separately so `beats_ok = 7` cannot be the
+            # whole story a finished run tells about its footage.
+            "beats_from_neutral": sum(
+                1 for b in beat_records
+                if any(n.startswith("filled ") for n in b.get("notes") or [])
+            ),
             "assets": len(assets),
             "from_cache": sum(1 for a in assets if a["from_cache"]),
             "downloaded_bytes": sum(
