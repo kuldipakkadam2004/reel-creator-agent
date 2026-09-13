@@ -451,6 +451,30 @@ _FULLY_FIXED = (
     "thousand feet, ninety-nine percent of the sun is gone. Effectively dark."
 )
 
+#: The draft refused on 2026-09-13, shortened to the sentences the rounds
+#: argued over. Only the findings matter to the loop - it never reads this -
+#: but a repair is scored against the script it was handed, so there has to be
+#: one.
+JELLYFISH = (
+    "For every living thing, the clock only runs one way. But one animal found "
+    "an escape clause. It collapses back into a formless blob of its earliest "
+    "cells."
+)
+
+#: Round 1 of that draft: the contradiction answered, the blob still there.
+_JELLY_ROUND_1 = (
+    "For almost every living thing, the clock only runs one way. But one "
+    "animal found an escape clause. It collapses back into a formless blob of "
+    "its earliest cells."
+)
+
+#: Round 2: the blob answered too, and the escape clause still there.
+_JELLY_ROUND_2 = (
+    "For almost every living thing, the clock only runs one way. But one "
+    "animal found an escape clause. It reverts to an earlier life stage, a "
+    "polyp."
+)
+
 
 def test_a_second_round_lands_the_repair_the_first_one_missed(monkeypatch):
     """The deep-sea reel of 2026-09-02. The first rewrite cleared the
@@ -630,6 +654,69 @@ def test_the_budget_is_spent_only_on_rounds_that_get_nowhere(monkeypatch):
     assert report["script"] == _HALF_FIXED
     assert len(report["remaining"]) == 1
     assert any("still stand" in w for w in report["warnings"])
+
+
+def test_a_round_that_answers_its_fault_is_kept_even_at_the_same_count(
+        monkeypatch):
+    """The jellyfish draft of 2026-09-13, as it ran.
+
+    One blocking finding, and a repair that fixed it and turned up a different
+    one - twice. The count never moved, because "fewer than one" is zero and
+    zero returns clean, so the loop recorded no best round and reverted to the
+    original: the draft with the contradiction round 1 had corrected, plus the
+    two sentences rounds 1 and 2 went on to fix. It refused the topic on the
+    first of those.
+    """
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 2)
+    started = [{"sentence": "For every living thing, the clock only runs one "
+                            "way.",
+                "kind": "contradiction",
+                "problem": "the immortal jellyfish is the counter-example"}]
+    then = [{"sentence": "It collapses back into a formless blob of its "
+                         "earliest cells.",
+             "kind": "false", "problem": "it reverts to a polyp"}]
+    after = [{"sentence": "But one animal found an escape clause.",
+              "kind": "false", "problem": "hydra do it too"}]
+    _verify_gemini(monkeypatch, findings=started,
+                   repaired=[_JELLY_ROUND_1, _JELLY_ROUND_2],
+                   recheck=[then, after])
+
+    report = script_gen.verify_claims("why some animals never seem to age",
+                                      JELLYFISH)
+
+    assert report["blocked"] is True, "one finding still stands"
+    assert report["revised"] is True
+    assert report["script"] == _JELLY_ROUND_2, "the last round that answered"
+    assert report["remaining"] == after, (
+        "the refusal must name the fault that survived, not the one the "
+        "draft started with"
+    )
+    assert not any("kept the original" in w for w in report["warnings"])
+
+
+def test_a_rewrite_carrying_its_fault_back_is_not_kept_at_the_same_count(
+        monkeypatch):
+    """The other side of it, and why the count cannot be the test on its own.
+
+    A repair that returns the sentence it was sent to fix, and has the same
+    finding read back to it, has bought nothing - it is level with the draft
+    on count and identical to it on the only fault either has.
+    """
+    monkeypatch.setattr(config, "VERIFY_REPAIR_ROUNDS", 1)
+    standing = [{"sentence": "Total darkness.", "kind": "false",
+                 "problem": "one percent of the light is left"}]
+    # Same fault, worded afresh: the checker is a sampled call and writes its
+    # reasoning differently each time it reports the same sentence.
+    again = [{"sentence": "Total darkness!", "kind": "false",
+              "problem": "a hundredth of the surface light reaches that deep"}]
+    _verify_gemini(monkeypatch, findings=standing,
+                   repaired=_HALF_FIXED, recheck=again)
+
+    report = script_gen.verify_claims("the deep sea", DEEP_SEA)
+
+    assert report["blocked"] is True
+    assert report["script"] == DEEP_SEA, "the original still stands"
+    assert any("did not clear" in w for w in report["warnings"])
 
 
 def test_the_ceiling_stops_a_repair_that_is_still_improving(monkeypatch):

@@ -2659,6 +2659,20 @@ def blocking_findings(findings: list[dict]) -> list[dict]:
     return [f for f in findings if f.get("kind") in _VERIFY_BLOCKING]
 
 
+def _claim_key(finding: dict) -> str:
+    """What makes two findings the same fault, for telling a repair that
+    landed from one that came back carrying the sentence it was sent to fix.
+
+    The sentence rather than the problem: the checker is a sampled call and
+    writes its reasoning afresh each time, so the same fault comes back worded
+    differently while the quoted sentence is lifted from the script and does
+    not drift. Punctuation and case go because a rewrite that only re-points a
+    comma has not answered anything.
+    """
+    text = str(finding.get("sentence") or "").casefold()
+    return " ".join(re.sub(r"[^\w\s]", " ", text).split())
+
+
 def claim_faults(findings: list[dict]) -> str:
     """The findings as the repair prompt wants them."""
     return "\n".join(
@@ -2793,10 +2807,11 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
         still = blocking_findings(rechecked["findings"])
         # What each round actually came back with, kept round by round. The
         # refusal message can only describe the script that ends up standing,
-        # which when nothing lands is the original - so without this the two
-        # rounds in between leave no trace anywhere, and the run log reports
-        # the fault the draft *started* with as though it were the fault that
-        # survived. Three fixes to this pass were argued from that log.
+        # and the script that stands is now the last round that did not go
+        # backwards rather than the original, so the fault it names is the one
+        # that survived. This record is what proves that: it is the only place
+        # the rounds in between leave a trace, and three fixes to this pass
+        # were argued from a log that had none.
         report["attempts"].append({"round": attempt + 1,
                                    "script": repair["script"],
                                    "remaining": still})
@@ -2829,12 +2844,35 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
         # both topics of that run were refused with one finding standing.
         # The budget is still what bounds the spend; only a repair that makes
         # things worse ends the loop early.
-        if len(still) < len(faults):
-            # Fewer faults than it started with, but not none. Keep it as the
-            # best script so far, and give the repair its patience back: it has
-            # just demonstrated it is working, and the next round starts from
-            # this script rather than from the one that had more wrong with it.
+        # Whether the round worked is whether the faults it was handed are
+        # gone, which is not what the count says. Keeping the best script only
+        # on a strictly smaller count is the same arithmetic the paragraph
+        # above condemns, left in the bookkeeping when the 2026-09-03 fix
+        # corrected it in `stale`: a draft with one blocking
+        # finding can only ever go 1 -> 1 or 1 -> 0, and 0 has returned clean
+        # above, so the common case could never record a best round and always
+        # reverted to the original. Measured on the jellyfish draft of
+        # 2026-09-13: round 1 fixed a contradiction and left a different false,
+        # round 2 fixed that and left another, and the loop threw both away and
+        # refused the topic on the contradiction round 1 had already corrected.
+        #
+        # Either kind of progress counts, and neither implies the other. A
+        # round that clears two of three faults has improved the script and
+        # still leaves one it was handed; a round that clears the only fault
+        # it was handed has improved the script and leaves the count where it
+        # was. What is not progress is a rewrite that comes back carrying the
+        # sentence it was sent to fix with no fewer faults than it left with -
+        # the count cannot tell that apart from the jellyfish rounds, and this
+        # is the pass that must not wave anything through.
+        answered = not ({_claim_key(f) for f in faults}
+                        & {_claim_key(f) for f in still})
+        if answered or len(still) < len(faults):
             improved = (repair["script"], still)
+        if len(still) < len(faults):
+            # Fewer faults than it started with, but not none. Give the repair
+            # its patience back: it has just demonstrated it is working, and
+            # the next round starts from this script rather than from the one
+            # that had more wrong with it.
             stale = 0
         else:
             # Held level. Re-sampled rather than abandoned, but the patience
@@ -2846,8 +2884,17 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
         report["script"], report["remaining"] = improved
         report["revised"] = True
         report["blocked"] = True
+        # What the rounds did to the count is not what they did to the script.
+        # A draft that goes 1 -> 1 -> 1 fixing a different sentence each time
+        # has had two faults corrected and none of its total cleared, and
+        # calling that "cleared some of the fact-check" reads as the opposite
+        # of what the round-by-round warnings above it say.
+        did = ("cleared some of the fact-check but not all of it"
+               if len(improved[1]) < len(blocking)
+               else "fixed the faults it was given, and the re-check found "
+                    "others in their place")
         report["warnings"].append(
-            f"the rewrite cleared some of the fact-check but not all of it "
+            f"the rewrite {did} "
             f"after {spent} round(s) - "
             f"{len(improved[1])} finding(s) still stand"
             + (f" (the {ceiling}-round ceiling stopped it while it was still "
