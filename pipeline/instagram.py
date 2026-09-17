@@ -52,9 +52,11 @@ Standalone use:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Allow both `python pipeline/instagram.py` and `python -m pipeline.instagram`
@@ -623,7 +625,15 @@ def fetch(run_ids, features_by_run: dict) -> dict:
     ledger = perform.PerformanceLedger()
     # Once per fetch, not once per reel: it is one number about the account
     # and it does not change between two reels read in the same minute.
-    ledger.set_audience(audience(session))
+    account = dict(audience(session))
+    # Carried on the account block because that is already "what the provider
+    # said about the account", and because the report is the only place an
+    # unattended read can put a warning where it will be seen: the daily task
+    # runs windowless, so nothing written to stderr reaches anybody.
+    aged = token_age()
+    if aged:
+        account["token"] = aged
+    ledger.set_audience(account)
     out: dict[str, dict] = {}
 
     features_by_run = {run_id: features_by_run.get(run_id) or {}
@@ -721,6 +731,70 @@ def pin(run_id: str, media_id: str) -> list[str]:
     entry["media_id"] = media_id.strip()
     entry["matched_by"] = "pinned"
     return ledger.save()
+
+
+def token_age(token: str = "", *, state_path=None, today=None) -> dict:
+    """How long this token has been in use, and how long it has left.
+
+    Meta's long-lived token lasts sixty days and can only be refreshed *while
+    it is still valid*; past expiry it has to be generated again in the Meta
+    dashboard. So the failure mode is not "the read errors today" - it is "the
+    read has been erroring for three weeks and nothing said so", which is
+    exactly what an unattended daily task is for and exactly what it was not
+    doing.
+
+    Nothing here stores the token. It keeps a truncated SHA-256 of it and the
+    date that hash was first seen, so pasting a new token restarts the clock on
+    its own with nobody having to remember to reset anything. And nothing here
+    rewrites .env - `refresh_token` still prints the new token for a person to
+    paste, deliberately. What is automated is *noticing*.
+
+    Returns {first_seen, days_old, days_left, warn}. `days_left` is an upper
+    bound: the clock starts when this program first saw the token, which is at
+    or after the day it was minted, so a token is never reported as fresher
+    than it is.
+    """
+    token = (token or config.INSTAGRAM_ACCESS_TOKEN or "").strip()
+    if not token:
+        return {}
+    path = Path(state_path or config.INSTAGRAM_TOKEN_STATE)
+    today = today or datetime.now(timezone.utc).date()
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+    state = {}
+    try:
+        if path.is_file():
+            state = json.loads(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        state = {}
+
+    first_seen = str(state.get("first_seen") or "")
+    if state.get("token") != digest or not first_seen:
+        first_seen = today.isoformat()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"token": digest, "first_seen": first_seen},
+                           indent=2),
+                encoding="utf-8")
+        except OSError:
+            # Losing the file costs the warning, not the read. The clock simply
+            # restarts next time, which errs towards saying nothing rather than
+            # towards a wrong date.
+            pass
+
+    try:
+        started = date.fromisoformat(first_seen)
+    except ValueError:
+        return {}
+    days_old = (today - started).days
+    days_left = max(0, config.INSTAGRAM_TOKEN_DAYS - days_old)
+    return {
+        "first_seen": first_seen,
+        "days_old": days_old,
+        "days_left": days_left,
+        "warn": days_left <= config.INSTAGRAM_TOKEN_WARN_DAYS,
+    }
 
 
 def refresh_token(session=None) -> str:

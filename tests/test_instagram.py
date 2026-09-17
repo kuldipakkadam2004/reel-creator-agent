@@ -12,7 +12,7 @@ token apart from a permission that was never granted.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1012,3 +1012,92 @@ def test_an_unreadable_audience_is_empty_rather_than_zero(credentials):
         {"error": {"message": "(#190) bad token", "code": 190}},
     ]})
     assert instagram.audience(session) == {}
+
+
+# ---------------------------------------------------------------------------
+# How long the token has left
+#
+# A long-lived token lasts sixty days and can only be refreshed while it is
+# still valid. The failure mode is not "the read errors today", it is "the read
+# has been erroring for three weeks and nothing said so" - which is what an
+# unattended daily task is for and what it was not doing.
+# ---------------------------------------------------------------------------
+
+def test_the_first_sight_of_a_token_starts_its_clock(tmp_path):
+    state = tmp_path / "token-age.json"
+
+    aged = instagram.token_age("tok-abc", state_path=state,
+                               today=date(2026, 9, 17))
+
+    assert aged["first_seen"] == "2026-09-17"
+    assert aged["days_old"] == 0
+    assert aged["days_left"] == config.INSTAGRAM_TOKEN_DAYS
+    assert aged["warn"] is False
+
+
+def test_the_token_itself_is_never_written_down(tmp_path):
+    """Only a truncated hash of it, so the file is not a second copy of .env."""
+    state = tmp_path / "token-age.json"
+
+    instagram.token_age("hunter2-secret", state_path=state,
+                        today=date(2026, 9, 17))
+
+    assert "hunter2-secret" not in state.read_text(encoding="utf-8")
+
+
+def test_the_clock_keeps_running_for_the_same_token(tmp_path):
+    state = tmp_path / "token-age.json"
+    instagram.token_age("tok-abc", state_path=state, today=date(2026, 9, 1))
+
+    aged = instagram.token_age("tok-abc", state_path=state,
+                               today=date(2026, 9, 17))
+
+    assert aged["days_old"] == 16
+    assert aged["days_left"] == config.INSTAGRAM_TOKEN_DAYS - 16
+
+
+def test_pasting_a_new_token_restarts_the_clock_by_itself(tmp_path):
+    """Nobody has to remember to reset anything - the hash changing is the
+    signal, which is the whole reason it is stored."""
+    state = tmp_path / "token-age.json"
+    instagram.token_age("tok-old", state_path=state, today=date(2026, 7, 1))
+
+    aged = instagram.token_age("tok-new", state_path=state,
+                               today=date(2026, 9, 17))
+
+    assert aged["first_seen"] == "2026-09-17"
+    assert aged["days_old"] == 0
+
+
+def test_a_token_inside_the_warning_window_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "INSTAGRAM_TOKEN_DAYS", 60)
+    monkeypatch.setattr(config, "INSTAGRAM_TOKEN_WARN_DAYS", 14)
+    state = tmp_path / "token-age.json"
+    instagram.token_age("tok-abc", state_path=state, today=date(2026, 7, 20))
+
+    aged = instagram.token_age("tok-abc", state_path=state,
+                               today=date(2026, 9, 17))
+
+    assert aged["days_left"] == 1
+    assert aged["warn"] is True
+
+
+def test_no_token_is_no_answer_rather_than_a_zero(tmp_path, monkeypatch):
+    """A hand-typed ledger has no token, and saying it expires today would be
+    a warning about nothing."""
+    monkeypatch.setattr(config, "INSTAGRAM_ACCESS_TOKEN", "")
+
+    assert instagram.token_age("", state_path=tmp_path / "s.json") == {}
+
+
+def test_an_unreadable_state_file_costs_the_warning_not_the_read(tmp_path):
+    """Losing the file restarts the clock, which errs towards saying nothing
+    rather than towards a wrong date."""
+    state = tmp_path / "token-age.json"
+    state.write_text("{not json", encoding="utf-8")
+
+    aged = instagram.token_age("tok-abc", state_path=state,
+                               today=date(2026, 9, 17))
+
+    assert aged["first_seen"] == "2026-09-17"
+    assert aged["warn"] is False

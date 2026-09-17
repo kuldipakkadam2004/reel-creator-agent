@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import statistics
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -2710,3 +2710,168 @@ def test_the_binned_table_is_never_asked_what_was_playing(paths):
     """A binned reel was never published, so the question would separate the
     posted rows from the binned ones and report the tautology."""
     assert perform._post_time_facets({"status": "skipped"}) == []
+
+
+# ---------------------------------------------------------------------------
+# Writing it down, and filling in what nobody will type
+#
+# The reel is made and posted by hand on purpose; everything between those two
+# is meant to happen unattended. These pin the two halves of that: the report
+# existing whether or not anybody runs it, and the audio of a reel whose
+# operator has said once that they never touch audio in the app.
+# ---------------------------------------------------------------------------
+
+def test_nothing_is_assumed_about_the_audio_by_default(paths, monkeypatch):
+    """The honest default for anyone who has not said otherwise.
+
+    Pinned against `config` rather than against whatever the machine running
+    the suite happens to have in .env: this asserts the shipped default, and an
+    operator who has set PERFORMANCE_ASSUME_AUDIO must not turn that assertion
+    red.
+    """
+    monkeypatch.setattr(config, "PERFORMANCE_ASSUME_AUDIO", "")
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+
+    assert perform.assume_audio(ledger) == []
+    assert "audio" not in ledger.entry("r0")
+
+
+def test_an_assumed_audio_never_overwrites_one_that_was_typed(paths):
+    """A hand-recorded audio outranks a standing assumption, always."""
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    ledger.note_audio("r0", "added", "Blue Monday")
+
+    perform.assume_audio(ledger, "bed")
+
+    assert ledger.entry("r0")["audio"] == {"mode": "added",
+                                           "track": "Blue Monday"}
+
+
+def test_a_bed_is_never_assumed_onto_a_reel_that_was_rendered_without_one(paths):
+    """There the only two truths are silent and added, this cannot tell them
+    apart, and the one it would guess is the one that inverts the trial."""
+    features = _features("r0", trial={"name": "music", "arm": "off"})
+    features["music"] = ""
+    ledger = _ledger(features)
+    ledger.record("r0", {"reach": 100})
+
+    warnings = perform.assume_audio(ledger, "bed")
+
+    assert "audio" not in ledger.entry("r0")
+    assert any("rendered with no music bed" in w for w in warnings)
+
+
+def test_an_assumed_audio_reaches_a_reel_that_did_have_a_bed(paths):
+    features = _features("r0")
+    features["music"] = "documentary-background.mp3"
+    ledger = _ledger(features)
+    ledger.record("r0", {"reach": 100})
+
+    perform.assume_audio(ledger, "bed")
+
+    assert ledger.entry("r0")["audio"]["mode"] == "bed"
+
+
+def test_an_unknown_assumed_mode_assumes_nothing(paths):
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+
+    warnings = perform.assume_audio(ledger, "trending")
+
+    assert "audio" not in ledger.entry("r0")
+    assert any("is not one of" in w for w in warnings)
+
+
+def test_the_report_is_written_where_it_can_be_read_without_running_anything(
+        paths, tmp_path):
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    data = perform.report(ledger=ledger)
+
+    warnings = perform.write_report(
+        data, path=tmp_path / "report.txt", json_path=tmp_path / "report.json",
+        history_dir=tmp_path / "reports", today=date(2026, 9, 17),
+    )
+
+    assert warnings == []
+    text = (tmp_path / "report.txt").read_text(encoding="utf-8")
+    assert "2026-09-17" in text
+    assert "REELS" in text
+    assert json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert (tmp_path / "reports" / "2026-09-17.txt").is_file()
+
+
+def test_the_written_report_is_the_one_the_terminal_prints(paths):
+    """Captured from `_print_report` rather than rebuilt beside it, because two
+    renderers drift and the file would keep printing a dropped table."""
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    data = perform.report(ledger=ledger)
+
+    import contextlib
+    import io as _io
+    buffer = _io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        perform._print_report(data)
+
+    assert perform.render_report(data) == buffer.getvalue()
+
+
+def test_old_report_copies_are_pruned_to_the_history_kept(paths, tmp_path):
+    history = tmp_path / "reports"
+    history.mkdir()
+    for day in range(1, 8):
+        (history / f"2026-09-{day:02d}.txt").write_text("old", encoding="utf-8")
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    data = perform.report(ledger=ledger)
+
+    perform.write_report(
+        data, path=tmp_path / "report.txt", json_path=tmp_path / "report.json",
+        history_dir=history, keep=3, today=date(2026, 9, 17),
+    )
+
+    kept = sorted(p.name for p in history.glob("*.txt"))
+    assert kept == ["2026-09-06.txt", "2026-09-07.txt", "2026-09-17.txt"]
+
+
+def test_a_report_that_cannot_be_written_is_a_warning_not_a_failure(paths,
+                                                                   tmp_path):
+    """The ledger is already saved by the time this runs, and a file open in an
+    editor must not cost the day's numbers."""
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    data = perform.report(ledger=ledger)
+    blocked = tmp_path / "taken"
+    blocked.write_text("not a directory", encoding="utf-8")
+
+    warnings = perform.write_report(
+        data, path=blocked / "report.txt", json_path=blocked / "report.json",
+        history_dir=blocked / "reports", today=date(2026, 9, 17),
+    )
+
+    assert warnings
+    assert any("could not be written" in w for w in warnings)
+
+
+def test_a_token_near_expiry_is_named_in_the_report(paths):
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    ledger.set_audience({"followers": 3, "token": {"days_left": 5,
+                                                   "warn": True}})
+
+    data = perform.report(ledger=ledger)
+
+    assert any("expires in about 5 day(s)" in w for w in data["warnings"])
+
+
+def test_a_ledger_with_no_token_says_nothing_about_one(paths):
+    """Absent is silent - a hand-typed ledger has no token to expire."""
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+
+    data = perform.report(ledger=ledger)
+
+    assert not any("expires in about" in w for w in data["warnings"])

@@ -1988,6 +1988,77 @@ PERFORMANCE_CONFIDENCE = get_env_float("PERFORMANCE_CONFIDENCE", 0.90)
 #: about the reel, and nobody has to see a reel for it to be true.
 PERFORMANCE_MIN_REACH = get_env_int("PERFORMANCE_MIN_REACH", 30)
 
+# ---------------------------------------------------------------------------
+# The report, written down rather than remembered
+#
+# The reel is made by hand and posted by hand, on purpose. Everything between
+# those two is meant to happen without being asked, and until now the *reading*
+# was automated while the thing the reading is for was not: `--report` only
+# existed if somebody remembered to type it. A number nobody looks at is the
+# same as a number nobody took.
+#
+# So the read task writes it out. Same report, same filters, no new analysis -
+# this only decides where it lands.
+# ---------------------------------------------------------------------------
+
+#: Write the report to disk after every `--fetch`. The read task runs daily and
+#: is the only thing that touches the ledger unattended, so this is the moment
+#: the file can be made to describe the ledger as it now stands.
+PERFORMANCE_REPORT_ON_FETCH = get_env_bool("PERFORMANCE_REPORT_ON_FETCH", True)
+
+#: Where the current one lives. Overwritten each time, so this path is always
+#: the latest reading and never has to be found among dated files.
+PERFORMANCE_REPORT_FILE = OUTPUT_DIR / "report.txt"
+
+#: And the same thing as JSON, beside it, for anything that wants to read the
+#: numbers rather than the table.
+PERFORMANCE_REPORT_JSON = OUTPUT_DIR / "report.json"
+
+#: Dated copies, so a claim about what the report said last week can be
+#: checked instead of remembered. Cheap - the file is a few KB - and the only
+#: record of how a reading changed as it settled.
+PERFORMANCE_REPORT_DIR = OUTPUT_DIR / "reports"
+
+#: How many dated copies to keep. Two weeks is long enough to cover the 24-48h
+#: window several times over and short enough that the directory stays
+#: readable. 0 keeps every one.
+PERFORMANCE_REPORT_HISTORY = get_env_int("PERFORMANCE_REPORT_HISTORY", 14)
+
+#: What to record as the audio of a reel the provider has just matched to a
+#: post, when nobody is going to type it.
+#:
+#: Empty by default, and that is the honest default for anyone who has not said
+#: otherwise: `note_audio` exists precisely because the pipeline cannot see
+#: what happened in the Instagram app, and inventing an answer is the failure
+#: it was built to prevent. Set to "bed" by an operator who posts the rendered
+#: file as-is and never touches audio in the app - which is a fact about that
+#: operator's workflow, and one only they can assert.
+#:
+#: It never overwrites an audio already recorded by hand, and a reel whose run
+#: rendered no bed at all is left alone whatever this says - there the
+#: assumption would be wrong in the one direction that matters.
+PERFORMANCE_ASSUME_AUDIO = get_env("PERFORMANCE_ASSUME_AUDIO", "")
+
+#: How long a long-lived Instagram token lasts. Meta's is sixty days; this is
+#: here to be counted against, not to be changed.
+INSTAGRAM_TOKEN_DAYS = get_env_int("INSTAGRAM_TOKEN_DAYS", 60)
+
+#: How many days before that to start saying so. The refresh has to happen
+#: while the token is still valid - past expiry it cannot be refreshed at all
+#: and has to be generated again in the Meta dashboard - so the warning has to
+#: arrive with room to act on it.
+#:
+#: Nothing here rewrites .env. `refresh_token` prints the new token for a
+#: person to paste, deliberately, because a program that edits the one file
+#: secrets live in is a program that can mangle it. What is automated is
+#: noticing, which is the part that was silently failing.
+INSTAGRAM_TOKEN_WARN_DAYS = get_env_int("INSTAGRAM_TOKEN_WARN_DAYS", 14)
+
+#: Where the token's age is tracked. Stores a truncated SHA-256 of the token
+#: and the date it was first seen - never the token. A different hash means a
+#: new token was pasted, and the clock restarts on its own.
+INSTAGRAM_TOKEN_STATE = OUTPUT_DIR / "token-age.json"
+
 #: How many accounts belonging to whoever runs this see every reel - the
 #: operator's own login and any alts. Subtracted before anything is called
 #: engagement.

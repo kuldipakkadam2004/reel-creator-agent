@@ -1778,6 +1778,67 @@ Measured on 2026-09-16, with the read riding on step 8 and step 8 run by hand:
 | no baseline on one side | 1 |
 | **comparable** | **0** |
 
+### What the read task does besides read
+
+The reel is made by hand and posted by hand on purpose. Everything between
+those two is meant to happen without being asked — and for a while the reading
+was automated while the thing the reading is *for* was not: `--report` only
+existed if somebody remembered to type it. A number nobody looks at is the same
+as a number nobody took.
+
+So `--fetch` now does three things, in this order, and the last two are new:
+
+**1. It reads the numbers.** As before.
+
+**2. It fills in the audio, if you have said it can.** `PERFORMANCE_ASSUME_AUDIO=bed`
+records the audio of any newly matched reel, so you never type `--audio` again.
+It never overwrites one recorded by hand, and it never assumes a bed onto a reel
+that was rendered without one — there the only two truths are `silent` and
+`added`, this cannot tell them apart, and the one it would guess is the one that
+inverts the `music` trial. Leave it empty to be asked instead.
+
+**3. It writes the report down.**
+
+```
+output/report.txt              always the latest, overwritten each read
+output/report.json            the same reading, for anything that wants numbers
+output/reports/2026-09-17.txt dated copies, PERFORMANCE_REPORT_HISTORY of them
+```
+
+The dated copies matter more here than they look. A reel read at 19h and re-read
+at 43h produces two honestly different reports and only the second one is
+comparable, so "what did it say last week" is a question with a real answer
+rather than a memory. Writing is never fatal: the ledger is already saved by the
+time this runs, and a file open in an editor must not cost the day's numbers.
+
+The report is captured from the same printer the terminal uses rather than
+rebuilt beside it — two renderers drift, and the file would end up printing a
+table the terminal had stopped showing.
+
+### The token, which is the thing that fails silently
+
+A long-lived Instagram token lasts sixty days and **can only be refreshed while
+it is still valid**. Past expiry it cannot be refreshed at all; it has to be
+generated again in the Meta dashboard. So the failure mode is not a loud error
+today — it is an unattended daily read that has been doing nothing for three
+weeks with nobody looking.
+
+The report now counts. `output/token-age.json` holds a truncated SHA-256 of the
+token and the date it was first seen — never the token itself — and within
+`INSTAGRAM_TOKEN_WARN_DAYS` of sixty the report says so:
+
+```
+warning: the Instagram token expires in about 9 day(s) and cannot be refreshed
+once it has - python pipeline/instagram.py --refresh, then paste the new token
+into .env as INSTAGRAM_ACCESS_TOKEN
+```
+
+Pasting a new token restarts the clock by itself: the hash changes, and nobody
+has to remember to reset anything. **Nothing here rewrites `.env`** — `--refresh`
+still prints the token for a person to paste, deliberately, because a program
+that edits the one file secrets live in is a program that can mangle it. What is
+automated is the noticing, which is the part that was silently failing.
+
 Every ratio table in `--report` was empty — not thin, empty — and no amount of
 posting fixes that, because a hand-run read cannot reliably land in a 24-hour
 slot. A job firing once every 24 hours lands inside any 24-hour span by

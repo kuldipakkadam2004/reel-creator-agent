@@ -52,6 +52,9 @@ Standalone use:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import io
 import json
 import random
 import statistics
@@ -1985,6 +1988,26 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
         extra=_post_time_facets,
     )
 
+    # The token that fetched all of this, and how long it has left. A
+    # provider-agnostic read of whatever the provider chose to say: the key is
+    # absent for a hand-typed ledger and for any provider that does not use a
+    # token, and absent is silent.
+    #
+    # It is a warning rather than a line in the table because it is the one
+    # thing here that is about the *reading* and not about any reel, and
+    # because losing it is total - a lapsed token cannot be refreshed, only
+    # replaced from the Meta dashboard, and until it is every daily read does
+    # nothing at all.
+    token = (ledger.audience or {}).get("token") or {}
+    if token.get("warn"):
+        left = token.get("days_left")
+        warnings.append(
+            f"the Instagram token expires in about {left} day(s) and cannot "
+            f"be refreshed once it has - python pipeline/instagram.py "
+            f"--refresh, then paste the new token into .env as "
+            f"INSTAGRAM_ACCESS_TOKEN"
+        )
+
     # What was under the reel as published, and whether the trial still
     # describes it. Both are warnings rather than filters: a row that has not
     # been told simply does not answer the audio facet, and a row whose arm
@@ -3094,6 +3117,152 @@ def _print_recorded(run_id: str, entry: dict) -> None:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+# Writing it down
+#
+# The reel is made by hand and posted by hand on purpose. Everything between
+# those two was supposed to happen unattended, and the reading was - while the
+# thing the reading is *for* still required somebody to remember to type
+# `--report`. A number nobody looks at is the same as a number nobody took.
+# ---------------------------------------------------------------------------
+
+def render_report(data: dict) -> str:
+    """The report exactly as `--report` prints it, as a string.
+
+    Captured from `_print_report` rather than rebuilt beside it. Two renderers
+    drift: the file would keep printing a table the terminal had stopped
+    showing, and the first person to notice would be someone quoting a number
+    that no longer exists. There is one report and this is a second way of
+    spelling it.
+    """
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        _print_report(data)
+    return buffer.getvalue()
+
+
+def write_report(data: dict, *, path: Path | None = None,
+                 json_path: Path | None = None,
+                 history_dir: Path | None = None,
+                 keep: int | None = None,
+                 today: date | None = None) -> list[str]:
+    """Write the report to disk. Never raises - a failed write is a warning.
+
+    Deliberately not fatal. This runs at the tail of the daily read, and the
+    ledger has already been saved by the time it does: a full disk or a file
+    open in an editor must not turn a successful read into a failed task and
+    cost the day's numbers. The reading is the job; this is the copy.
+
+    Three files, because they answer different questions. `report.txt` is
+    always the latest and never has to be found. `report.json` is the same
+    reading for anything that wants the numbers rather than the table. The
+    dated copy under `reports/` is how a claim about what the report said last
+    week gets checked rather than remembered - which matters here more than it
+    usually would, because a reel read at 19h and re-read at 43h produces two
+    honestly different reports and only the second one is comparable.
+    """
+    path = Path(path or config.PERFORMANCE_REPORT_FILE)
+    json_path = Path(json_path or config.PERFORMANCE_REPORT_JSON)
+    history_dir = Path(history_dir or config.PERFORMANCE_REPORT_DIR)
+    keep = config.PERFORMANCE_REPORT_HISTORY if keep is None else keep
+    stamp = (today or datetime.now(timezone.utc).date()).isoformat()
+
+    warnings: list[str] = []
+    try:
+        text = render_report(data)
+    except Exception as exc:  # noqa: BLE001 - a report is never worth a crash
+        return [f"the report could not be rendered ({exc})"]
+
+    header = (f"# {stamp} - written by the daily read. "
+              f"python pipeline/perform.py --report prints this live.\n\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(header + text, encoding="utf-8")
+    except OSError as exc:
+        warnings.append(f"the report could not be written to {path} ({exc})")
+
+    try:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+    except OSError as exc:
+        warnings.append(f"the report json could not be written ({exc})")
+
+    # The dated copy, and then the pruning. Written after the two above so a
+    # directory that cannot be made costs only the history and not the report.
+    try:
+        history_dir.mkdir(parents=True, exist_ok=True)
+        (history_dir / f"{stamp}.txt").write_text(header + text,
+                                                  encoding="utf-8")
+    except OSError as exc:
+        warnings.append(f"the dated report copy could not be written ({exc})")
+        return warnings
+
+    if keep > 0:
+        try:
+            dated = sorted(history_dir.glob("????-??-??.txt"))
+            for stale in dated[:-keep]:
+                stale.unlink()
+        except OSError as exc:
+            warnings.append(f"old report copies could not be pruned ({exc})")
+    return warnings
+
+
+def assume_audio(ledger: PerformanceLedger, mode: str = "") -> list[str]:
+    """Fill in the audio of posted reels nobody is going to type it for.
+
+    Off unless `PERFORMANCE_ASSUME_AUDIO` says otherwise, and that is the right
+    default for anyone who has not said: `note_audio` exists *because* the
+    pipeline cannot see what happened in the Instagram app, and inventing an
+    answer is the failure it was built to prevent. Set by an operator who posts
+    the rendered file as-is and never touches audio in the app, it is not an
+    inference - it is that operator stating a fact about their own workflow
+    once instead of fourteen times.
+
+    Two things it will not do, and both are the reason it is safe to leave on:
+
+      * **it never overwrites.** An audio recorded by hand outranks a standing
+        assumption, always. That is what makes "I usually don't, but this once
+        I did" recoverable - record the exception and this leaves it alone.
+      * **it never assumes a bed onto a reel that had none.** `features`
+        knows what step 5 rendered. Where that is no bed, the only two truths
+        are `silent` and `added`, this cannot tell them apart, and the one it
+        would guess is the one that inverts the `music` trial. So it declines.
+    """
+    mode = (mode or config.PERFORMANCE_ASSUME_AUDIO or "").strip().lower()
+    if not mode:
+        return []
+    if mode not in AUDIO_MODES:
+        return [f"PERFORMANCE_ASSUME_AUDIO={mode!r} is not one of "
+                + ", ".join(sorted(AUDIO_MODES)) + " - nothing was assumed"]
+
+    filled, declined = 0, 0
+    for row in ledger.rows():
+        if row.get("status") != "posted" or row.get("audio"):
+            continue
+        rendered = ((row.get("features") or {}).get("music") or "")
+        if mode == "bed" and not rendered:
+            declined += 1
+            continue
+        ledger.note_audio(row.get("run_id") or "", mode)
+        filled += 1
+
+    warnings: list[str] = []
+    if filled:
+        warnings.append(
+            f"recorded audio={mode} on {filled} posted reel(s) from "
+            f"PERFORMANCE_ASSUME_AUDIO - set it to \"\" to be asked instead"
+        )
+    if declined:
+        warnings.append(
+            f"{declined} posted reel(s) were rendered with no music bed, so "
+            f"audio={mode} was not assumed onto them - only you know whether "
+            f"a track was added in the app. python pipeline/perform.py <run> "
+            f"--audio silent|added"
+        )
+    return warnings
+
+
+# ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -3205,6 +3374,31 @@ def main(argv: list[str] | None = None) -> int:
         if args.fetch:
             recorded, warnings = fetch(ledger=ledger)
             print(f"recorded {recorded} reel(s) from PERFORMANCE_PROVIDER.")
+
+            # After the numbers and before the report, so a reel that has just
+            # become posted carries its audio into the tables the report is
+            # about to render. Saved again because `fetch` saved before this
+            # touched anything.
+            assumed = assume_audio(ledger)
+            if assumed:
+                warnings.extend(assumed)
+                warnings.extend(ledger.save())
+
+            # The whole point of the daily read: it writes down what it found,
+            # so the report exists whether or not anybody types `--report`.
+            # Last, and never fatal - the ledger is already safely on disk, and
+            # a file that cannot be written must not cost the day's numbers.
+            if config.PERFORMANCE_REPORT_ON_FETCH:
+                try:
+                    data = report(ledger=ledger, metric=args.metric)
+                    warnings.extend(write_report(data))
+                    print(f"wrote {config.PERFORMANCE_REPORT_FILE}")
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(
+                        f"the read succeeded and the report did not ({exc}) - "
+                        f"python pipeline/perform.py --report"
+                    )
+
             for warning in warnings:
                 print(f"warning: {warning}", file=sys.stderr)
             return 0
