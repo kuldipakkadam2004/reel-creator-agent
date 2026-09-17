@@ -1805,19 +1805,35 @@ def test_youtube_skips_a_video_the_probe_cannot_play(monkeypatch):
     assert visuals.YouTubeCCProvider(session).search("deep sea", "video", 5) == []
 
 
-def test_youtube_credits_the_channel_because_cc_by_requires_it():
+def test_youtube_claims_no_licence_while_its_guards_are_off():
+    """The guards are commented out, so there is no grant to assert.
+
+    This pinned `attribution_required is True` and a `CC BY 3.0` stamp until
+    2026-09-17, which is the combination that credited an All Rights Reserved
+    upload as Creative Commons. The guards stayed off and the claim went; see
+    the `YouTubeCCProvider` docstring for the trade-off that leaves standing.
+    """
     provider = visuals.YouTubeCCProvider
-    assert provider.attribution_required is True
+    assert provider.attribution_required is False
+    assert provider.LICENSE == ""
     assert provider.key_env == ("YOUTUBE_API_KEY",)
 
 
-def test_youtube_attribution_names_the_channel_and_the_licence(monkeypatch):
+def test_youtube_attribution_names_the_channel_and_asserts_no_licence(monkeypatch):
+    """The channel is still named - that part was never the problem.
+
+    Crediting the uploader is right whatever the licence turns out to be. What
+    must not appear is a licence this provider never read off the upload, so
+    the parenthetical falls back to "see source" rather than naming one.
+    """
     monkeypatch.setattr(visuals, "_ytdl_probe", lambda url: (3840, 2160))
     session = _youtube_session([_yt_item(channel="Deep Sea Trust")])
     [candidate] = visuals.YouTubeCCProvider(session).search("deep sea", "video", 5)
 
     assert candidate.creator == "Deep Sea Trust"
-    assert "CC BY" in candidate.attribution
+    assert candidate.license == ""
+    assert "CC BY" not in candidate.attribution
+    assert "(see source)" in candidate.attribution
     assert "youtube.com/watch?v=v1" in candidate.attribution
 
 

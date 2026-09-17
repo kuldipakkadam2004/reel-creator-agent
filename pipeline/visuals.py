@@ -1282,23 +1282,52 @@ class YouTubeCCProvider(Provider):
     second pass is capped by YOUTUBE_PROBE_LIMIT - it is an HTTP round trip
     per video, and the ranking only ever needs a handful of survivors.
 
-    And the licence is a filter, not a label. videoLicense=creativeCommon is
-    sent on every search and status.license is checked again on the way back,
-    because a default YouTube upload is All Rights Reserved and carries no
-    reuse grant at all. CC-BY does, on the condition that the creator is
-    credited - hence attribution_required, and hence the channel name riding
-    in `creator` where step 6's credit block will find it.
+    **The licence is a filter here no longer, and this class now claims
+    nothing.** `videoLicense=creativeCommon` and the `status.license` re-check
+    are both commented out below, deliberately and at the user's instruction -
+    so a default YouTube upload, which is All Rights Reserved and carries no
+    reuse grant at all, is accepted as a candidate.
+
+    Until 2026-09-17 `LICENSE` was still `"CC BY 3.0"` and
+    `attribution_required` still `True`, which meant footage that grants
+    nothing was stamped with a licence it was never released under, in the reel
+    and in attribution.txt alike. Nothing had shipped through it - across the
+    16 reels in output/ the 225 credited assets were 207 pexels, 16 pixabay and
+    2 openverse, and zero youtube - so it was a latent fault, of the kind that
+    fires silently the first time a beat is filled from here.
+
+    Settled on 2026-09-17: the guards stay off, and the *claim* goes instead.
+    `LICENSE` is empty and `attribution_required` is False, so a candidate from
+    here asserts no licence at all. `Candidate.attribution` renders the empty
+    licence as "see source" and step 6's credit block omits the parenthetical
+    entirely, which is the honest reading - this pipeline does not know what
+    the upload was licensed under, and now says so rather than guessing
+    generously.
+
+    **What this does not fix, and what it deliberately leaves standing:**
+    dropping the stamp removes the false claim, not the exposure. An All
+    Rights Reserved clip can still be selected and shipped, now uncredited
+    rather than miscredited. That was the user's call on 2026-09-17 with the
+    trade-off stated. Do not uncomment the guards unasked - they were turned
+    off on purpose - and do not restore `LICENSE` to a constant: a licence this
+    provider has not read off the upload is a guess whichever way it points.
     """
 
     name = "youtube"
     kinds = ("video",)
     key_env = ("YOUTUBE_API_KEY",)
-    attribution_required = True
+    #: False because the licence guards are off: an upload this provider has
+    #: not screened may be All Rights Reserved, and "credit required" is a
+    #: statement about a grant that may not exist. See the class docstring.
+    attribution_required = False
 
     SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
     VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
     WATCH_URL = "https://www.youtube.com/watch?v="
-    LICENSE = "CC BY 3.0"
+    #: Empty on purpose. With the licence guards off nothing here has been
+    #: read off the upload, so there is no licence to name; `Candidate.
+    #: attribution` renders this as "see source".
+    LICENSE = ""
 
     def search(self, query: str, kind: str, limit: int) -> list[Candidate]:
         if kind != "video":
