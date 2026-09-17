@@ -2427,7 +2427,7 @@ Reading your own account this way needs **no App Review** — Meta lets an app's
 own admins and testers exercise permissions in development mode, which is
 exactly one person reading one account.
 
-Four things about it are worth knowing before relying on it:
+Five things about it are worth knowing before relying on it:
 
 * **there are two Instagram APIs and the tokens do not cross.** Which host
   answers depends on how the token was minted: Instagram Login tokens (they all
@@ -2446,7 +2446,19 @@ Four things about it are worth knowing before relying on it:
   is the nearest later post for every reel made that week, and the ones that
   were never posted each walk off with a copy of the numbers of the one that
   was. Measured the day this was first switched on: 7 posts, 7 exact caption
-  matches, and 5 further reels handed somebody else's numbers by the fallback;
+  matches, and 5 further reels handed somebody else's numbers by the fallback.
+  The claim runs in four rungs — hand pins, captions, the match this ledger
+  made on an earlier read, then the timestamp fallback — and **every rung takes
+  only from what is still unclaimed**. That last clause was missing from the
+  pin rung until 2026-09-17, and `--fetch` replayed each stored id through it,
+  so a timestamp guess written down once was re-asserted on every later read
+  and could not lose its post to the caption that should have taken it: media
+  `18100751702021813` sat under two rows for four days and its reach was
+  counted twice. A reel that loses a post now loses the numbers it read off it
+  and goes back to `pending`, with a warning naming who took it. **The check
+  that catches this is in `--report`'s own header:** if `REELS` says more
+  posted than `AUDIENCE` says the account has posts, a post is being worn
+  twice. Numbers typed in by hand are never dropped this way;
 * **the metric names churn.** `plays` became `views`, the reels metrics have
   been consolidated more than once, and which ones a media node answers for
   depends on its type and on the API version. So the request is made from a

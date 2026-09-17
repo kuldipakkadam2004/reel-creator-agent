@@ -477,7 +477,8 @@ def match(features: dict, posts: list[dict]) -> dict:
 
 
 def assign(features_by_run: dict, posts: list[dict],
-           pinned: dict | None = None) -> dict:
+           pinned: dict | None = None,
+           remembered: dict | None = None) -> dict:
     """Match every waiting reel at once, letting no post be claimed twice.
 
     `match` cannot see the other reels, which is right when a caption settles
@@ -488,15 +489,34 @@ def assign(features_by_run: dict, posts: list[dict],
     caption matches, and 5 further reels handed a copy of somebody else's
     numbers by the fallback.
 
-    A post is one reel. So pins are honoured first, then the captions - which
-    are evidence rather than a guess - and the timestamp fallback is left to
-    divide up whatever is still unclaimed, closest gap first and one reel each.
+    A post is one reel, in four rungs: hand pins, then the captions - which are
+    evidence rather than a guess - then whatever settled this reel on an
+    earlier read, and last the timestamp fallback dividing up what nobody has
+    claimed, closest gap first and one reel each. Every rung takes only from what
+    is still free - the pin rung included, which is the part that was missing.
+
+    `pinned` is what a person wrote with `--pin`. `remembered` is a match this
+    ledger made for itself on a previous fetch, and the two are separated
+    because feeding the second back in as the first is how the rule above was
+    broken for a week: read on 2026-09-17, media 18100751702021813 was held by
+    *two* rows at once - the mole-rat reel by a timestamp guess and the brain
+    reel by its caption - because the pinned rung was the one rung that never
+    checked `claimed`, and `fetch` replayed every stored id through it. A guess
+    written down once was therefore re-asserted forever, and could not lose its
+    post to the evidence that should have taken it. The ledger said 14 posted
+    against an account with 13 posts.
+
+    A hand pin still outranks a caption, and still holds even when no post
+    carries that id - a person saying which post this is, is the most
+    authoritative thing here, and one that matches nothing visible is worth
+    seeing rather than silently dropping. But two pins on one post are a typo,
+    not a fact, and the first one wins.
     """
     claimed: dict[str, str] = {}
     out: dict[str, dict] = {}
 
     for run_id, media_id in (pinned or {}).items():
-        if not media_id or run_id not in features_by_run:
+        if not media_id or run_id not in features_by_run or media_id in claimed:
             continue
         post = next((p for p in posts if (p.get("id") or "") == media_id), None)
         out[run_id] = (_found(post, "pinned") if post else
@@ -514,6 +534,22 @@ def assign(features_by_run: dict, posts: list[dict],
         if run_id in out or media_id in claimed:
             continue
         out[run_id] = _found(post, "caption")
+        claimed[media_id] = run_id
+
+    # What settled this reel last time. It sits below a fresh caption because a
+    # caption is evidence read off the account this minute, and above the
+    # fallback because a reel keeps its post across re-reads - that stability
+    # is the whole reason the id is stored. Refused when the post has already
+    # gone to somebody else, which is the audit event worth printing.
+    for run_id, media_id in (remembered or {}).items():
+        if not media_id or run_id not in features_by_run or run_id in out:
+            continue
+        if media_id in claimed:
+            continue
+        post = next((p for p in posts if (p.get("id") or "") == media_id), None)
+        if post is None:
+            continue
+        out[run_id] = _found(post, "remembered")
         claimed[media_id] = run_id
 
     guesses = []
@@ -592,9 +628,42 @@ def fetch(run_ids, features_by_run: dict) -> dict:
 
     features_by_run = {run_id: features_by_run.get(run_id) or {}
                        for run_id in run_ids}
-    pinned = {run_id: ledger.entry(run_id).get("media_id") or ""
-              for run_id in run_ids}
-    found_by_run = assign(features_by_run, posts, pinned)
+    # A hand pin and a match this ledger made for itself are not the same
+    # claim, and passing the second as the first is what let two reels hold one
+    # post. `matched_by` is the only thing that tells them apart: the provider
+    # always writes one, so a stored id carrying a "caption" or "timestamp" is
+    # this program's own earlier answer, and is remembered rather than obeyed.
+    #
+    # A stored id with no `matched_by` at all can only have been typed into the
+    # ledger by a person - `pin` writes "pinned" and the provider writes what
+    # settled it - so it is read as a pin, which is what somebody editing that
+    # field by hand means by it.
+    stored = {run_id: ledger.entry(run_id) for run_id in run_ids}
+    by_hand = {run_id: entry for run_id, entry in stored.items()
+               if (entry.get("matched_by") or "pinned") == "pinned"}
+    pinned = {run_id: entry.get("media_id") or ""
+              for run_id, entry in by_hand.items()}
+    remembered = {run_id: entry.get("media_id") or ""
+                  for run_id, entry in stored.items()
+                  if run_id not in by_hand}
+    found_by_run = assign(features_by_run, posts, pinned, remembered)
+
+    # A reel that held a post and does not any more kept numbers read off it,
+    # and they stay in every table until something takes them out.
+    for run_id, media_id in remembered.items():
+        if not media_id:
+            continue
+        if (found_by_run.get(run_id) or {}).get("media_id") == media_id:
+            continue
+        holder = next((other for other, found in found_by_run.items()
+                       if other != run_id and found
+                       and found.get("media_id") == media_id), "")
+        if ledger.disown(run_id):
+            print(f"warning: {run_id} no longer holds post {media_id}"
+                  + (f" - {holder} matched it on its caption." if holder else
+                     " - no post on the account carries that id.")
+                  + " Its numbers came off that post and have been dropped.",
+                  file=sys.stderr)
 
     for run_id in run_ids:
         features = features_by_run[run_id]
@@ -626,11 +695,12 @@ def fetch(run_ids, features_by_run: dict) -> dict:
         record["media_id"] = found["media_id"]
         record["permalink"] = found["permalink"]
         # On a re-read the media id comes from the ledger, so `assign` reports
-        # it as pinned whatever settled it the first time. Keep what did: a
-        # timestamp match is a guess, and quietly promoting it to "pinned" on
-        # the second fetch would hide the one row worth checking. A hand pin
-        # is written by `pin` and survives because nothing overwrites it.
-        if found["how"] != "pinned" or not record.get("matched_by"):
+        # it as "remembered" whatever settled it the first time. Keep what did:
+        # a timestamp match is a guess, and overwriting it on the second fetch
+        # would hide the one row worth checking. A hand pin is written by `pin`
+        # and survives because nothing overwrites it.
+        if (found["how"] not in ("pinned", "remembered")
+                or not record.get("matched_by")):
             record["matched_by"] = found["how"]
         # When the post went up, which is not when the reel was made - step 9
         # assumes the latter when nobody says otherwise, and the age of a

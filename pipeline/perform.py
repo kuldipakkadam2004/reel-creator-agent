@@ -762,6 +762,41 @@ class PerformanceLedger:
         entry["measurements"] = history[-MEASUREMENT_HISTORY:]
         return warnings
 
+    #: Everything a row holds only because a provider matched it to a post.
+    #: `features` is not here and never can be - it describes the reel itself,
+    #: which is true whatever post the reel did or did not become.
+    BORROWED = ("media_id", "permalink", "matched_by", "posted_at",
+                "posted_at_assumed", "hours_after_post", "metrics",
+                "measurements", "source", "recorded_at")
+
+    def disown(self, run_id: str) -> bool:
+        """Give back a post this reel turns out not to be, and its numbers.
+
+        A match that loses its post has to lose what came with it. Otherwise
+        the row keeps reading as posted, with a reach and a watch ratio taken
+        off somebody else's post, and there is nothing in the ledger to say so
+        - which is how media 18100751702021813 came to sit under two rows and
+        be counted twice in `--report` for four days. Wrong numbers are worse
+        than none: no table can tell them from real ones.
+
+        Every reading goes, not just the last, because the whole history was
+        read off the wrong post. Numbers typed in by hand are left alone - a
+        person saying what a reel did outranks a provider saying it cannot find
+        the post - and the row goes back to `pending`, which is a row waiting
+        to be matched or labelled, not a verdict about the reel.
+        """
+        entry = self.reels.get(run_id)
+        if not isinstance(entry, dict) or entry.get("source") == "manual":
+            return False
+        if not any(entry.get(field) for field in self.BORROWED):
+            return False
+        for field in self.BORROWED:
+            entry.pop(field, None)
+        if entry.get("status") == "posted":
+            entry["status"] = "pending"
+            entry["skip_reason"] = ""
+        return True
+
     def skip(self, run_id: str, reason: str = "") -> list[str]:
         """Record that a reel was made and not posted. The free label.
 
@@ -2247,6 +2282,20 @@ def fetch(*, ledger: PerformanceLedger | None = None, provider=None,
         for field in PROVIDER_ANNOTATIONS:
             if saved.get(field):
                 entry[field] = saved[field]
+
+    # The same merge in the other direction, for the rows a provider *cleared*.
+    # A reel whose post turns out to belong to another reel is disowned on
+    # disk, and it does not appear in `answers` - it has no numbers, that is
+    # the point - so the loop above never reaches it and the save below would
+    # put the borrowed numbers straight back. Merging field by field cannot
+    # express a deletion, so the disk row is adopted whole.
+    for run_id in [row["run_id"] for row in waiting]:
+        saved = stored.get(run_id)
+        held = ledger.reels.get(run_id)
+        if not isinstance(saved, dict) or not isinstance(held, dict):
+            continue
+        if held.get("media_id") and not saved.get("media_id"):
+            ledger.reels[run_id] = saved
 
     recorded = 0
     for run_id, metrics in (answers or {}).items():

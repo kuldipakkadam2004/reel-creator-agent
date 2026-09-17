@@ -500,6 +500,76 @@ def test_a_pin_holds_its_post_against_a_caption(credentials, tmp_path):
     assert found["author"]["media_id"] == ""
 
 
+def test_two_pins_on_one_post_do_not_both_hold_it(credentials, tmp_path):
+    """Two pins on one post are a typo, not a fact. The first one wins."""
+    made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    rows = {
+        "first": _row(tmp_path, "first", made=made),
+        "second": _row(tmp_path, "second", made=made),
+    }
+    posts = [_post("1792", "Whale song.", made + timedelta(hours=4))]
+
+    found = instagram.assign(rows, posts, {"first": "1792", "second": "1792"})
+
+    assert found["first"]["media_id"] == "1792"
+    assert found["second"]["media_id"] == ""
+
+
+def test_a_caption_takes_its_post_off_a_remembered_guess(credentials, tmp_path):
+    """The measured failure of 2026-09-17, in the shape it actually had.
+
+    The mole-rat reel held media 18100751702021813 on a timestamp guess made
+    before the brain reel existed. The brain reel then matched the same post on
+    its caption, and both rows kept it - because `fetch` replayed the stored id
+    as a pin and the pinned rung was the one rung that did not check `claimed`.
+    """
+    made = datetime(2026, 9, 12, 16, 51, tzinfo=timezone.utc)
+    rows = {
+        "mole": _row(tmp_path, "mole", made=made),
+        "brain": _row(tmp_path, "brain", made=made + timedelta(hours=18),
+                      caption="Your brain takes the rubbish out at night."),
+    }
+    posts = [_post("18100751702021813",
+                   "Your brain takes the rubbish out at night. #sleep",
+                   made + timedelta(hours=19))]
+
+    found = instagram.assign(rows, posts, None,
+                             {"mole": "18100751702021813"})
+
+    assert found["brain"]["media_id"] == "18100751702021813"
+    assert found["brain"]["how"] == "caption"
+    assert found["mole"]["media_id"] == ""
+
+
+def test_a_remembered_match_keeps_its_post_when_nothing_contests_it(
+        credentials, tmp_path):
+    """The reason the id is stored at all: a reel keeps its post on a re-read."""
+    made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    rows = {"r1": _row(tmp_path, "r1", made=made)}
+    posts = [_post("1792", "nothing this reel ever wrote",
+                   made + timedelta(hours=6))]
+
+    found = instagram.assign(rows, posts, None, {"r1": "1792"})
+
+    assert found["r1"]["media_id"] == "1792"
+    assert found["r1"]["how"] == "remembered"
+
+
+def test_a_remembered_match_does_not_outrank_a_hand_pin(credentials, tmp_path):
+    made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    rows = {
+        "guesser": _row(tmp_path, "guesser", made=made),
+        "pinned": _row(tmp_path, "pinned", made=made),
+    }
+    posts = [_post("1792", "Whale song.", made + timedelta(hours=4))]
+
+    found = instagram.assign(rows, posts, {"pinned": "1792"},
+                             {"guesser": "1792"})
+
+    assert found["pinned"]["media_id"] == "1792"
+    assert found["guesser"]["media_id"] == ""
+
+
 def test_when_the_post_went_up_comes_back_with_the_match(credentials, tmp_path):
     made = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
     posted = made + timedelta(hours=6)
@@ -714,6 +784,106 @@ def test_two_reels_are_never_handed_the_same_numbers(credentials, tmp_path,
                           {"canyon-9f9f9f9f": shelved, "ocean-1a2b3c": posted})
 
     assert list(out) == ["ocean-1a2b3c"]
+
+
+def test_a_reel_that_loses_its_post_loses_the_numbers_it_read_off_it(
+        credentials, tmp_path, monkeypatch):
+    """The corrupting half: a refused claim that keeps its borrowed numbers.
+
+    Reading this back is how the ledger came to say 14 posted against an
+    account with 13 posts. The row has to go back to pending with nothing on
+    it, because a wrong number is indistinguishable from a real one in the
+    report.
+    """
+    made = datetime.now(timezone.utc) - timedelta(hours=30)
+    mole = _row(tmp_path, "mole-98c893d3", made=made)
+    brain = _row(tmp_path, "brain-dbbe0d8f", made=made + timedelta(hours=18),
+                 caption="Your brain takes the rubbish out at night.")
+    ledger = perform.PerformanceLedger()
+    ledger.register(mole)
+    ledger.register(brain)
+    ledger.record("mole-98c893d3", {"reach": 15}, source="provider")
+    ledger.reels["mole-98c893d3"]["media_id"] = "1792"
+    ledger.reels["mole-98c893d3"]["matched_by"] = "timestamp"
+    ledger.save()
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("reach", 15)]},
+           posts=[_post("1792", "Your brain takes the rubbish out at night.",
+                        made + timedelta(hours=19))])
+
+    out = instagram.fetch(["mole-98c893d3", "brain-dbbe0d8f"],
+                          {"mole-98c893d3": mole, "brain-dbbe0d8f": brain})
+
+    assert list(out) == ["brain-dbbe0d8f"]
+    disowned = perform.PerformanceLedger().entry("mole-98c893d3")
+    assert disowned["status"] == "pending"
+    assert "metrics" not in disowned
+    assert "media_id" not in disowned
+    # The reel itself is untouched - it was made, whatever it did or did not
+    # become.
+    assert disowned["features"]["run_id"] == "mole-98c893d3"
+
+
+def test_a_disowned_row_survives_the_ledger_save_around_it(credentials,
+                                                            tmp_path,
+                                                            monkeypatch):
+    """Through `perform.fetch`, which is the path that actually runs.
+
+    The provider clears the row on disk while `perform.fetch` is holding a copy
+    read before it ran, and a disowned reel is not in `answers` - it has no
+    numbers, that is the point - so the annotation merge never reaches it and
+    the save puts the borrowed numbers straight back.
+
+    The reading here is 10 hours old, which is to say still unsettled. That is
+    the only state this heals from: `unsettled` never asks again about a row
+    whose reading is already comparable, so a bad match that got a comparable
+    reading stays until somebody repairs it by hand. Finding one is a REELS
+    count above the AUDIENCE post count in `--report`.
+    """
+    made = datetime.now(timezone.utc) - timedelta(hours=10)
+    mole = _row(tmp_path, "mole-98c893d3", made=made)
+    brain = _row(tmp_path, "brain-dbbe0d8f", made=made + timedelta(hours=1),
+                 caption="Your brain takes the rubbish out at night.")
+    ledger = perform.PerformanceLedger()
+    ledger.register(mole)
+    ledger.register(brain)
+    ledger.record("mole-98c893d3", {"reach": 15}, source="provider")
+    ledger.reels["mole-98c893d3"]["media_id"] = "1792"
+    ledger.reels["mole-98c893d3"]["matched_by"] = "timestamp"
+    ledger.save()
+    _wired(tmp_path, monkeypatch,
+           insights={"data": [_insight("reach", 15)]},
+           posts=[_post("1792", "Your brain takes the rubbish out at night.",
+                        made + timedelta(hours=2))])
+
+    perform.fetch(ledger=perform.PerformanceLedger(), provider=instagram.fetch)
+
+    disowned = perform.PerformanceLedger().entry("mole-98c893d3")
+    assert disowned["status"] == "pending"
+    assert "metrics" not in disowned
+    assert perform.PerformanceLedger().entry(
+        "brain-dbbe0d8f")["metrics"]["reach"] == 15
+
+
+def test_numbers_typed_in_by_hand_are_not_dropped_by_the_matcher(
+        credentials, tmp_path, monkeypatch):
+    """A person saying what a reel did outranks a provider losing the post."""
+    made = datetime.now(timezone.utc) - timedelta(hours=30)
+    features = _features(tmp_path, made=made, caption="Snailfish live deep.")
+    ledger = perform.PerformanceLedger()
+    ledger.register(features)
+    ledger.record("ocean-1a2b3c", {"reach": 400}, source="manual")
+    ledger.reels["ocean-1a2b3c"]["media_id"] = "1792"
+    ledger.reels["ocean-1a2b3c"]["matched_by"] = "timestamp"
+    ledger.save()
+    _wired(tmp_path, monkeypatch, insights={"data": []},
+           posts=[_post("4242", "some other account's post", made)])
+
+    instagram.fetch(["ocean-1a2b3c"], {"ocean-1a2b3c": features})
+
+    entry = perform.PerformanceLedger().entry("ocean-1a2b3c")
+    assert entry["metrics"]["reach"] == 400
+    assert entry["status"] == "posted"
 
 
 # ---------------------------------------------------------------------------
