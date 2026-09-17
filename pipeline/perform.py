@@ -102,7 +102,13 @@ from pipeline import visuals  # noqa: E402
 #: `look_graded` is the load-bearing one: a reel nobody looked at and a reel
 #: that was looked at and found clean both carry an empty `look_problems`, and
 #: scoring them together would put the whole back catalogue in the clean arm.
-FEATURES_VERSION = 6
+#: 7 adds `beats_from_neutral`, which step 4 had counted into its manifest from
+#: the start and nothing had ever read. It is the share of the reel given over
+#: to the one safe shot the query writer picks for the whole video, and it is
+#: the only column that separates the two reels step 5b graded 1/3 from the one
+#: it graded 2. An older row cannot answer it: the count exists in manifests
+#: going back only as far as the counter, and "no such column" is not "none".
+FEATURES_VERSION = 7
 
 #: 2 adds `watch_ratio` and the `measurements` history, and both are derived
 #: for rows already in the file rather than left blank - the numbers needed
@@ -407,6 +413,10 @@ def features_for(record: dict) -> dict:
         "mean_shot_seconds": stats.get("mean_shot_seconds"),
         "first_shot_seconds": stats.get("first_shot_seconds"),
         "assets_sourced": stats.get("assets_sourced"),
+        # How many beats were filled from the video's single neutral shot.
+        # None on every row before version 7, which is why the facet below is
+        # gated: a row that never counted this is not a row that counted zero.
+        "beats_from_neutral": stats.get("beats_from_neutral"),
         "moving_shots": stats.get("moving_shots") or 0,
         "sfx_cues": stats.get("sfx_cues") or 0,
         # "file", not "name": `Track.to_dict` writes the filename under "file"
@@ -1268,6 +1278,17 @@ def facets(features: dict, vocabulary: dict[str, list[str]]) -> list[tuple[str, 
             pairs.append(("look grade", str(features["look_grade"])))
         if features.get("cover_look_grade") is not None:
             pairs.append(("cover look grade", str(features["cover_look_grade"])))
+    # Version 7: the neutral shot is one shot for the whole video, so a reel
+    # that filled several beats from it is showing the same footage over and
+    # over. The two reels graded 1/3 by the look pass had filled 4 of 8 and 5
+    # of 6 beats that way; the one graded 2 had filled 1 of 5. That is three
+    # rows and a guess at a mechanism, not a finding - the facet is here so
+    # reach can answer it. Banded, because the count is bounded by
+    # VISUAL_MAX_NEUTRAL_BEATS and raw counts would split the arms too thin.
+    if _written_since(features, 7) and features.get("beats_from_neutral") is not None:
+        filled = int(features["beats_from_neutral"])
+        pairs.append(("neutral beats",
+                      "0" if filled == 0 else "1" if filled == 1 else "2+"))
     if features.get("aligner"):
         pairs.append(("captions", str(features["aligner"])))
     # Only from version 3: every earlier row records "" for the music whether

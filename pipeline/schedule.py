@@ -45,6 +45,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
+from pipeline import perform  # noqa: E402
 from pipeline import run as run_step  # noqa: E402
 
 RULE = "-" * 68
@@ -58,6 +59,17 @@ WINDOWS = os.name == "nt"
 #: The task calls this, with `--scheduled` so the ledger can tell a 5pm run
 #: from one you started at a console.
 RUNNER = config.BASE_DIR / "pipeline" / "run.py"
+
+#: The other job that can go on a clock: step 9's read. It makes nothing, spends
+#: nothing on Gemini or ElevenLabs, and writes only the ledger - so it is the
+#: one piece of this pipeline that is safe to automate without also deciding
+#: that a video gets published somewhere.
+READER = config.BASE_DIR / "pipeline" / "perform.py"
+
+#: The jobs `install` knows how to register. Two, not one, because they are
+#: separate decisions with opposite consequences for getting them wrong - see
+#: `job_spec`.
+JOBS = ("reel", "read")
 
 #: Task Scheduler's own schema. `1.2` is the version that has every setting
 #: used here and is understood by Windows 7 onwards - there is nothing to gain
@@ -80,6 +92,59 @@ _LAST_RESULT = {
 
 class ScheduleError(RuntimeError):
     """The task could not be installed, removed or read."""
+
+
+def job_spec(job: str = "reel") -> dict:
+    """Everything that differs between the reel task and the read task.
+
+    Read out of `config` on every call rather than baked in at import, so that
+    what gets installed is what `python config.py` currently says - the same
+    contract `build_xml` already had for the other settings.
+
+    **Why these are two tasks and not one with a flag.** Making a reel is a
+    content decision, and somebody may reasonably want to keep it by hand.
+    Reading how the last reel did is not a decision at all, and the cost of
+    missing it is permanent: a reading has to land between
+    PERFORMANCE_MIN_AGE_HOURS and PERFORMANCE_WINDOW_HOURS or that reel can
+    never be compared with any other, ever. Measured 2026-09-16 with the read
+    riding on step 8 and step 8 run by hand: 0 of 12 posted reels were
+    comparable, 7 of them read only past 48h. So the read is worth a clock
+    even where the reel is not, and each has to be installable and removable
+    without touching the other.
+    """
+    if job not in JOBS:
+        raise ScheduleError(
+            f"unknown job {job!r} - it is one of {', '.join(JOBS)}"
+        )
+    if job == "read":
+        return {
+            "job": "read",
+            "runner": READER,
+            "arguments": f'"{READER}" --fetch',
+            "task_name": config.SCHEDULE_READ_TASK_NAME,
+            "time_of_day": config.SCHEDULE_READ_TIME,
+            "time_limit": config.SCHEDULE_READ_TIME_LIMIT_MINUTES,
+            "description": (
+                "Reel Creator Agent - read how already-posted reels did "
+                "(step 9) and write the numbers to the ledger. It makes no "
+                "video, posts nothing, and spends nothing on Gemini or "
+                "ElevenLabs."
+            ),
+            "makes": "It reads numbers into the ledger and makes nothing.",
+        }
+    return {
+        "job": "reel",
+        "runner": RUNNER,
+        "arguments": f'"{RUNNER}" --scheduled',
+        "task_name": config.SCHEDULE_TASK_NAME,
+        "time_of_day": config.SCHEDULE_TIME,
+        "time_limit": config.SCHEDULE_TIME_LIMIT_MINUTES,
+        "description": (
+            "Reel Creator Agent - generate one reel a day (step 8). Output "
+            "lands in output/<date>/ and is not posted anywhere."
+        ),
+        "makes": "It generates the reel and stops there - nothing is posted.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +211,16 @@ def build_xml(*, time_of_day: str | None = None, python: Path | None = None,
               catch_up: bool | None = None, wake: bool | None = None,
               retry_minutes: int | None = None, retry_count: int | None = None,
               time_limit_minutes: int | None = None,
-              windowless: bool = True, now: datetime | None = None) -> str:
-    """The Task Scheduler XML for the daily run.
+              windowless: bool = True, now: datetime | None = None,
+              job: str = "reel") -> str:
+    """The Task Scheduler XML for one of the two daily jobs.
 
     Every default comes from config, so the task that gets installed is the one
-    `python config.py` says will be installed.
+    `python config.py` says will be installed. `job` picks which set of those
+    defaults applies - see `job_spec`.
     """
-    hour, minute = parse_time(time_of_day or config.SCHEDULE_TIME)
+    spec = job_spec(job)
+    hour, minute = parse_time(time_of_day or spec["time_of_day"])
     start = next_occurrence(hour, minute, now=now)
 
     catch_up = config.SCHEDULE_CATCH_UP if catch_up is None else catch_up
@@ -161,11 +229,11 @@ def build_xml(*, time_of_day: str | None = None, python: Path | None = None,
                else retry_minutes)
     count = (config.SCHEDULE_RETRY_COUNT if retry_count is None
              else retry_count)
-    limit = (config.SCHEDULE_TIME_LIMIT_MINUTES if time_limit_minutes is None
+    limit = (spec["time_limit"] if time_limit_minutes is None
              else time_limit_minutes)
 
     interpreter = python or python_command(windowless=windowless)
-    arguments = f'"{RUNNER}" --scheduled'
+    arguments = spec["arguments"]
 
     # RestartOnFailure with a count of 0 is not "no retries", it is invalid.
     # Leaving the element out entirely is how you say no retries.
@@ -180,8 +248,8 @@ def build_xml(*, time_of_day: str | None = None, python: Path | None = None,
 <Task version="{TASK_VERSION}" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>{escape(current_user())}</Author>
-    <Description>Reel Creator Agent - generate one reel a day (step 8). Output lands in output/&lt;date&gt;/ and is not posted anywhere.</Description>
-    <URI>\\{escape(config.SCHEDULE_TASK_NAME)}</URI>
+    <Description>{escape(spec["description"])}</Description>
+    <URI>\\{escape(spec["task_name"])}</URI>
   </RegistrationInfo>
   <Principals>
     <Principal id="Author">
@@ -230,17 +298,20 @@ def build_xml(*, time_of_day: str | None = None, python: Path | None = None,
 
 
 def crontab_line(*, time_of_day: str | None = None,
-                 python: str | None = None) -> str:
+                 python: str | None = None, job: str = "reel") -> str:
     """The same job as a crontab entry, for when this leaves the laptop.
 
     Not installed by anything here - a crontab is one line and installing it
     behind someone's back on a machine this code has never seen is not a
     favour. Printed so it can be pasted.
     """
-    hour, minute = parse_time(time_of_day or config.SCHEDULE_TIME)
+    spec = job_spec(job)
+    hour, minute = parse_time(time_of_day or spec["time_of_day"])
     interpreter = python or sys.executable
+    script = spec["runner"].name
+    tail = "--fetch" if job == "read" else "--scheduled"
     return (f"{minute} {hour} * * * cd '{config.BASE_DIR}' && "
-            f"'{interpreter}' pipeline/run.py --scheduled")
+            f"'{interpreter}' pipeline/{script} {tail}")
 
 
 # ---------------------------------------------------------------------------
@@ -273,15 +344,19 @@ def _schtasks(*args: str) -> tuple[int, str]:
     return completed.returncode, output.decode(errors="replace").strip()
 
 
-def install(*, task_name: str | None = None, **kwargs) -> str:
+def install(*, task_name: str | None = None, job: str = "reel",
+            **kwargs) -> str:
     """Write the task definition and register it. Returns schtasks' reply.
 
     Replaces an existing task of the same name, which is what makes `install`
-    the way to *change* the time as well as set it: there is one task, and
-    running install again is how it gets edited.
+    the way to *change* the time as well as set it: there is one task per job,
+    and running install again is how it gets edited. `job` picks which of the
+    two - they have different names, so installing one never disturbs the
+    other.
     """
-    name = task_name or config.SCHEDULE_TASK_NAME
-    xml = build_xml(**kwargs)
+    spec = job_spec(job)
+    name = task_name or spec["task_name"]
+    xml = build_xml(job=job, **kwargs)
 
     # UTF-16 with a BOM, matching the declaration in the document. schtasks
     # rejects a UTF-8 file as malformed XML rather than saying so plainly, and
@@ -341,32 +416,76 @@ def run_now(task_name: str | None = None) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _print_installed(name: str, xml_time: str, interpreter: Path) -> None:
+def _print_installed(name: str, xml_time: str, interpreter: Path,
+                     job: str = "reel") -> None:
+    spec = job_spec(job)
     hour, minute = parse_time(xml_time)
     first = next_occurrence(hour, minute)
+    flag = " --read" if job == "read" else ""
     print(RULE)
     print(f"INSTALLED : {name}")
     print(f"RUNS      : every day at {xml_time}")
     print(f"FIRST     : {first.strftime('%a %d %b, %H:%M')}")
-    print(f"COMMAND   : {interpreter} \"{RUNNER}\" --scheduled")
-    print(f"OUTPUT    : {config.OUTPUT_DIR}\\<date>\\<run id>\\")
-    print(f"LOGS      : {config.LOGS_DIR}")
+    print(f"COMMAND   : {interpreter} {spec['arguments']}")
+    if job == "read":
+        print(f"WRITES    : {config.PERFORMANCE_FILE}")
+    else:
+        print(f"OUTPUT    : {config.OUTPUT_DIR}\\<date>\\<run id>\\")
+        print(f"LOGS      : {config.LOGS_DIR}")
     print(RULE)
-    print("It generates the reel and stops there - nothing is posted.")
+    print(spec["makes"])
     print("Check on it with:")
-    print("  python pipeline/schedule.py status")
-    print("  python pipeline/run.py --status")
-    print("Try the whole thing once, right now, without waiting:")
-    print("  python pipeline/schedule.py run-now")
+    print(f"  python pipeline/schedule.py status{flag}")
+    print("  python pipeline/perform.py" if job == "read"
+          else "  python pipeline/run.py --status")
+    if job == "read":
+        # The one fact that explains why this task is worth having even
+        # where the reel task is not.
+        print(f"A reading counts only between "
+              f"{config.PERFORMANCE_MIN_AGE_HOURS}h and "
+              f"{config.PERFORMANCE_WINDOW_HOURS}h after a reel is "
+              f"posted, and a daily")
+        print("trigger lands in that window exactly once - which is the "
+              "whole reason to put this on a clock.")
+    print("Try it once, right now, without waiting:")
+    print(f"  python pipeline/schedule.py run-now{flag}")
 
 
-def _print_status(name: str) -> None:
+def _print_read_state() -> None:
+    """What the read task is for, in the only terms that matter: the ledger.
+
+    The OS can say the process started. Only this can say whether any reel got
+    a reading inside the window it had to be inside, which is the entire point
+    of putting the read on a clock.
+    """
+    try:
+        ledger = perform.PerformanceLedger()
+    except Exception as exc:  # a ledger that will not load is not a crash here
+        print(f"could not read the ledger: {exc}")
+        return
+    rows = ledger.rows()
+    posted = [r for r in rows if r.get("status") == "posted"]
+    lo = config.PERFORMANCE_MIN_AGE_HOURS
+    hi = config.PERFORMANCE_WINDOW_HOURS
+    inside = [r for r in posted
+              if r.get("hours_after_post") is not None
+              and lo <= float(r["hours_after_post"]) <= hi]
+    waiting = ledger.unsettled()
+    print(f"posted   : {len(posted)} reel(s), {len(inside)} of them read "
+          f"inside {lo}-{hi}h and so comparable")
+    print(f"waiting  : {len(waiting)} reel(s) this task would ask about tonight")
+    print("  python pipeline/perform.py          which ones, and when each is due")
+    print("  python pipeline/perform.py --report what they add up to")
+
+
+def _print_status(name: str, job: str = "reel") -> None:
+    flag = " --read" if job == "read" else ""
     fields = query(name)
     print(RULE)
     if fields is None:
         print(f"TASK    : {name} is not installed")
         print(RULE)
-        print("  python pipeline/schedule.py install")
+        print(f"  python pipeline/schedule.py install{flag}")
         return
 
     result = fields.get("last result", "")
@@ -374,13 +493,25 @@ def _print_status(name: str) -> None:
     print(f"STATE   : {fields.get('scheduled task state') or fields.get('status', '?')}")
     print(f"NEXT    : {fields.get('next run time', '?')}")
     print(f"LAST    : {fields.get('last run time', '?')}")
+    # Exit 1 means different things to the two jobs, and pointing somebody at
+    # output/logs/ after a failed *read* sends them to a directory the read
+    # task never writes to. It leaves no transcript at all - under pythonw.exe
+    # its stdout goes nowhere - so what it did is read out of the ledger below.
+    meaning = dict(_LAST_RESULT)
+    if job == "read":
+        meaning["1"] = ("the read failed - run `python pipeline/perform.py "
+                        "--fetch` by hand to see why")
     print(f"RESULT  : {result}"
-          + (f"  ({_LAST_RESULT[result]})" if result in _LAST_RESULT else ""))
+          + (f"  ({meaning[result]})" if result in meaning else ""))
     print(f"RUNS    : {fields.get('task to run', '?')}")
     print(RULE)
 
     # The OS knows whether the process started. Only the ledger knows whether a
     # reel came out of it, which is the question actually being asked.
+    if job == "read":
+        _print_read_state()
+        return
+
     runs = run_step.load_ledger().get("runs", [])
     if not runs:
         print("no runs recorded yet - output/runs.json is empty.")
@@ -396,7 +527,9 @@ def main(argv: list[str] | None = None) -> int:
     run_step._attach_console()
     run_step._make_output_lossy()
     parser = argparse.ArgumentParser(
-        description="Install the daily reel run into the OS scheduler.",
+        description="Install a daily job into the OS scheduler: the reel run "
+                    "(step 8), or --read, which only reads how already-posted "
+                    "reels did (step 9) and makes nothing.",
     )
     parser.add_argument("action",
                         choices=("install", "uninstall", "status", "run-now",
@@ -408,7 +541,15 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"24-hour local time to run "
                              f"(default: {config.SCHEDULE_TIME})")
     parser.add_argument("-n", "--name", default=None,
-                        help=f"task name (default: {config.SCHEDULE_TASK_NAME})")
+                        help=f"task name (default: {config.SCHEDULE_TASK_NAME}, "
+                             f"or {config.SCHEDULE_READ_TASK_NAME} with --read)")
+    parser.add_argument("--read", action="store_true",
+                        help="act on the reading task instead of the reel "
+                             "task: it asks the provider how already-posted "
+                             "reels did and writes the ledger, generating no "
+                             "video and spending nothing on Gemini or "
+                             "ElevenLabs. Its own task name, so the two "
+                             "install and uninstall independently")
     parser.add_argument("--python", default=None, metavar="PATH",
                         help="interpreter to run it with (default: the one "
                              "installing it, windowless if available)")
@@ -424,8 +565,10 @@ def main(argv: list[str] | None = None) -> int:
                              "the scheduled time")
     args = parser.parse_args(argv)
 
-    name = args.name or config.SCHEDULE_TASK_NAME
-    moment = args.time or config.SCHEDULE_TIME
+    job = "read" if args.read else "reel"
+    spec = job_spec(job)
+    name = args.name or spec["task_name"]
+    moment = args.time or spec["time_of_day"]
     options = dict(
         time_of_day=moment,
         python=Path(args.python) if args.python else None,
@@ -437,34 +580,45 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "preview":
             if WINDOWS:
-                print(build_xml(**options))
+                print(build_xml(job=job, **options))
             else:
                 print("# not Windows - the equivalent crontab line is:")
                 print(crontab_line(time_of_day=moment,
-                                   python=args.python))
+                                   python=args.python, job=job))
             return 0
 
         if args.action == "status":
-            _print_status(name)
+            _print_status(name, job)
             return 0
 
         if args.action == "uninstall":
             uninstall(name)
-            print(f"removed {name}. Nothing will run by itself any more.")
+            # Deliberately not "nothing runs by itself any more": the other
+            # task may well still be installed, and saying otherwise about a
+            # scheduler is the kind of wrong that is found out late.
+            other = job_spec("reel" if job == "read" else "read")
+            print(f"removed {name}.")
+            print(f"  python pipeline/schedule.py status"
+                  + (" --read" if job != "read" else "")
+                  + f"   whether {other['task_name']} is still installed")
             return 0
 
         if args.action == "run-now":
             run_now(name)
             print(f"started {name}.")
             print("It runs in the background - watch it with:")
-            print(f"  python pipeline/run.py --status")
-            print(f"  the newest file in {config.LOGS_DIR}")
+            if job == "read":
+                print("  python pipeline/perform.py")
+            else:
+                print(f"  python pipeline/run.py --status")
+                print(f"  the newest file in {config.LOGS_DIR}")
             return 0
 
-        install(task_name=name, **options)
+        install(task_name=name, job=job, **options)
         _print_installed(name, moment,
                          options["python"]
-                         or python_command(windowless=not args.console))
+                         or python_command(windowless=not args.console),
+                         job)
         return 0
 
     except ScheduleError as exc:

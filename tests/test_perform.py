@@ -283,6 +283,43 @@ def test_features_read_the_run_directory_s_manifests(paths, tmp_path):
     assert features["duration_band"] == "50-60s"
 
 
+def test_the_neutral_shot_count_reaches_the_features_row(paths, tmp_path):
+    """The visuals manifest counted it from the start and nothing ever read it.
+
+    It is the one number that separates the two reels the look pass graded 1/3
+    (4 of 8 beats and 5 of 6 from the neutral shot) from the one it graded 2
+    (1 of 5). Until it is on the row there is nothing for reach to test that
+    against, and the cap that now bounds it is only a declared prior.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "assembly.json").write_text(json.dumps({
+        "duration_seconds": 42.24,
+        "stats": {"shots": 17, "beats": 8, "beats_from_neutral": 4},
+    }), encoding="utf-8")
+
+    features = perform.features_for({"run_id": "beetle-999fcdcf",
+                                     "run_dir": str(run_dir)})
+
+    assert features["beats_from_neutral"] == 4
+
+
+def test_the_neutral_shot_facet_is_banded_and_version_gated():
+    """A row that never counted this is not a row that counted zero."""
+    row = {**_features("r1"), "beats_from_neutral": 3}
+    assert ("neutral beats", "2+") in perform.facets(row, {})
+
+    none_used = {**_features("r2"), "beats_from_neutral": 0}
+    assert ("neutral beats", "0") in perform.facets(none_used, {})
+
+    # Both absences: an older row, and a row from a run that never recorded it.
+    older = {**_features("r3"), "features_version": 6, "beats_from_neutral": 3}
+    unrecorded = {**_features("r4"), "beats_from_neutral": None}
+    for row in (older, unrecorded):
+        assert not any(name == "neutral beats"
+                       for name, _ in perform.facets(row, {}))
+
+
 def test_the_music_column_reads_what_step_5_actually_writes(paths, tmp_path):
     """Ties the reader to the writer instead of to a hand-typed fixture.
 

@@ -2456,6 +2456,7 @@ def _settings_fingerprint(settings: dict) -> str:
             "provider_floors",
             "kinds", "allow_landscape", "query_mode", "image_duration",
             "relevance_mode", "relevance_floor", "relevance_shortlist",
+            "max_neutral_beats",
         )
     }
     blob = json.dumps(relevant, sort_keys=True, default=str)
@@ -3015,6 +3016,10 @@ class _RunState:
     #: and a dozen museums, and one throttling host must not cost us the others.
     rate_limited: set[str] = dataclass_field(default_factory=set)
     ordinals: dict[int, int] = dataclass_field(default_factory=dict)
+    #: How many beats have already been filled from the video's neutral shot.
+    #: Run-level, not per-beat, because the neutral is one shot for the whole
+    #: video: the second beat to reach for it shows the same footage again.
+    neutral_beats: int = 0
     #: What this run has already put on screen, for the variety check: the
     #: content words of every taken clip's description, and how many clips each
     #: creator has contributed. Both are about the *run*, not the beat - the
@@ -3411,6 +3416,7 @@ def source_visuals(
             else config.VISUAL_RELEVANCE_FLOOR
         ),
         "relevance_shortlist": max(1, int(config.VISUAL_RELEVANCE_SHORTLIST)),
+        "max_neutral_beats": int(config.VISUAL_MAX_NEUTRAL_BEATS),
         "similar_overlap": float(
             similar_overlap if similar_overlap is not None
             else config.VISUAL_SIMILAR_OVERLAP
@@ -3526,6 +3532,17 @@ def source_visuals(
         rejections, warnings, rejected_keys, screened_keys,
     )
 
+    # The screen has already handed whole beats to the neutral shot, and those
+    # put the same footage on screen as the top-up below does. Counting them
+    # here means the cap bounds how much of the reel is that one shot, not
+    # merely how many beats reached it by the second route. The screen's own
+    # fallback is never capped: a beat gets there only when the alternative is
+    # a clip that contradicts the narration, or nothing at all.
+    state.neutral_beats = sum(
+        1 for notes in screen_notes.values()
+        if any(n.startswith("fell back to the neutral shot") for n in notes)
+    )
+
     # --- pass 2: download in beat order ------------------------------------
     def take(rows, count, beat, avoid_similar=True):
         """`_acquire` with this run's plumbing already filled in."""
@@ -3591,6 +3608,7 @@ def source_visuals(
                 "wanted": want,
             }
 
+            deferred = False
             acquired = take(keepers, want, beat)
             if len(acquired) < want:
                 # Variety is a preference, not a filter. A beat left short by
@@ -3607,14 +3625,40 @@ def source_visuals(
             # one that contradicts the narration. Only beats that need it pay
             # for the search.
             if len(acquired) < want and (rejects or unscreened):
+                # The neutral is one shot for the whole video - the query
+                # prompt says the same answer for every beat is fine - so the
+                # second beat to reach for it puts the same footage on screen
+                # again. Unbounded, that is how 4 of the beetle reel's 8 beats
+                # (2026-09-14) became the same bark texture. Past the cap the
+                # beat takes its chances with footage the screen never judged,
+                # which is at least aimed at this beat rather than at the video
+                # in general. Only when there is some, though: below the
+                # unjudged rows sit clips the screen actively rejected, those
+                # contradict the narration, and the neutral still beats one of
+                # those - so the cap never empties a beat, it only ever swaps
+                # a repeat for something unjudged.
+                cap = int(settings.get("max_neutral_beats", -1))
+                deferred = (
+                    cap >= 0
+                    and state.neutral_beats >= cap
+                    and bool(unscreened)
+                )
                 seen = {row[1].key for row in ranked}
-                safe = _neutral_plan(beat, active, settings, ledger, run_id,
-                                     state, rejections, warnings, seen,
-                                     rejected_keys, topic=topic,
-                                     notes=record["notes"])
+                safe = [] if deferred else _neutral_plan(
+                    beat, active, settings, ledger, run_id,
+                    state, rejections, warnings, seen,
+                    rejected_keys, topic=topic,
+                    notes=record["notes"])
                 taken = take(safe, want - len(acquired), beat)
+                if deferred:
+                    record["notes"].append(
+                        f"did not reach for the neutral shot "
+                        f"{beat.neutral_query!r}: it has already filled "
+                        f"{state.neutral_beats} beat(s) and the cap is {cap}"
+                    )
                 if taken:
                     acquired += taken
+                    state.neutral_beats += 1
                     record["notes"].append(
                         f"filled {len(taken)} slot(s) from the neutral shot "
                         f"{beat.neutral_query!r}: "
@@ -3652,8 +3696,11 @@ def source_visuals(
                     warnings.append(
                         f"beat {beat.index} ({beat.query!r}): placed "
                         f"{len(unjudged)} unscreened clip(s) - the screen kept "
-                        f"too few to fill the beat and the neutral shot did "
-                        f"not cover it"
+                        + ("too few to fill the beat and the neutral shot had "
+                           f"already filled its {cap}-beat cap"
+                           if deferred else
+                           "too few to fill the beat and the neutral shot did "
+                           "not cover it")
                     )
 
             # Last resort, and the order matters: a blank beat is still the
@@ -3829,9 +3876,18 @@ def source_visuals(
             # subject: a beat that took every slot from its neutral shot is
             # "ok" too. Counted separately so `beats_ok = 7` cannot be the
             # whole story a finished run tells about its footage.
+            # Both routes to the neutral shot count. A beat the screen handed
+            # over whole ("fell back to...") and a beat topped up from it
+            # ("filled N slot(s) from...") are both showing the video's one
+            # safe shot; counting only the second undercounts the reels this
+            # number exists to find. Demotion notes also name the neutral shot
+            # and mean a candidate was thrown out, so the prefixes are matched
+            # rather than the phrase.
             "beats_from_neutral": sum(
                 1 for b in beat_records
-                if any(n.startswith("filled ") for n in b.get("notes") or [])
+                if any(n.startswith("filled ")
+                       or n.startswith("fell back to the neutral shot")
+                       for n in b.get("notes") or [])
             ),
             "assets": len(assets),
             "from_cache": sum(1 for a in assets if a["from_cache"]),

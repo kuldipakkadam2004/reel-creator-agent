@@ -1193,6 +1193,152 @@ def test_an_unscreened_run_does_not_hold_its_own_footage_back(sandbox):
         assert not any("never judged them" in note for note in beat["notes"])
 
 
+def _keep_only_the_first(shortlists, beats, topic):
+    """Keeps one clip of a beat's own footage, and all of the neutral shot's.
+
+    The beat's own shortlist is cut to a single keeper so that every beat ends
+    up short and reaches the fallback. The neutral's shortlist is kept whole,
+    because the cap is about how many *different* beats take footage from it -
+    if the screen left only one neutral clip in the run, the second beat would
+    find it already spent and the cap would never be the thing that decided.
+    """
+    # `_screen_beats` screens every beat in one call; `_neutral_plan` screens
+    # one beat on its own. That is the only thing here that tells the beat's
+    # own footage from the neutral shot's, because in heuristic mode the topic
+    # hint is both the neutral query and one of each beat's alt queries - so
+    # the same clips arrive down both routes and no property of a candidate
+    # can separate them.
+    neutral_pass = len(shortlists) == 1
+    verdicts: dict[int, dict[int, tuple[bool, str]]] = {}
+    for index, candidates in shortlists.items():
+        verdicts[index] = {
+            position: (True, "") if neutral_pass or position == 0
+            else (False, "shows the wrong thing")
+            for position in range(len(candidates))
+        }
+    return verdicts, []
+
+
+def _neutral_fills(manifest):
+    return [b["index"] for b in manifest["beats"]
+            if any(n.startswith("filled ") for n in b["notes"])]
+
+
+def _neutral_serves_its_own_footage(monkeypatch):
+    """Stub search where the neutral query alone returns unseen clips.
+
+    The plain stub answers every query with one catalog, so the neutral shot
+    can only ever return footage the beat has already ranked and is deduped
+    away to nothing - the beat then falls through to unjudged rows and the
+    cap is never what decided anything.
+    """
+    main = [make_candidate(i) for i in range(40)]
+    # Worded distinctly, or the variety check reads the neutral clip as another
+    # take of what the beat already holds ("clip 3" against "clip 103") and
+    # skips it - which from the outside looks exactly like the cap firing.
+    # Each one worded differently again: the variety check is run-level, so
+    # eight clips all called "open water horizon" would let exactly one beat
+    # take from the neutral and every later beat would be refused by variety
+    # rather than by the cap.
+    scenes = [
+        "kelp forest drifting", "coral shelf sunlit", "sand ripples shallow",
+        "open horizon calm", "tidal pool still", "cliff face spray",
+        "lagoon glass flat", "reef edge blue",
+    ]
+    safe = [
+        Candidate(
+            provider="stub", provider_id=f"video{100 + i}", kind="video",
+            width=1080, height=1920, duration=8.0,
+            download_url=f"https://stub.test/video/{100 + i}.mp4",
+            source_url=f"https://stub.test/page/{100 + i}",
+            creator=f"neutral{i}", license="Stub License",
+            title=f"{scene} horizon",
+        )
+        for i, scene in enumerate(scenes)
+    ]
+
+    def search(self, query, kind, limit):
+        self.searches += 1
+        rows = safe if query.strip().lower() == "ocean salty" else main
+        return [c for c in rows if c.kind == kind][:limit]
+
+    monkeypatch.setattr(StubProvider, "search", search)
+
+
+def test_the_neutral_shot_stops_carrying_the_reel_once_it_hits_its_cap(
+        sandbox, monkeypatch):
+    """The beetle reel of 2026-09-14, which is why the cap exists.
+
+    The neutral is one shot for the whole video, so each beat that reaches for
+    it shows the same footage again. Four of that reel's eight beats came back
+    as the same bark texture and the look pass graded it 1/3 "off_topic". Past
+    the cap a beat takes footage the screen never judged instead: unjudged, but
+    aimed at this beat rather than at the video in general.
+    """
+    _neutral_serves_its_own_footage(monkeypatch)
+    monkeypatch.setattr(visuals, "llm_screen", _keep_only_the_first)
+    monkeypatch.setattr(config, "VISUAL_MAX_NEUTRAL_BEATS", 1)
+
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=2, providers=["stub"],
+    )
+
+    filled = _neutral_fills(manifest)
+    assert len(filled) <= 1, f"the cap let the neutral take {len(filled)} beats"
+    assert manifest["stats"]["beats_from_neutral"] == len(filled)
+    # The beat that went without has to say so, or the cap is a silent
+    # downgrade from a repeat to an unjudged clip.
+    assert any(n.startswith("did not reach for the neutral shot")
+               for b in manifest["beats"] for n in b["notes"])
+
+
+def test_without_the_cap_the_neutral_shot_takes_every_beat_it_can(
+        sandbox, monkeypatch):
+    """The other half: -1 restores the behaviour the cap replaced.
+
+    Pinned so the test above is known to be measuring the cap and not some
+    other reason the neutral stopped being reached for.
+    """
+    _neutral_serves_its_own_footage(monkeypatch)
+    monkeypatch.setattr(visuals, "llm_screen", _keep_only_the_first)
+    monkeypatch.setattr(config, "VISUAL_MAX_NEUTRAL_BEATS", -1)
+
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=2, providers=["stub"],
+    )
+
+    assert len(_neutral_fills(manifest)) > 1, (
+        "nothing reached the neutral shot, so the capped run proves nothing"
+    )
+
+
+def test_the_cap_never_leaves_a_beat_holding_a_rejected_clip(
+        sandbox, monkeypatch):
+    """The cap may only ever swap a repeat for something unjudged.
+
+    Below the unjudged rows sit clips the screen threw out, and one of those
+    contradicts the narration - which is worse than seeing the safe shot
+    again. With nothing unjudged to fall through to, a beat past the cap still
+    gets the neutral.
+    """
+    # A catalog no deeper than the shortlist: everything is screened, so there
+    # are no unjudged rows anywhere in the run.
+    _neutral_serves_its_own_footage(monkeypatch)
+    # A shortlist deeper than the pool: everything is screened, so the run has
+    # no unjudged rows anywhere for a capped beat to fall through to.
+    monkeypatch.setattr(config, "VISUAL_RELEVANCE_SHORTLIST", 200)
+    monkeypatch.setattr(visuals, "llm_screen", _keep_only_the_first)
+    monkeypatch.setattr(config, "VISUAL_MAX_NEUTRAL_BEATS", 0)
+
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=2, providers=["stub"],
+    )
+
+    assert _neutral_fills(manifest), (
+        "the cap fell through to rejected footage rather than the safe shot"
+    )
+
+
 def test_the_query_writer_is_asked_for_a_neutral_shot():
     """The fallback only exists if step 4 asks for it and can read it back."""
     prompt = visuals._QUERY_PROMPT_TEMPLATE
@@ -1645,7 +1791,7 @@ def test_changing_a_provider_floor_invalidates_the_cached_manifest():
         "min_width": 1080, "min_height": 1920, "kinds": ("video",),
         "allow_landscape": True, "query_mode": "llm", "image_duration": 4.0,
         "relevance_mode": "llm", "relevance_floor": 0.2, "relevance_shortlist": 6,
-        "provider_floors": {},
+        "provider_floors": {}, "max_neutral_beats": 2,
     }
     moved = {**base, "provider_floors": {"youtube": (608, 1080)}}
 

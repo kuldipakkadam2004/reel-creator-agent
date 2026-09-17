@@ -949,6 +949,36 @@ VISUAL_RELEVANCE_FLOOR = get_env_float("VISUAL_RELEVANCE_FLOOR", 0.15)
 #: for a run that keeps warning it placed unscreened clips.
 VISUAL_RELEVANCE_SHORTLIST = get_env_int("VISUAL_RELEVANCE_SHORTLIST", 6)
 
+#: How many beats may fall back to the neutral shot before the rest are made to
+#: take their chances with unjudged footage instead. Off by default, because
+#: the one time it was measured it made the reel worse.
+#:
+#: The reasoning for it: the neutral is one shot for the whole video - the
+#: query prompt says so - so a reel that fills half its beats from it shows the
+#: same footage over and over. The beetle run of 2026-09-14 filled 4 of 8 that
+#: way and the look pass graded it 1/3; the mole-rat run of 2026-09-12 filled 5
+#: of 6 and also graded 1; the one run that reached for it once graded 2.
+#:
+#: What the rebuild with the cap at 2 actually showed (same topic, same day):
+#: it held beats 5 and 7 back from the neutral, they took unjudged clips from
+#: their own queries instead, and the look pass graded the reel 0/3 - naming
+#: the last beat, the deferred one, as "explicitly misidentifying the subject".
+#: Frame by frame, the deferred beat was the worst in the reel at 0/3, and the
+#: best at 3/3 was an oak tree - the neutral's own subject. The premise was
+#: that unjudged footage aimed at this beat beats a safe repeat. It does not:
+#: a clip nobody screened, pulled from a query naming a rare species, is most
+#: often the wrong species, and that contradicts the narration where the
+#: repeat merely under-informs. That is the trade `_neutral_plan` was written
+#: to make in the first place, and the cap inverted it.
+#:
+#: Not proof - one run either side, and the two runs had different scripts, so
+#: the 1/3 -> 0/3 is not a controlled comparison. But the mechanism is legible
+#: on the single beat where the cap is the only thing that differed, and a
+#: default with one observed harm and no observed benefit should be off. The
+#: knob stays so the idea can be tried again against `beats_from_neutral`,
+#: which is on the features row now. A positive integer caps; -1 is off.
+VISUAL_MAX_NEUTRAL_BEATS = get_env_int("VISUAL_MAX_NEUTRAL_BEATS", -1)
+
 #: Two clips can be different files, clear every filter, and still read as one
 #: shot held too long - stock libraries sell whole shoots a frame apart. The
 #: sleep reel spent four of its last six shots on two men in two beds, and its
@@ -2129,6 +2159,42 @@ SCHEDULE_RETRY_COUNT = get_env_int("SCHEDULE_RETRY_COUNT", 2)
 #: in, something is hung, and a hung run holds the once-per-day slot.
 SCHEDULE_TIME_LIMIT_MINUTES = get_env_int("SCHEDULE_TIME_LIMIT_MINUTES", 120)
 
+# --- the reading task, which is not the reel task ---------------------------
+# Two jobs, two tasks, installed separately and on purpose. Making a reel is a
+# content decision somebody may well want to keep by hand; *reading how the
+# last one did* is neither, and the two have opposite failure modes. A reel
+# that does not get made is a day without a post. A reading that does not get
+# taken inside PERFORMANCE_MIN_AGE_HOURS..PERFORMANCE_WINDOW_HOURS is a reel
+# that can never be compared with any other reel, for as long as the ledger
+# exists - there is no second chance at a 24-48h reading.
+#
+# Measured on 2026-09-16, with the reel task never installed and the read
+# riding on step 8: of 12 posted reels, 7 had only been read past 48h and 1
+# only at 11.8h. **0 of 12 were comparable**, so every table in the report was
+# empty - not thin, empty. That is not a sample-size problem and no amount of
+# posting fixes it, because a hand-run read cannot reliably land in a 24-hour
+# slot. A job firing once every 24 hours lands inside any 24-hour span, which
+# is the whole argument for putting *this* on a clock even if the reel stays
+# manual.
+
+#: When the daily read fires. Any hour works: the window is 24h wide and a
+#: daily trigger hits a 24h-wide window exactly once, so this is a question of
+#: when the machine tends to be awake, not of when the number is best. Midday
+#: rather than SCHEDULE_TIME, so a read and a reel never contend.
+SCHEDULE_READ_TIME = get_env("SCHEDULE_READ_TIME", "12:00")
+
+#: Its own task name, so `schedule.py uninstall` on one never removes the
+#: other. Installing the reel task and installing the read task are separate
+#: decisions and stay separately reversible.
+SCHEDULE_READ_TASK_NAME = get_env("SCHEDULE_READ_TASK_NAME",
+                                  "ReelCreatorAgentRead")
+
+#: A read is one API call per unsettled reel and writes only the ledger. Two
+#: hours is the ceiling for an encode; here it would only ever mean a hung
+#: socket, so it is short.
+SCHEDULE_READ_TIME_LIMIT_MINUTES = get_env_int(
+    "SCHEDULE_READ_TIME_LIMIT_MINUTES", 15)
+
 
 ensure_dirs()
 
@@ -2384,6 +2450,11 @@ def _report() -> None:
                         else ", skipping a missed day")
                      + (", waking the machine" if SCHEDULE_WAKE else "")
                      + "  (install it: python pipeline/schedule.py install)"),
+        ("SCHEDULE_READ", f"{SCHEDULE_READ_TIME} daily, as "
+                          f"\"{SCHEDULE_READ_TASK_NAME}\" - reads how posted "
+                          f"reels did and makes nothing"
+                          + "  (install it: python pipeline/schedule.py "
+                            "install --read)"),
     ):
         print(f"  {key:<22} {value}")
 

@@ -70,7 +70,8 @@ config.py           paths, .env loading, per-step key validation
 pipeline/           pipeline modules (one per step)
 pipeline/look.py    step 5b: the one place a picture is shown to the model
 pipeline/run.py     step 8: all of it, start to finish, unattended
-pipeline/schedule.py  registers step 8 with Windows Task Scheduler
+pipeline/schedule.py  registers step 8 with Windows Task Scheduler,
+                    and --read registers step 9's read as its own task
 pipeline/perform.py step 9: how the reel did, and what that changes
 pipeline/instagram.py  step 9's optional provider: insights, read not typed
 assets/visuals/cache/   downloaded media, content-addressed
@@ -1744,6 +1745,44 @@ python pipeline/schedule.py run-now       # fire it once, now
 python pipeline/schedule.py preview       # print the definition, install nothing
 python pipeline/schedule.py uninstall
 ```
+
+### Automating the reading without automating the reel
+
+`--read` on any of those acts on a **second, separate task** that runs step 9's
+read instead of step 8:
+
+```bash
+python pipeline/schedule.py install --read     # daily at SCHEDULE_READ_TIME (12:00)
+python pipeline/schedule.py status --read      # and how many reels are comparable
+python pipeline/schedule.py uninstall --read
+```
+
+It runs `python pipeline/perform.py --fetch` and nothing else: **no video is
+made, nothing is posted, and no Gemini or ElevenLabs credit is spent.** It has
+its own task name, so installing or removing it never touches the reel task,
+and either can exist without the other.
+
+Worth having even if you would rather make reels by hand, because the two jobs
+fail differently. A reel that does not get made is a day without a post, and
+you can make it tomorrow. **A reading that is not taken between
+`PERFORMANCE_MIN_AGE_HOURS` and `PERFORMANCE_WINDOW_HOURS` cannot be taken
+later** — that reel is then uncomparable for as long as the ledger exists.
+
+Measured on 2026-09-16, with the read riding on step 8 and step 8 run by hand:
+
+| of 12 posted reels | |
+|---|---|
+| read only past 48h | 7 |
+| read only at 11.8h | 1 |
+| under the reach floor | 3 |
+| no baseline on one side | 1 |
+| **comparable** | **0** |
+
+Every ratio table in `--report` was empty — not thin, empty — and no amount of
+posting fixes that, because a hand-run read cannot reliably land in a 24-hour
+slot. A job firing once every 24 hours lands inside any 24-hour span by
+construction. That is the whole argument, and it applies to the read whether or
+not the reel is ever automated.
 
 It hands a task definition to **Windows Task Scheduler** and gets out of the
 way. A long-lived Python process sleeping until 17:00 would work until the

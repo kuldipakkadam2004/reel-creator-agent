@@ -3833,6 +3833,12 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
             "beats": len({shot.beat_index for shot in shots}),
             "assets_used": sum(1 for c in credits if c.get("kind") != "music"),
             "assets_sourced": len(manifest["assets"]),
+            # Carried up from the visuals manifest so step 9 can ask whether
+            # a reel built out of its own neutral shot reaches worse. It was
+            # counted there from the start and read by nothing.
+            "beats_from_neutral": (
+                (manifest.get("stats") or {}).get("beats_from_neutral")
+            ),
             "looped_shots": sum(1 for shot in shots if shot.looped),
             "reused_shots": sum(1 for shot in shots if shot.reused),
             "moving_shots": sum(1 for shot in shots if shot.motion),

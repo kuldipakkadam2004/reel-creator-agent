@@ -365,7 +365,14 @@ def test_cli_status_translates_the_last_result_code(schtasks, capsys):
 def test_cli_uninstall_removes_the_task(schtasks, capsys):
     assert schedule.main(["uninstall"]) == 0
     assert "/Delete" in schtasks.calls[0]["args"]
-    assert "Nothing will run by itself" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"removed {config.SCHEDULE_TASK_NAME}" in out
+    # It used to say "Nothing will run by itself any more", which stopped being
+    # true the moment there were two tasks: removing the reel task says nothing
+    # about whether the read task is still installed. Claiming otherwise about
+    # a scheduler is the kind of wrong that is found out weeks later.
+    assert "Nothing will run by itself" not in out
+    assert config.SCHEDULE_READ_TASK_NAME in out
 
 
 def test_cli_run_now_starts_the_task(schtasks, capsys):
@@ -375,3 +382,106 @@ def test_cli_run_now_starts_the_task(schtasks, capsys):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# The reading task
+# ---------------------------------------------------------------------------
+#
+# A second job on the same machinery: `--read` installs a task that asks the
+# performance provider how already-posted reels did and writes the ledger. It
+# exists because a reading has to land between PERFORMANCE_MIN_AGE_HOURS and
+# PERFORMANCE_WINDOW_HOURS or that reel can never be compared with another, and
+# a hand-run read does not reliably hit a 24-hour slot. What matters in these
+# tests is that it is a *different task* running a *different command*, so that
+# somebody who wants the numbers automated but not the video gets exactly that.
+
+def test_read_job_runs_perform_and_not_run_py():
+    xml = schedule.build_xml(job="read")
+    args = ElementTree.fromstring(xml).find(".//t:Arguments", NS).text
+    assert "perform.py" in args
+    assert "--fetch" in args
+    # The whole point of the separation: installing the reading must never be
+    # a way of accidentally installing the reel.
+    assert "run.py" not in args
+    assert "--scheduled" not in args
+
+
+def test_read_job_has_its_own_task_name():
+    read = ElementTree.fromstring(schedule.build_xml(job="read"))
+    reel = ElementTree.fromstring(schedule.build_xml(job="reel"))
+    read_uri = read.find(".//t:URI", NS).text
+    reel_uri = reel.find(".//t:URI", NS).text
+    assert read_uri != reel_uri
+    assert config.SCHEDULE_READ_TASK_NAME in read_uri
+    assert config.SCHEDULE_TASK_NAME in reel_uri
+
+
+def test_read_job_says_it_makes_nothing():
+    """The description is what a person sees in Task Scheduler's own list."""
+    xml = schedule.build_xml(job="read")
+    description = ElementTree.fromstring(xml).find(".//t:Description", NS).text
+    assert "makes no video" in description
+    assert "posts nothing" in description
+
+
+def test_read_job_uses_its_own_time_and_limit():
+    xml = schedule.build_xml(job="read")
+    root = ElementTree.fromstring(xml)
+    start = root.find(".//t:StartBoundary", NS).text
+    hour, minute = schedule.parse_time(config.SCHEDULE_READ_TIME)
+    assert start.endswith(f"T{hour:02d}:{minute:02d}:00")
+    limit = root.find(".//t:ExecutionTimeLimit", NS).text
+    assert limit == f"PT{config.SCHEDULE_READ_TIME_LIMIT_MINUTES}M"
+
+
+def test_read_job_catches_up_a_missed_day():
+    """The setting the whole feature depends on.
+
+    A laptop that is shut at noon is the normal case, not the exception, and a
+    read that simply does not happen that day is a reel that may fall out of
+    its window for good. StartWhenAvailable is what turns a missed trigger into
+    a late run instead of no run.
+    """
+    xml = schedule.build_xml(job="read")
+    root = ElementTree.fromstring(xml)
+    assert root.find(".//t:StartWhenAvailable", NS).text == "true"
+    # ...but never at the cost of waking the machine: there is nothing urgent
+    # about a number, and the window is a day wide.
+    assert root.find(".//t:WakeToRun", NS).text == "false"
+
+
+def test_installing_the_reel_task_is_unchanged_by_the_read_job():
+    """The reel task that existed before must come out byte-identical."""
+    now = datetime(2026, 9, 16, 9, 0)
+    assert (schedule.build_xml(now=now)
+            == schedule.build_xml(job="reel", now=now))
+
+
+def test_unknown_job_is_refused():
+    with pytest.raises(schedule.ScheduleError) as exc:
+        schedule.build_xml(job="numbers")
+    assert "numbers" in str(exc.value)
+
+
+def test_cli_read_installs_the_read_task(schtasks, capsys):
+    assert schedule.main(["install", "--read"]) == 0
+    created = schtasks.calls[0]
+    assert "/Create" in created["args"]
+    name = created["args"][created["args"].index("/TN") + 1]
+    assert name == config.SCHEDULE_READ_TASK_NAME
+    assert "perform.py" in created["xml"]
+    out = capsys.readouterr().out
+    assert "makes nothing" in out
+
+
+def test_cli_read_uninstalls_only_the_read_task(schtasks):
+    assert schedule.main(["uninstall", "--read"]) == 0
+    args = schtasks.calls[0]["args"]
+    assert args[args.index("/TN") + 1] == config.SCHEDULE_READ_TASK_NAME
+
+
+def test_crontab_line_for_the_read_job():
+    line = schedule.crontab_line(job="read")
+    assert "perform.py --fetch" in line
+    assert "run.py" not in line
