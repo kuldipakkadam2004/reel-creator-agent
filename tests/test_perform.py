@@ -2875,3 +2875,40 @@ def test_a_ledger_with_no_token_says_nothing_about_one(paths):
     data = perform.report(ledger=ledger)
 
     assert not any("expires in about" in w for w in data["warnings"])
+
+
+def test_a_manual_run_and_the_read_task_leave_the_same_report(paths, tmp_path,
+                                                              monkeypatch):
+    """Step 8's read and `--fetch` share one tail on purpose.
+
+    Before they did, making a reel by hand refreshed the ledger and left
+    report.txt describing the ledger as it had been - which looks exactly like
+    a working report.
+    """
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_FILE", tmp_path / "r.txt")
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_JSON", tmp_path / "r.json")
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_DIR", tmp_path / "reports")
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_ON_FETCH", True)
+    # Pinned so this test is about the report and not about whatever the
+    # machine running the suite has in .env.
+    monkeypatch.setattr(config, "PERFORMANCE_ASSUME_AUDIO", "")
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    ledger.save()
+
+    assert perform.refresh_outputs() == []
+    assert (tmp_path / "r.txt").is_file()
+    assert "REELS" in (tmp_path / "r.txt").read_text(encoding="utf-8")
+
+
+def test_refresh_outputs_writes_nothing_when_it_is_switched_off(paths, tmp_path,
+                                                                monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_FILE", tmp_path / "r.txt")
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_ON_FETCH", False)
+    monkeypatch.setattr(config, "PERFORMANCE_ASSUME_AUDIO", "")
+    ledger = _ledger(_features("r0"))
+    ledger.record("r0", {"reach": 100})
+    ledger.save()
+
+    assert perform.refresh_outputs() == []
+    assert not (tmp_path / "r.txt").exists()

@@ -3262,6 +3262,37 @@ def assume_audio(ledger: PerformanceLedger, mode: str = "") -> list[str]:
     return warnings
 
 
+def refresh_outputs(*, metric: str = "",
+                    ledger: PerformanceLedger | None = None) -> list[str]:
+    """Everything the daily read does once the numbers are in. Never raises.
+
+    Called from two places that both read insights and would otherwise disagree
+    about what happens next: `--fetch`, which is what the read task runs, and
+    step 8's own read at the start of a manual run. Before this existed only
+    the first of them wrote the report, so making a reel by hand refreshed the
+    ledger and left `report.txt` describing the ledger as it had been - the one
+    failure mode that looks exactly like a working report.
+
+    Reads a fresh ledger by default, because `fetch` has already saved and the
+    caller may not be holding the copy it saved.
+    """
+    ledger = ledger or PerformanceLedger()
+    warnings = list(assume_audio(ledger))
+    if warnings:
+        warnings.extend(ledger.save())
+    if not config.PERFORMANCE_REPORT_ON_FETCH:
+        return warnings
+    try:
+        data = report(ledger=ledger, metric=metric)
+        warnings.extend(write_report(data))
+    except Exception as exc:  # noqa: BLE001 - the read is the job, not this
+        warnings.append(
+            f"the read succeeded and the report did not ({exc}) - "
+            f"python pipeline/perform.py --report"
+        )
+    return warnings
+
+
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -3375,29 +3406,12 @@ def main(argv: list[str] | None = None) -> int:
             recorded, warnings = fetch(ledger=ledger)
             print(f"recorded {recorded} reel(s) from PERFORMANCE_PROVIDER.")
 
-            # After the numbers and before the report, so a reel that has just
-            # become posted carries its audio into the tables the report is
-            # about to render. Saved again because `fetch` saved before this
-            # touched anything.
-            assumed = assume_audio(ledger)
-            if assumed:
-                warnings.extend(assumed)
-                warnings.extend(ledger.save())
-
-            # The whole point of the daily read: it writes down what it found,
-            # so the report exists whether or not anybody types `--report`.
-            # Last, and never fatal - the ledger is already safely on disk, and
-            # a file that cannot be written must not cost the day's numbers.
+            # The whole point of the daily read: it writes down what it
+            # found, so the report exists whether or not anybody types
+            # `--report`. Shared with step 8's read so the two cannot drift.
+            warnings.extend(refresh_outputs(metric=args.metric, ledger=ledger))
             if config.PERFORMANCE_REPORT_ON_FETCH:
-                try:
-                    data = report(ledger=ledger, metric=args.metric)
-                    warnings.extend(write_report(data))
-                    print(f"wrote {config.PERFORMANCE_REPORT_FILE}")
-                except Exception as exc:  # noqa: BLE001
-                    warnings.append(
-                        f"the read succeeded and the report did not ({exc}) - "
-                        f"python pipeline/perform.py --report"
-                    )
+                print(f"wrote {config.PERFORMANCE_REPORT_FILE}")
 
             for warning in warnings:
                 print(f"warning: {warning}", file=sys.stderr)

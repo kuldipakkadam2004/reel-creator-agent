@@ -456,6 +456,14 @@ def _read_insights(record: dict) -> None:
     _collect(record, "insights", warnings)
     print(f"          {recorded} reel(s) re-read", flush=True)
 
+    # The same tail the read task runs, so a reel made by hand leaves the
+    # report describing the ledger as it now stands rather than as it was.
+    # Never fatal: the numbers are already saved, and this is the copy.
+    try:
+        _collect(record, "insights", perform.refresh_outputs())
+    except Exception as exc:  # noqa: BLE001
+        record["warnings"].append(f"insights: {_one_line(exc)}")
+
 
 def _one_line(text) -> str:
     """An error boiled down to something a ledger column can hold.
