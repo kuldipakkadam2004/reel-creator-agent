@@ -2621,3 +2621,92 @@ def test_a_confidence_outside_the_range_does_not_index_backwards():
     mine, rest = [1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]
     low, high = perform._interval(mine, rest, statistics.median, 1.5, 1)
     assert low <= high
+
+
+# ---------------------------------------------------------------------------
+# What was playing when it went out
+#
+# The `music` trial alternates whether step 5 lays a bed, which is a fact about
+# the render. Instagram's licensed catalogue has no publishing API, so a
+# trending track can only be attached by hand in the app after the reel leaves
+# the pipeline - and a reel rendered with no bed and posted with a track on it
+# is published *with* music. These pin the half the pipeline cannot observe.
+# ---------------------------------------------------------------------------
+
+def test_audio_is_recorded_without_waiting_for_the_numbers(paths):
+    """The audio is known at post time; the numbers are not known for hours."""
+    ledger = _ledger(_features("r0"))
+
+    assert ledger.note_audio("r0", "added", "Blue Monday") == []
+
+    assert ledger.entry("r0")["audio"] == {"mode": "added",
+                                           "track": "Blue Monday"}
+
+
+def test_an_unknown_audio_mode_is_refused_rather_than_stored(paths):
+    ledger = _ledger(_features("r0"))
+
+    with pytest.raises(perform.PerformanceError) as excinfo:
+        ledger.note_audio("r0", "trending")
+
+    assert "unknown audio mode" in str(excinfo.value)
+    assert "audio" not in ledger.entry("r0")
+
+
+def test_a_track_added_with_no_name_is_still_music(paths):
+    """It counts as music-on; what it cannot say is which track."""
+    ledger = _ledger(_features("r0"))
+
+    warnings = ledger.note_audio("r0", "added")
+
+    assert ledger.entry("r0")["audio"]["mode"] == "added"
+    assert any("no track named" in w for w in warnings)
+
+
+def test_a_row_that_was_never_told_does_not_default_to_the_bed(paths):
+    """Defaulting would be right about every reel so far and silently wrong
+    about the first one that is not - which is the whole point of the field."""
+    assert perform._audio_posted({"status": "posted"}) == []
+    assert perform._audio_posted({"audio": {"mode": "bed"}}) == [
+        ("audio as posted", "bed")
+    ]
+
+
+def test_a_silent_arm_posted_with_a_track_is_flagged_as_music_on(paths):
+    """The arm describes the render. This reel went out with music on it."""
+    row = {
+        "run_id": "r0",
+        "features": _features("r0", trial={"name": "music", "arm": "off"}),
+        "audio": {"mode": "added", "track": "Blue Monday"},
+    }
+
+    why = perform.audio_disagrees(row)
+
+    assert "music-on however the arm is labelled" in why
+
+
+def test_an_arm_that_matches_what_went_out_is_not_flagged(paths):
+    row = {
+        "run_id": "r0",
+        "features": _features("r0", trial={"name": "music", "arm": "off"}),
+        "audio": {"mode": "silent"},
+    }
+
+    assert perform.audio_disagrees(row) == ""
+
+
+def test_a_trial_on_something_else_is_never_flagged_by_the_audio(paths):
+    """Only the `music` trial makes a claim the audio can contradict."""
+    row = {
+        "run_id": "r0",
+        "features": _features("r0", trial={"name": "hook", "arm": "off"}),
+        "audio": {"mode": "added", "track": "Blue Monday"},
+    }
+
+    assert perform.audio_disagrees(row) == ""
+
+
+def test_the_binned_table_is_never_asked_what_was_playing(paths):
+    """A binned reel was never published, so the question would separate the
+    posted rows from the binned ones and report the tautology."""
+    assert perform._post_time_facets({"status": "skipped"}) == []

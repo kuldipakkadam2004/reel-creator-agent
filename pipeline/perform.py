@@ -217,6 +217,11 @@ TRIALS = {
     "curiosity": ("on", "off"),
 }
 
+#: What can have been playing under a reel when it was actually published.
+#: See `PerformanceLedger.note_audio` for why this is a separate fact from
+#: `features["music"]` rather than a reading of it.
+AUDIO_MODES = ("bed", "silent", "added")
+
 #: The trials whose arm is spent on the topic board, before there is a topic.
 #: They are called out separately because a run has to decide them earlier than
 #: the rest - `run_once` arms the board, where every other arm is applied once
@@ -762,9 +767,60 @@ class PerformanceLedger:
         entry["measurements"] = history[-MEASUREMENT_HISTORY:]
         return warnings
 
+    def note_audio(self, run_id: str, mode: str, track: str = "") -> list[str]:
+        """Record what was actually playing under the reel when it went out.
+
+        This is the post-time half of the `music` trial, and without it that
+        trial measures the opposite of the truth the moment trending audio is
+        used. `features["music"]` is the bed step 5 *rendered*, which is the
+        only thing the pipeline can know - Instagram's licensed catalogue has
+        no publishing API, so a trending track can only be attached by hand in
+        the app, after the reel leaves here. A reel rendered with no bed and
+        posted with a trending track on it is published *with* music, and the
+        `music: off` facet reads it as the silent arm.
+
+        So the arm describes the render and this describes the reel, and
+        `report` refuses to let the first stand in for the second.
+
+        Modes:
+          bed      the rendered bed is what played - every reel to 2026-09-17
+          silent   posted with no music at all
+          added    a track was attached in the app; `track` names it
+
+        `track` is kept but never faceted on: one track per reel makes a
+        bucket per reel, which is a list of reels wearing a table's clothes.
+        """
+        mode = (mode or "").strip().lower()
+        if mode not in AUDIO_MODES:
+            raise PerformanceError(
+                f"unknown audio mode {mode!r} - expected one of "
+                + ", ".join(sorted(AUDIO_MODES))
+            )
+        entry = self.reels.setdefault(run_id, {"run_id": run_id})
+        entry["audio"] = {"mode": mode, "track": (track or "").strip()}
+
+        warnings: list[str] = []
+        if mode == "added" and not (track or "").strip():
+            warnings.append(
+                "audio recorded as 'added' with no track named - the reel is "
+                "counted as having music, but nothing says which"
+            )
+        if mode != "added" and (track or "").strip():
+            warnings.append(
+                f"a track was named but the mode is {mode!r}, so it is kept "
+                f"and not read as music added in the app"
+            )
+        return warnings
+
     #: Everything a row holds only because a provider matched it to a post.
     #: `features` is not here and never can be - it describes the reel itself,
     #: which is true whatever post the reel did or did not become.
+    #:
+    #: `audio` is not here either, and for a related reason: it is something
+    #: the user did to the reel at post time, not something a provider handed
+    #: over. A row that turns out to be matched to the wrong post still had a
+    #: trending track attached to it or not, and losing the match does not
+    #: make that untrue.
     BORROWED = ("media_id", "permalink", "matched_by", "posted_at",
                 "posted_at_assumed", "hours_after_post", "metrics",
                 "measurements", "source", "recorded_at")
@@ -1611,6 +1667,63 @@ def _when_posted(row: dict) -> list[tuple[str, str]]:
     return [("posted", slot)] if slot else []
 
 
+def _audio_posted(row: dict) -> list[tuple[str, str]]:
+    """What was playing under the reel as published, for the tables that can ask.
+
+    Never asked of KEPT OR BINNED, for `_when_posted`'s reason: a binned reel
+    was never published, so the question would separate the posted rows from
+    the binned ones and report the tautology the table is made of.
+
+    A row that has not been told stays out entirely rather than defaulting to
+    "bed". Every reel to 2026-09-17 did play its rendered bed, so defaulting
+    would be right about all of them and silently wrong about the first one
+    that is not - which is the failure this whole field exists to prevent.
+    """
+    audio = row.get("audio")
+    if not isinstance(audio, dict):
+        return []
+    mode = str(audio.get("mode") or "").strip().lower()
+    return [("audio as posted", mode)] if mode in AUDIO_MODES else []
+
+
+def audio_disagrees(row: dict) -> str:
+    """Why this row's trial arm no longer describes the reel, or "".
+
+    The `music` trial alternates whether step 5 lays a bed. That is a fact
+    about the render, and it stops being a fact about the reel the moment a
+    track is attached in the app. A row in the `off` arm with `added` audio was
+    published with music on it, and counting it as the silent arm does not
+    weaken the trial - it inverts it.
+    """
+    audio = row.get("audio")
+    if not isinstance(audio, dict):
+        return ""
+    mode = str(audio.get("mode") or "").strip().lower()
+    trial = ((row.get("features") or {}).get("trial") or {})
+    if trial.get("name") != "music":
+        return ""
+    arm = str(trial.get("arm") or "").strip().lower()
+    if arm == "off" and mode == "added":
+        return ("was rendered with no bed and posted with a track added in "
+                "the app, so it is music-on however the arm is labelled")
+    if arm == "on" and mode == "silent":
+        return ("was rendered with a bed and recorded as posted silent, which "
+                "the arm cannot be describing")
+    return ""
+
+
+def _post_time_facets(row: dict) -> list[tuple[str, str]]:
+    """Everything asked of a row about what was *done* with the reel.
+
+    `_segment` takes one `extra`, and there are two of these now - when it went
+    out, and what was under it. They are joined here rather than by widening
+    `extra`, because they share the one rule that matters: both are questions
+    only a published reel can answer, so both are per-table and neither is ever
+    asked of KEPT OR BINNED.
+    """
+    return _when_posted(row) + _audio_posted(row)
+
+
 def unlabelled_bins(rows: list[dict]) -> list[dict]:
     """The binned reels whose reason was lost, oldest first.
 
@@ -1839,7 +1952,7 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     performance = _segment(
         fresh,
         lambda row: scores.get(row.get("run_id") or ""),
-        vocabulary, floor, extra=_when_posted,
+        vocabulary, floor, extra=_post_time_facets,
     )
 
     # How many people it got in front of, which is upstream of everything else
@@ -1852,7 +1965,7 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     reached = _segment(
         seen_by,
         lambda row: reach_scores.get(row.get("run_id") or ""),
-        vocabulary, floor, extra=_when_posted,
+        vocabulary, floor, extra=_post_time_facets,
     )
 
     # Read on the same window as the performance table, so every reel is
@@ -1861,7 +1974,7 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     # long ago a reel went out as much as anything about the reel.
     saved = _segment(
         fresh, was_kept, vocabulary, floor, statistic=statistics.fmean,
-        extra=_when_posted,
+        extra=_post_time_facets,
     )
 
     # The last stage of the funnel, and the only one that compounds. Read on
@@ -1869,8 +1982,29 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     # 96h has had three more days to win a follow than one read at 29h.
     followed = _segment(
         fresh, won_a_follow, vocabulary, floor, statistic=statistics.fmean,
-        extra=_when_posted,
+        extra=_post_time_facets,
     )
+
+    # What was under the reel as published, and whether the trial still
+    # describes it. Both are warnings rather than filters: a row that has not
+    # been told simply does not answer the audio facet, and a row whose arm
+    # disagrees still carries perfectly good numbers - what it must not do is
+    # carry them into a segment labelled with the opposite treatment.
+    mislabelled = [(row, audio_disagrees(row)) for row in posted]
+    for row, why in mislabelled:
+        if why:
+            warnings.append(
+                f"{row.get('run_id') or '?'} {why} - its `trial: music` "
+                f"segment is reading it as the arm it was rendered in, not "
+                f"the reel that went out"
+            )
+    untold = [row for row in posted if not _audio_posted(row)]
+    if untold and len(untold) < len(posted):
+        warnings.append(
+            f"{len(untold)} posted reel(s) have no audio recorded and sit out "
+            f"the AUDIO AS POSTED rows - python pipeline/perform.py <run> "
+            f"--audio bed|silent|added"
+        )
 
     if not posted:
         warnings.append(
@@ -2989,6 +3123,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="when it went out (YYYY-MM-DD). Without it the "
                              "age of the measurement is taken from when the "
                              "reel was made")
+    parser.add_argument("--audio", default="", metavar="MODE",
+                        choices=("", *AUDIO_MODES),
+                        help="what was actually playing under the reel when "
+                             "it went out: bed (the rendered bed), silent "
+                             "(nothing), or added (a track attached in the "
+                             "Instagram app - name it with --track). Step 5 "
+                             "cannot know this: Instagram's music catalogue "
+                             "has no publishing API")
+    parser.add_argument("--track", default="", metavar="NAME",
+                        help="which track was attached, for --audio added. "
+                             "Kept on the row but never faceted on - one "
+                             "track per reel is a bucket per reel")
     parser.add_argument("--skipped", nargs="?", const="", default=None,
                         metavar="WHY",
                         help="this reel was made and never posted, and why: "
@@ -3077,6 +3223,18 @@ def main(argv: list[str] | None = None) -> int:
 
         run_id = resolve_run(args.run, ledger=ledger)
 
+        # Ahead of the metrics branch, and deliberately not part of it. The
+        # audio is known the moment the reel is posted; the numbers are not
+        # known for hours. Requiring them together would mean either recording
+        # the audio from memory days later or not at all, and this is a fact
+        # that decays - nobody remembers in a week which of fourteen reels had
+        # a track put on it.
+        audio_recorded = False
+        if args.audio:
+            for warning in ledger.note_audio(run_id, args.audio, args.track):
+                print(f"warning: {warning}", file=sys.stderr)
+            audio_recorded = True
+
         if args.skipped is not None:
             for warning in ledger.skip(run_id, args.skipped):
                 print(f"warning: {warning}", file=sys.stderr)
@@ -3087,9 +3245,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             metrics = {name: getattr(args, name) for name in METRICS
                        if getattr(args, name, None) is not None}
-            if not metrics:
+            if not metrics and not audio_recorded:
                 # Naming a reel and passing no numbers is a question, not a
                 # record: show what is already known about it.
+                entry = ledger.entry(run_id)
+                if args.json:
+                    print(json.dumps(entry, indent=2, ensure_ascii=False))
+                else:
+                    _print_recorded(run_id, entry)
+                return 0
+            if not metrics:
+                # Audio alone is a perfectly good thing to record, and saying
+                # so is not the same as having nothing to say.
+                for warning in ledger.save():
+                    print(f"warning: {warning}", file=sys.stderr)
                 entry = ledger.entry(run_id)
                 if args.json:
                     print(json.dumps(entry, indent=2, ensure_ascii=False))

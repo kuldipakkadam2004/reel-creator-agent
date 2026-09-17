@@ -2404,6 +2404,51 @@ answer rather than a limitation — the column that matters most early on is
 ids and their features rows, returning `{run_id: {metric: value}}`. Anything it
 cannot answer stays pending, exactly as if it had not been asked.
 
+### Trending audio, and the half the pipeline cannot see
+
+Instagram's licensed music catalogue has **no publishing API**. The Content
+Publishing API's REELS container takes `media_type`, `video_url`, `caption`,
+`share_to_feed`, `collaborators`, `cover_url`, `audio_name`, `user_tags`,
+`location_id`, `thumb_offset` and `upload_type` — and `audio_name` renames your
+*own* original audio rather than attaching a catalogue track. Music that plays
+under a reel published through the API has to be baked into the file. A
+trending track can only be attached by hand, in the app.
+
+That is not a blocker here, because nothing in this pipeline posts anyway. The
+render side already exists: `PERFORMANCE_EXPLORE=music` alternates the bed on
+and off, and the `off` arm hands you a reel with narration and SFX and no
+music — which is exactly the reel to put a trending track under. With no bed
+there is no beat grid, so the opening cuts fall back to word boundaries; that
+is a real difference between the arms and the trial is what measures it.
+
+What the pipeline genuinely cannot know is what you then did in the app. So it
+asks:
+
+```bash
+python pipeline/perform.py <run> --audio bed        # the rendered bed played
+python pipeline/perform.py <run> --audio silent     # no music at all
+python pipeline/perform.py <run> --audio added --track "Blue Monday"
+```
+
+Recorded on its own, without waiting for numbers — the audio is known the
+minute the reel goes out and the numbers are not known for hours, and nobody
+remembers a week later which of fourteen reels had a track put on it. It adds
+an `AUDIO AS POSTED` facet to the four post-time tables, and a row that has
+not been told sits out rather than defaulting to `bed`.
+
+**Why it is a separate fact from `music`, and not a reading of it.**
+`features["music"]` is the bed step 5 rendered. A reel rendered with no bed and
+posted with a trending track on it is published *with* music, and the
+`music: off` facet reads it as the silent arm — so the `music` trial would
+measure the exact opposite of the truth the first time you used the feature it
+exists to test. `--report` cross-checks the two and says so by name:
+
+```
+warning: <run> was rendered with no bed and posted with a track added in the
+app, so it is music-on however the arm is labelled - its `trial: music`
+segment is reading it as the arm it was rendered in, not the reel that went out
+```
+
 ### Reading them off Instagram instead
 
 `pipeline/instagram.py` is that callable. It reads insights and **cannot post**
