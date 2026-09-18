@@ -2400,6 +2400,46 @@ def test_frames_are_sent_smaller_than_they_ship_but_the_same_shape():
     assert abs(width / height - config.VIDEO_WIDTH / config.VIDEO_HEIGHT) < 0.02
 
 
+def test_the_beats_reach_step_5b_as_the_lines_their_footage_plays_under():
+    """What step 5b needs to judge a frame against the words over it.
+
+    Beats rather than caption cues: a cue is three words long, so a frame would
+    land against a fragment with no claim in it, while a beat is the sentence
+    whose claim the footage was chosen to carry.
+    """
+    manifest = {"beats": [
+        {"index": 0, "start": 0.0, "end": 18.652,
+         "text": "Two billion years ago, shallow water washed over sand."},
+        {"index": 1, "start": 18.652, "end": 26.515,
+         "text": "This was a planet of bare continents, before the first\n"
+                 "   animal had even evolved."},
+    ]}
+    lines = assemble.narration_lines(manifest)
+
+    assert lines[0][:2] == (0.0, 18.652)
+    # Wrapped text arrives as one line, or the grader reads a line break as a
+    # sentence ending and judges the frame against half a claim.
+    assert lines[1][2] == ("This was a planet of bare continents, before the "
+                           "first animal had even evolved.")
+
+
+def test_a_beat_missing_its_timings_is_dropped_not_guessed_at():
+    """A wrong time sends the grader to a line that was not playing."""
+    manifest = {"beats": [
+        {"start": 0.0, "end": 4.0, "text": "timed"},
+        {"start": None, "end": 9.0, "text": "no start"},
+        {"end": 12.0, "text": "no start key at all"},
+        {"start": 12.0, "end": 15.0, "text": "   "},
+        "not a dict",
+    ]}
+    assert assemble.narration_lines(manifest) == [(0.0, 4.0, "timed")]
+
+
+def test_a_manifest_with_no_beats_asks_for_no_timings():
+    """Step 5b then grades from the script alone, as it did before."""
+    assert assemble.narration_lines({}) == []
+
+
 def test_nothing_is_sampled_out_of_a_reel_that_is_not_there(tmp_path):
     frames, notes = assemble.sample_reel_frames(tmp_path / "gone.mp4", 40.0)
     assert frames == [] and notes == []

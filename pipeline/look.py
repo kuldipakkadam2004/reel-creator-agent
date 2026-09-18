@@ -135,7 +135,7 @@ do not guess at what the frames between the ones you were given might fix."""
 _REEL_PROMPT_TEMPLATE = """\
 Topic of the video: {topic}
 
-What is being said, in order:
+What is being said, and when:
 {script}
 
 Above are {count} frames sampled evenly across the finished video, in order \
@@ -158,8 +158,24 @@ Use a name only where a viewer would notice it, not where you can find a trace \
 of it if you look. An empty list is a real answer and the right one for a video \
 with nothing wrong.
 
-Also grade each frame 0 to {grade_max} on the same scale, judged as one \
-picture, and say in a short phrase what it shows.
+Weigh "off_topic" against the line playing over the frame, not against the \
+topic. Every frame is labelled with a time, so read the narration above for \
+the line covering that time and ask what it would have the viewer expect to \
+see. Footage that says less than the line is not off_topic - a wide landscape \
+under a line about one rock in it is fine. Footage that shows what the line \
+says is not there is: where the narration puts the scene before something \
+existed, or calls a place bare, empty or lifeless, anything in the frame that \
+the words have ruled out contradicts them. Living things are the ones that \
+slip past, because grass, shrubs, trees and green hillsides read as scenery \
+rather than as a subject - under "a planet of bare continents, before the \
+first animal had even evolved", a slope covered in vegetation is not backdrop, \
+it is the picture disagreeing with the words. Rock, water, sand and sky look \
+the same at any age; nothing alive does.
+
+Also grade each frame 0 to {grade_max} - not as a photograph, but as this \
+video's picture for the words playing over it. A frame that is well shot and \
+shows the wrong thing is a 1, not a {grade_max}. Say in a short phrase what it \
+shows, and name anything in it the narration has ruled out.
 
 "summary" is one sentence on the video as a whole, for somebody who will not \
 see the frames.
@@ -315,8 +331,44 @@ def blank_grade() -> dict:
             "summary": "", "frames": []}
 
 
+def _timed_narration(script: str, lines) -> str:
+    """The narration as the grader reads it, timed where the timings are known.
+
+    Without this the grader gets the script as one block and the frames as
+    timestamps, and has to guess which line was playing over which frame - so
+    "does it depict what is being said" quietly becomes "is it about the
+    topic", which is a question almost any on-theme footage passes.
+
+    The Teide frame of 2026-09-18 is what that costs. A shrub-covered volcano
+    sampled at 24.7s, under "a planet of bare continents, and iron-rich water,
+    before the first animal had even evolved", came back graded 3 of 3 and
+    described as "a volcanic landscape with a mountain in the distance" - true
+    of the picture, and the picture was full of the one thing the line says
+    was not there yet. Step 4's screener could not have caught it either: it
+    reads a library's own words, and Pexels' words for that clip are "majestic
+    teide volcano landscape", which name no plants at all. This pass is the
+    only one that sees the frame.
+
+    Falls back to the untimed script when no timings are passed - that is the
+    behaviour this replaces, and words with no timings still beat no words.
+    """
+    rows = []
+    for entry in lines or []:
+        try:
+            start, end, text = entry
+            start, end = float(start), float(end)
+        except (TypeError, ValueError):
+            continue
+        text = " ".join(str(text or "").split())
+        if text:
+            rows.append(f"{start:.1f}-{end:.1f}s  {text}")
+    if rows:
+        return "\n".join(rows)
+    return (script or "(not given)").strip()
+
+
 def grade_reel(frames: list[tuple[str, bytes]], *, topic: str = "",
-               script: str = "") -> tuple[dict, list[str]]:
+               script: str = "", lines=None) -> tuple[dict, list[str]]:
     """Grade the rendered reel from frames sampled across it.
 
     Returns (record, warnings). The record is what goes into assembly.json and,
@@ -329,6 +381,11 @@ def grade_reel(frames: list[tuple[str, bytes]], *, topic: str = "",
     on their own: a reel that was never looked at and a reel that was looked at
     and found clean both have no problems, and scoring them together is exactly
     the mistake `_written_since` exists to stop step 9 making.
+
+    `lines` is the narration as (start, end, text), which is what lets a frame
+    be judged against the words playing over it rather than against the topic -
+    see `_timed_narration`. Optional, and omitting it grades from the script
+    alone, as this did before.
     """
     record = blank_grade()
     if not frames:
@@ -342,7 +399,7 @@ def grade_reel(frames: list[tuple[str, bytes]], *, topic: str = "",
 
     prompt = _REEL_PROMPT_TEMPLATE.format(
         topic=topic or "(not given)",
-        script=(script or "(not given)").strip(),
+        script=_timed_narration(script, lines),
         count=len(frames),
         grade_max=GRADE_MAX,
         problems="  " + "\n  ".join(PROBLEMS),

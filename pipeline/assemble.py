@@ -2704,6 +2704,34 @@ def preview_cover_frames(pool: list[Shot], *, card: str, card_seconds: float,
     return frames, notes
 
 
+def narration_lines(manifest: dict) -> list[tuple[float, float, str]]:
+    """The beats as (start, end, text), for step 5b to align frames against.
+
+    The beats are the right grain for this and the alignment is not: a caption
+    cue is three words long, so a frame would land against a fragment with no
+    claim in it, while a beat is the sentence whose claim the footage was
+    chosen to carry. Step 4 already searched per beat, so a beat is also the
+    unit whose footage can be wrong.
+
+    Beats missing their timings are skipped rather than guessed at - a wrong
+    time is worse here than a missing one, because it hands the grader a line
+    that was not playing and invites it to reject footage that matched.
+    """
+    rows: list[tuple[float, float, str]] = []
+    for beat in manifest.get("beats") or []:
+        if not isinstance(beat, dict):
+            continue
+        try:
+            start = float(beat["start"])
+            end = float(beat["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = " ".join(str(beat.get("text") or "").split())
+        if text:
+            rows.append((start, end, text))
+    return rows
+
+
 def sample_reel_frames(video_path: Path, duration: float, *,
                        count: int | None = None,
                        ) -> tuple[list[tuple[str, bytes]], list[str]]:
@@ -3763,6 +3791,7 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                 frames,
                 topic=manifest.get("topic") or "",
                 script=str(manifest.get("script") or ""),
+                lines=narration_lines(manifest),
             )
             warnings += notes
 

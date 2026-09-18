@@ -252,6 +252,89 @@ def test_a_frame_verdict_about_a_timestamp_nobody_sent_is_dropped(monkeypatch):
     assert record["frames"] == []
 
 
+def test_the_grader_is_told_which_line_plays_over_which_frame(monkeypatch):
+    """The Teide frame of 2026-09-18.
+
+    A shrub-covered volcano sampled at 24.7s, under "a planet of bare
+    continents, and iron-rich water, before the first animal had even evolved",
+    came back graded 3 of 3 and described as "a volcanic landscape with a
+    mountain in the distance". True of the picture, and the picture was full of
+    the one thing that line says was not there yet.
+
+    It was given the script as one block and the frames as bare timestamps, so
+    it had no way to know which words were playing over the frame in front of
+    it. The timings are what make "does it depict what is being said" a
+    question it can answer.
+    """
+    ask, seen = answers({"grade": 3, "problems": [], "summary": "",
+                         "frames": []})
+    monkeypatch.setattr(look, "_ask", ask)
+    look.grade_reel(
+        frames("24.7s"),
+        topic="2 billion year old ripples preserved in rock",
+        script="But this wasn't a world you'd recognize.",
+        lines=[(0.0, 18.6, "Two billion years ago, shallow water washed over "
+                           "loose sand."),
+               (18.6, 26.5, "This was a planet of bare continents, before the "
+                            "first animal had even evolved.")],
+    )
+
+    # The line the frame at 24.7s actually plays under, with a window around it
+    # that contains 24.7.
+    assert "18.6-26.5s  This was a planet of bare continents" in seen["prompt"]
+    assert "0.0-18.6s" in seen["prompt"]
+
+
+def test_vegetation_under_a_line_that_rules_it_out_is_named_as_off_topic(monkeypatch):
+    """The rule the Teide frame needed, spelled out rather than left implied.
+
+    Step 4's screener could not have caught this one: it reads a stock
+    library's own words, and Pexels' words for that clip are "majestic teide
+    volcano landscape", which name no plants at all. Only this pass sees the
+    frame, so the rule has to live here.
+    """
+    prompt = look._REEL_PROMPT_TEMPLATE
+    assert "bare, empty or lifeless" in prompt
+    assert "green hillsides" in prompt
+    # And the half that stops it over-reading: saying less than the line is not
+    # the same as contradicting it, or every wide shot becomes a reject.
+    assert "says less than the line is not off_topic" in prompt
+    # A frame is graded as this video's picture, not as a photograph - grading
+    # it "as one picture" is what earned the Teide frame its 3.
+    assert "not as a photograph" in prompt
+
+
+def test_narration_with_no_timings_still_reaches_the_grader(monkeypatch):
+    """Falling back to the plain script, which is what this replaced."""
+    ask, seen = answers({"grade": 3, "problems": [], "summary": "",
+                         "frames": []})
+    monkeypatch.setattr(look, "_ask", ask)
+    look.grade_reel(frames("0.5s"), topic="deltas", script="A river delta...")
+    assert "A river delta" in seen["prompt"]
+
+
+def test_a_beat_with_no_usable_timing_is_left_out_rather_than_guessed_at(monkeypatch):
+    """A wrong time is worse than a missing one.
+
+    It hands the grader a line that was not playing and invites it to reject
+    footage that in fact matched - the opposite of the defect this fixes.
+    """
+    ask, seen = answers({"grade": 3, "problems": [], "summary": "",
+                         "frames": []})
+    monkeypatch.setattr(look, "_ask", ask)
+    look.grade_reel(
+        frames("1.0s"),
+        script="the fallback",
+        lines=[(0.0, 4.0, "a line that has its timings"),
+               (None, 9.0, "a line that does not"),
+               (9.0, 12.0, "   ")],
+    )
+    assert "0.0-4.0s  a line that has its timings" in seen["prompt"]
+    assert "a line that does not" not in seen["prompt"]
+    # Something was timed, so the untimed script is not also pasted in.
+    assert "the fallback" not in seen["prompt"]
+
+
 def test_the_problem_list_the_prompt_offers_is_the_one_the_code_accepts(monkeypatch):
     ask, seen = answers({"grade": 3, "problems": [], "summary": "",
                          "frames": []})
