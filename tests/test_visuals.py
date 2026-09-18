@@ -509,8 +509,21 @@ def test_screen_json_survives_fences_and_junk_entries():
      "not an object",
      {"beat": "x", "verdicts": []}]
     ```"""
-    parsed = visuals._parse_screen_json(raw)
+    parsed, subjects = visuals._parse_screen_json(raw)
     assert parsed == {0: {0: (True, ""), 1: (False, "a bear")}}
+    # No "subj" in the response at all: every flag defaults to False, so a
+    # model that ignores the new field can never trigger the salvage step.
+    assert subjects == {0: {0: False, 1: False}}
+
+
+def test_screen_json_reads_subj_apart_from_ok():
+    """A reject can still be the subject - that pair is what salvage runs on."""
+    raw = ('[{"beat": 0, "verdicts": ['
+           '{"i": 0, "ok": false, "subj": true, "why": "does not show a wallow"},'
+           '{"i": 1, "ok": false, "subj": false, "why": "shows a gaur"}]}]')
+    parsed, subjects = visuals._parse_screen_json(raw)
+    assert parsed[0][0] == (False, "does not show a wallow")
+    assert subjects[0] == {0: True, 1: False}
 
 
 def test_screen_json_rejects_a_non_array():
@@ -627,7 +640,8 @@ def test_a_beat_with_no_match_is_researched_on_its_fallback_query(monkeypatch):
     # which is what the model returns for this beat on a live run.
     monkeypatch.setattr(
         visuals, "llm_screen",
-        lambda shortlists, beats, topic: ({0: {0: (False, "shows a bear")}}, []),
+        lambda shortlists, beats, topic, subject_keys=None: (
+            {0: {0: (False, "shows a bear")}}, []),
     )
     notes = visuals._screen_beats(
         plans, [beat], "sleep", [provider], settings,
@@ -680,7 +694,7 @@ def _retry_settings():
     )
 
 
-def _reject_everything(shortlists, beats, topic):
+def _reject_everything(shortlists, beats, topic, subject_keys=None):
     return (
         {index: {position: (False, "shows modern construction")
                  for position in range(len(candidates))}
@@ -856,6 +870,99 @@ def test_the_neutral_shot_still_fills_a_beat_when_nothing_was_rejected(monkeypat
     assert any("neutral shot" in note for note in notes[0])
 
 
+def test_the_subject_is_salvaged_before_the_neutral_shot(monkeypatch):
+    """The bison reel of 2026-09-17, in miniature.
+
+    Beat 3 asked for "bison wallow with water", turned down three genuine bison
+    for *does not show a wallow*, and beats 1, 2, 4 and 6 then filled from a
+    neutral prairie that returned sheep, daisies and thistles. The reel was
+    graded `off_topic` for showing no bison while four screened bison clips sat
+    unused in the run. A clip the screen marked `subj` must now be reached
+    before the neutral shot, wherever in the run it was found.
+    """
+    wallow = Beat(
+        index=0, start=0.0, end=6.0, query="bison wallow with water",
+        text="Those wallows are not just puddles.",
+        alt_queries=("prairie puddle rainwater",),
+        neutral_query="American prairie landscape",
+    )
+    standing = _described(60, "bison-in-the-grassy-field-near-a-road")
+    prairie = _described(61, "american-prairie-landscape-at-dawn")
+    served = {
+        "prairie puddle rainwater": [],
+        "American prairie landscape": [prairie],
+    }
+    provider = _query_aware_provider(served)(session=None)
+
+    def screen(shortlists, beats, topic, subject_keys=None):
+        # The live screen's exact verdict on those three clips: not usable for
+        # this beat, and unmistakably the subject.
+        if subject_keys is not None:
+            subject_keys.add(standing.key)
+        return ({index: {position: (False, "does not show a wallow")
+                         for position in range(len(candidates))}
+                 for index, candidates in shortlists.items()}, [])
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+
+    plans = {0: [(9.0, standing, "bison wallow with water")]}
+    warnings = []
+    rejected_keys = set()
+    notes = visuals._screen_beats(
+        plans, [wallow], "how bison help restore a natural landscape",
+        [provider], _retry_settings(), visuals.UsageLedger(), "run",
+        visuals._RunState(), {}, warnings, rejected_keys,
+    )
+
+    placed = [row[1].provider_id for row in plans[0]]
+    assert placed[0] == "v60", (
+        f"the beat went to the neutral shot with the subject in hand: {placed}"
+    )
+    assert any("salvaged" in note for note in notes[0])
+    assert any("subject but not the action" in w for w in warnings)
+    # And it must stop reading as a reject, or pass 2 places it with the
+    # "nothing else could be downloaded" warning - the wrong sentence for a
+    # clip chosen deliberately.
+    assert standing.key not in rejected_keys
+
+
+def test_salvage_never_fires_on_a_clip_the_screen_did_not_call_the_subject(
+        monkeypatch):
+    """`subj` defaults False, so a model that ignores the field changes nothing.
+
+    This is the guard on the step above: salvage reaching for whatever happens
+    to be lying around would put back exactly the footage the screen exists to
+    keep out - the gaur, the cows and the horses that beat 6 turned down.
+    """
+    wallow = Beat(
+        index=0, start=0.0, end=6.0, query="bison wallow with water",
+        text="Those wallows are not just puddles.",
+        alt_queries=("prairie puddle rainwater",),
+        neutral_query="American prairie landscape",
+    )
+    gaur = _described(62, "gaur-grazing-in-woodland-clearing")
+    prairie = _described(63, "american-prairie-landscape-at-dawn")
+    served = {
+        "prairie puddle rainwater": [],
+        "American prairie landscape": [prairie],
+    }
+    provider = _query_aware_provider(served)(session=None)
+
+    # A screen that answers no "subj" at all, exactly as an older model would.
+    monkeypatch.setattr(visuals, "llm_screen", _reject_everything)
+
+    plans = {0: [(9.0, gaur, "bison wallow with water")]}
+    notes = visuals._screen_beats(
+        plans, [wallow], "how bison help restore a natural landscape",
+        [provider], _retry_settings(), visuals.UsageLedger(), "run",
+        visuals._RunState(), {}, [],
+    )
+
+    assert [row[1].provider_id for row in plans[0]][0] == "v63"
+    assert any("neutral shot" in note for note in notes[0])
+    assert not any("salvaged" in note for note in notes[0])
+
+
 def test_a_beat_no_provider_answered_still_reaches_the_neutral_shot(monkeypatch):
     """"beat 8 had 0 hits and its 7.0s was absorbed by beat 7."
 
@@ -935,7 +1042,7 @@ def test_the_neutral_shot_is_not_searched_when_the_fallback_query_works(monkeypa
     provider_cls = _query_aware_provider(served)
     provider = provider_cls(session=None)
 
-    def screen(shortlists, beats, topic):
+    def screen(shortlists, beats, topic, subject_keys=None):
         # Rejects the mixer, keeps the stone wall: the graded rule the live
         # prompt applies.
         out = {}
@@ -984,9 +1091,9 @@ def test_the_retry_is_screened_by_the_model_not_the_lexical_check(monkeypatch):
     provider = _query_aware_provider(served)(session=None)
     seen_shortlists = []
 
-    def screen(shortlists, beats, topic):
+    def screen(shortlists, beats, topic, subject_keys=None):
         seen_shortlists.append(shortlists)
-        return _reject_everything(shortlists, beats, topic)
+        return _reject_everything(shortlists, beats, topic, subject_keys)
 
     monkeypatch.setattr(visuals, "llm_screen", screen)
 
@@ -1039,7 +1146,7 @@ def test_the_screen_names_the_keys_it_rejected(monkeypatch):
 def _keep_only(provider_ids, rejected_ids=None):
     """A screen that keeps the named candidates and rejects every other one."""
 
-    def screen(shortlists, beats, topic):
+    def screen(shortlists, beats, topic, subject_keys=None):
         verdicts = {}
         for index, candidates in shortlists.items():
             verdicts[index] = {}
@@ -1193,7 +1300,7 @@ def test_an_unscreened_run_does_not_hold_its_own_footage_back(sandbox):
         assert not any("never judged them" in note for note in beat["notes"])
 
 
-def _keep_only_the_first(shortlists, beats, topic):
+def _keep_only_the_first(shortlists, beats, topic, subject_keys=None):
     """Keeps one clip of a beat's own footage, and all of the neutral shot's.
 
     The beat's own shortlist is cut to a single keeper so that every beat ends
@@ -3062,7 +3169,7 @@ def test_the_neutral_shot_is_screened_like_everything_else(monkeypatch):
         {"underground dirt tunnels": [monastery, tunnel]}
     )(session=None)
 
-    def screen(shortlists, beats, topic):
+    def screen(shortlists, beats, topic, subject_keys=None):
         # The subject test, standing in for the model: it is told the beat was
         # searched for the neutral query, not for the narration's words.
         assert [b.query for b in beats] == ["underground dirt tunnels"]

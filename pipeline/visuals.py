@@ -773,6 +773,9 @@ def llm_queries(beats: list[Beat], topic: str) -> list[str]:
             contents=prompt,
             config=types.GenerateContentConfig(**kwargs),
         )
+        script_gen.USAGE.record(
+            config.GEMINI_MODEL, getattr(response, "usage_metadata", None)
+        )
         entries = _parse_query_json(response.text or "", len(beats))
     except Exception as exc:  # noqa: BLE001 - any failure falls back to keywords
         return [
@@ -1864,14 +1867,42 @@ this against the topic, not only the beat - a beat reading "the state put \
 every commoner to work" says nothing about the period on its own.
 - "why" is a short phrase, only on rejects, naming what the clip shows \
 instead.
+- "subj" is a different question from "ok", and you answer it for every \
+candidate, keepers and rejects alike: does this clip show the video's \
+main subject - the one recurring thing named in the topic line above - \
+whatever that subject happens to be doing in it? Judge "subj" against \
+the topic, never against the beat. A clip of the subject standing still \
+is "subj": true under a beat that asked for it wallowing, running or \
+feeding, even though that is not what the beat asked for and "ok" is \
+false. Scenery the subject merely lives in, with the subject absent, is \
+"subj": false, and so is a different animal, culture or place however \
+close - a gaur is not a bison. Where the topic names no single subject \
+- a process, an idea, a place - answer "subj": false throughout rather \
+than guessing at one.
 
 Return ONLY a JSON array, one object per beat, in beat order:
-[{{"beat": 0, "verdicts": [{{"i": 0, "ok": true}}, \
-{{"i": 1, "ok": false, "why": "shows a bear, not people"}}]}}]"""
+[{{"beat": 0, "verdicts": [{{"i": 0, "ok": true, "subj": true}}, \
+{{"i": 1, "ok": false, "subj": false, \
+"why": "shows a bear, not people"}}]}}]"""
 
 
-def _parse_screen_json(raw: str) -> dict[int, dict[int, tuple[bool, str]]]:
-    """Read the screener's JSON into {beat_index: {candidate_i: (ok, why)}}."""
+def _parse_screen_json(
+    raw: str,
+) -> tuple[dict[int, dict[int, tuple[bool, str]]], dict[int, dict[int, bool]]]:
+    """Read the screener's JSON into verdicts and subject flags.
+
+    Returns `({beat: {i: (ok, why)}}, {beat: {i: shows_the_subject}})`. The two
+    answer different questions and are deliberately kept apart: `ok` is "use
+    this clip for *this beat*", `subj` is "this clip shows what the video is
+    about, whatever it is doing". A bison standing in a field is `subj` true
+    and `ok` false under a beat asking for a bison wallowing, and that pair is
+    the whole point - it is what lets a beat with nothing left prefer the right
+    animal doing the wrong thing over a landscape with no animal in it.
+
+    `subj` defaults to False, not True: an older model, a truncated response or
+    a topic with no single subject all arrive here the same way, and the
+    salvage step this feeds must not fire on a guess.
+    """
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
@@ -1886,6 +1917,7 @@ def _parse_screen_json(raw: str) -> dict[int, dict[int, tuple[bool, str]]]:
         raise ValueError("screener output was not a JSON array")
 
     parsed: dict[int, dict[int, tuple[bool, str]]] = {}
+    subjects: dict[int, dict[int, bool]] = {}
     for entry in data:
         if not isinstance(entry, dict):
             continue
@@ -1894,6 +1926,7 @@ def _parse_screen_json(raw: str) -> dict[int, dict[int, tuple[bool, str]]]:
         except (TypeError, ValueError):
             continue
         verdicts: dict[int, tuple[bool, str]] = {}
+        shows: dict[int, bool] = {}
         for verdict in entry.get("verdicts") or []:
             if not isinstance(verdict, dict):
                 continue
@@ -1905,13 +1938,16 @@ def _parse_screen_json(raw: str) -> dict[int, dict[int, tuple[bool, str]]]:
                 bool(verdict.get("ok", True)),
                 str(verdict.get("why") or "").strip(),
             )
+            shows[position] = bool(verdict.get("subj", False))
         if verdicts:
             parsed[beat_index] = verdicts
-    return parsed
+            subjects[beat_index] = shows
+    return parsed, subjects
 
 
 def llm_screen(
-    shortlists: dict[int, list[Candidate]], beats: list[Beat], topic: str
+    shortlists: dict[int, list[Candidate]], beats: list[Beat], topic: str,
+    subject_keys: set[str] | None = None,
 ) -> tuple[dict[int, dict[int, tuple[bool, str]]], list[str]]:
     """Screen every beat's shortlist in one Gemini call. Never raises.
 
@@ -1970,7 +2006,22 @@ def llm_screen(
             contents=prompt,
             config=types.GenerateContentConfig(**kwargs),
         )
-        return _parse_screen_json(response.text or ""), []
+        script_gen.USAGE.record(
+            config.GEMINI_MODEL, getattr(response, "usage_metadata", None)
+        )
+        verdicts, subjects = _parse_screen_json(response.text or "")
+        # The subject flags leave by an out-parameter rather than in the return
+        # value on purpose: every caller wants the verdicts, only the fallback
+        # chain wants these, and a third element would make both screening call
+        # sites and the lexical path carry a value they have nothing to do
+        # with. `rejected_keys` and `screened_keys` are threaded the same way.
+        if subject_keys is not None:
+            for index, flags in subjects.items():
+                shortlist = shortlists.get(index) or []
+                for position, shows in flags.items():
+                    if shows and 0 <= position < len(shortlist):
+                        subject_keys.add(shortlist[position].key)
+        return verdicts, []
     except Exception as exc:  # noqa: BLE001 - any failure falls back to lexical
         return {}, [
             f"Gemini relevance screening failed ({type(exc).__name__}: {exc}). "
@@ -2799,6 +2850,7 @@ def _screen_beats(
     rejections: dict[str, int], warnings: list[str],
     rejected_keys: set[str] | None = None,
     screened_keys: set[str] | None = None,
+    subject_keys: set[str] | None = None,
 ) -> dict[int, list[str]]:
     """Check every beat's shortlist against its narration, in one pass.
 
@@ -2836,6 +2888,11 @@ def _screen_beats(
     # man at Christmas dinner from the rows underneath.
     if screened_keys is None:
         screened_keys = set()
+    # Clips the screen said show the video's subject, whatever they were doing
+    # in them. Run-wide and deliberately not per-beat: the whole use of this
+    # set is to let one beat reach a clip another beat found and turned down.
+    if subject_keys is None:
+        subject_keys = set()
     by_index = {b.index: b for b in beats}
 
     shortlists = {
@@ -2844,7 +2901,9 @@ def _screen_beats(
     }
     llm_verdicts: dict[int, dict[int, tuple[bool, str]]] = {}
     if mode == "llm" and shortlists:
-        llm_verdicts, screen_warnings = llm_screen(shortlists, beats, topic)
+        llm_verdicts, screen_warnings = llm_screen(
+            shortlists, beats, topic, subject_keys=subject_keys
+        )
         warnings.extend(screen_warnings)
 
     retry: list[Beat] = []
@@ -2932,7 +2991,7 @@ def _screen_beats(
         }
         retry_beats = [by_index[i] for i in retry_shortlists if i in by_index]
         retry_verdicts, screen_warnings = llm_screen(
-            retry_shortlists, retry_beats, topic
+            retry_shortlists, retry_beats, topic, subject_keys=subject_keys
         )
         warnings.extend(screen_warnings)
 
@@ -2987,6 +3046,52 @@ def _screen_beats(
         # sends whoever reads it to the screen instead of to the providers.
         trouble = ("no provider returned anything for"
                    if beat.index in empty else "nothing found matches")
+
+        # --- the subject is already in this run, just not doing this ------
+        # Before the neutral shot, look for a clip the screen said shows the
+        # video's own subject - anywhere in the run, not only in this beat's
+        # plan. The bison reel of 2026-09-17 is what this is for: beat 3 asked
+        # for "bison wallow with water" and turned down three genuine bison
+        # ("does not show a wallow"), and beats 1, 2, 4 and 6 then fell to a
+        # neutral prairie that returned sheep, daisies and thistles. The reel
+        # was graded off_topic for showing no bison while four screened bison
+        # clips sat unused in the run.
+        #
+        # The order is the claim: the right subject doing the wrong thing says
+        # less than the beat asked for, but a landscape with the subject absent
+        # says nothing at all, and only one of the two can be mistaken for the
+        # video being about something else. `neutral_query` is unscreened by
+        # design, so it is the weaker guarantee of the two, not the stronger.
+        salvage: list[tuple[float, Candidate, str]] = []
+        if subject_keys:
+            seen_here = set()
+            for rows in plans.values():
+                for row in rows:
+                    key = row[1].key
+                    if (key in subject_keys and key not in state.taken_keys
+                            and key not in seen_here):
+                        seen_here.add(key)
+                        salvage.append(row)
+        if salvage:
+            # The run has decided these are acceptable footage, so they must
+            # stop reading as rejects downstream - pass 2 classifies a beat's
+            # rows against `rejected_keys` and would otherwise place one with
+            # the "nothing else could be downloaded" warning, which is exactly
+            # the wrong sentence for a clip chosen on purpose.
+            rejected_keys.difference_update(seen_here)
+            plans[beat.index] = salvage + plans.get(beat.index, [])
+            notes.setdefault(beat.index, []).append(
+                f"salvaged {len(salvage)} clip(s) the screen marked as the "
+                f"subject from elsewhere in the run: {trouble} "
+                f"{beat.query!r}, and the subject beats a neutral shot"
+            )
+            warnings.append(
+                f"beat {beat.index}: {trouble} {beat.query!r}, so the beat "
+                f"plays {len(salvage)} clip(s) showing the subject but not the "
+                f"action, rather than a neutral shot with no subject in it"
+            )
+            continue
+
         neutral = (beat.neutral_query or "").strip()
         if not neutral:
             warnings.append(
@@ -3530,6 +3635,7 @@ def source_visuals(
     rejections: dict[str, int] = {}
     rejected_keys: set[str] = set()
     screened_keys: set[str] = set()
+    subject_keys: set[str] = set()
     unjudged_keys: set[str] = set()
     assets: list[dict] = []
     beat_records: list[dict] = []
@@ -3558,7 +3664,7 @@ def source_visuals(
 
     screen_notes = _screen_beats(
         plans, beats, topic, active, settings, ledger, run_id, state,
-        rejections, warnings, rejected_keys, screened_keys,
+        rejections, warnings, rejected_keys, screened_keys, subject_keys,
     )
 
     # The screen has already handed whole beats to the neutral shot, and those

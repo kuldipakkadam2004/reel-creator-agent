@@ -109,6 +109,15 @@ MAX_DURATION_SECONDS = 180
 #: call sites across five modules, all of which want the text and none of
 #: which want the accounting. Step 8 reads the totals at the end of a run.
 #:
+#: `call_gemini` is not the only thing that feeds this. Step 4's query writer
+#: and relevance screener build their own `genai.Client` (they need per-call
+#: generation settings step 2 does not), and until 2026-09-17 they dropped
+#: `usage_metadata` on the floor - so a run that spent most of its effort in
+#: `visuals.py` reported none of it, and the recorded cost of a reel was an
+#: undercount of unknown size. Both now call `USAGE.record` directly. Anything
+#: else that reaches Gemini without going through `call_gemini` must do the
+#: same or it is invisible here.
+#:
 #: Prices are not stored here. They change, they differ per tier, and a stale
 #: constant that looks authoritative is worse than no constant - the tokens are
 #: the measurement, the rupees are the reader's arithmetic.
