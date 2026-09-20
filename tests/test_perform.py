@@ -2145,6 +2145,87 @@ def test_the_board_ordering_is_printed_beside_the_reach_ordering(paths):
     assert exhibit["by_score"][1]["reach"] == 6,         "the board's second favourite was the worst reel in the file"
 
 
+def _scored(ledger, run_id, *, day, score, reach):
+    features = _features(run_id, day=day)
+    features["topic_score"] = score
+    ledger.register(features)
+    ledger.record(run_id, {"watch_ratio": 0.5, "reach": reach})
+
+
+def test_too_few_scored_reels_correlate_to_nothing_at_all(paths):
+    """An absent answer, not a weak one: four rows cannot carry a rho."""
+    ledger = perform.PerformanceLedger()
+    for day, (score, reach) in enumerate(((4.5, 10), (3.7, 900), (2.0, 700),
+                                          (1.3, 64))):
+        _scored(ledger, f"r{day}", day=day, score=score, reach=reach)
+
+    exhibit = perform.report(ledger=ledger, min_samples=1)["reach_exhibit"]
+
+    assert exhibit["ordering"] is None
+
+
+def test_the_calendar_is_taken_back_out_of_the_board_ordering(paths, capsys):
+    """The ledger's own shape: score and post date are nearly one column.
+
+    Every score rises with the post date and so does every reach, which makes
+    the raw rank correlation perfect and says nothing - the board's picks got
+    better in step with everything else about this account. Holding post order
+    still is what tells the two apart.
+    """
+    ledger = perform.PerformanceLedger()
+    for day in range(10):
+        _scored(ledger, f"r{day}", day=day,
+                score=1.0 + day * 0.4, reach=10 + day * 30)
+
+    ordering = perform.report(ledger=ledger,
+                              min_samples=1)["reach_exhibit"]["ordering"]
+
+    assert ordering["n"] == 10
+    assert ordering["rho"] == 1.0
+    assert ordering["score_by_date"] == 1.0
+    assert ordering["partial"] is None,         "with score and the calendar identical there is nothing left to hold still"
+
+    perform._print_ordering(ordering)
+    assert "is the calendar and the board at once" in capsys.readouterr().out,         "a raw rho printed on its own reads as the board working"
+
+
+def test_a_board_that_orders_reach_against_the_calendar_keeps_its_rho(paths):
+    """The control: the same block has to be able to say the board works.
+
+    Score is dealt out against the posting order here rather than with it, so
+    the calendar explains none of it and the partial stays where the raw
+    correlation is. Without this the block can only ever print a denial.
+    """
+    ledger = perform.PerformanceLedger()
+    scores = (3.0, 1.0, 4.0, 2.0, 5.0, 1.5, 4.5, 2.5, 3.5, 5.5)
+    for day, score in enumerate(scores):
+        _scored(ledger, f"r{day}", day=day, score=score,
+                reach=int(score * 100))
+
+    ordering = perform.report(ledger=ledger,
+                              min_samples=1)["reach_exhibit"]["ordering"]
+
+    assert ordering["rho"] == 1.0
+    assert ordering["partial"] == 1.0
+    assert abs(ordering["score_by_date"]) < 0.5
+    assert ordering["p"] <= 0.01
+
+
+def test_the_ordering_prints_both_figures_or_neither(paths, capsys):
+    """The raw figure alone reads as the board working. Both, or nothing."""
+    ledger = perform.PerformanceLedger()
+    scores = (3.0, 1.0, 4.0, 2.0, 5.0, 1.5, 4.5, 2.5, 3.5, 5.5)
+    for day, score in enumerate(scores):
+        _scored(ledger, f"r{day}", day=day, score=score,
+                reach=int(score * 100))
+
+    perform._print_report(perform.report(ledger=ledger, min_samples=1))
+    out = capsys.readouterr().out
+
+    assert "score against reach: rho +1.00" in out
+    assert "post order held still: rho +1.00" in out
+
+
 def test_a_component_name_is_never_cut_in_half(paths):
     """'curiosity (contradic' reads as a component nobody recognises."""
     assert perform._charged(

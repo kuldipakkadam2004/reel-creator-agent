@@ -1190,6 +1190,143 @@ def won_a_follow(entry: dict) -> float | None:
 #: some noise.
 _NO_MIDDLE_SHARE = 0.5
 
+#: Below this many scored reels the orderings are printed and nothing is
+#: correlated. Eight because that is what every other block here waits for -
+#: `PERFORMANCE_MIN_SAMPLES` - and because a rank correlation over four rows
+#: takes one swapped pair to cross from +1 to nothing.
+_ORDERING_MIN_ROWS = 8
+
+
+def _ranks(values: list[float]) -> list[float]:
+    """Mid-ranks, so tied values share a position instead of inventing order.
+
+    Two reels scored 1.80 are not ranked 4th and 5th by whichever the file
+    happened to list first; they are both 4.5th. Half this ledger's scores
+    arrive in ties, so the alternative is a correlation that moves when the
+    rows are re-sorted.
+    """
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    out = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        stop = start
+        while (stop + 1 < len(order)
+               and values[order[stop + 1]] == values[order[start]]):
+            stop += 1
+        shared = (start + stop) / 2.0 + 1.0
+        for index in range(start, stop + 1):
+            out[order[index]] = shared
+        start = stop + 1
+    return out
+
+
+def _pearson(left: list[float], right: list[float]) -> float | None:
+    """Correlation, or None when either side never varies."""
+    count = len(left)
+    if count < 2 or count != len(right):
+        return None
+    mean_left = sum(left) / count
+    mean_right = sum(right) / count
+    spread = (sum((value - mean_left) ** 2 for value in left)
+              * sum((value - mean_right) ** 2 for value in right)) ** 0.5
+    if not spread:
+        return None
+    return sum((a - mean_left) * (b - mean_right)
+               for a, b in zip(left, right)) / spread
+
+
+def _spearman(left: list[float], right: list[float]) -> float | None:
+    return _pearson(_ranks(left), _ranks(right))
+
+
+def score_ordering(listed: list[dict]) -> dict | None:
+    """Whether the board's score orders reach, and whether the calendar does.
+
+    **Why this prints a number when the exhibit around it refuses to.** The
+    objection to correlating this column was that one reel holds most of the
+    total, and a correlation over eight rows would be describing that reel.
+    Ranks answer it: 1852 and 189 are first and second either way, so the tail
+    that makes every mean here meaningless does not reach a rank correlation
+    at all. What it cannot fix is n, which is why nothing prints below
+    `_ORDERING_MIN_ROWS`.
+
+    **Why refusing was not neutral.** The two orderings were printed side by
+    side and left to the reader, and the reading they got was the top of one
+    against the top of the other - a comparison of four reels at the extreme
+    of a distribution with a forty-to-one spread, which is the least stable
+    comparison available in the file. Read that way on 2026-09-19 it said the
+    board's ordering is unrelated to reach. The rank correlation over all
+    fifteen says +0.55, which is the opposite, and the partial below says the
+    first reading was right for a reason neither ordering shows.
+
+    **Why post order is held still.** Score and post date are nearly the same
+    column on this account: the low scores are the reels of the first week and
+    the high ones are this week's, because the board and everything around it
+    kept changing. Reach rose over the same weeks. A correlation between score
+    and reach therefore has the calendar inside it, and `partial` takes it
+    back out - Spearman's, computed from the three pairwise correlations
+    rather than by fitting anything, because with n this small a fit would be
+    a third assumption to defend.
+
+    `p` is a permutation test rather than a table lookup: reach ranks are
+    shuffled against the scores `_RESAMPLES` times and the share of shuffles
+    reaching this |rho| is reported. It makes no distributional claim, which
+    matters on a column like this one, and it is seeded so the same ledger
+    prints the same figure twice.
+
+    None when too few reels carry both a score and a post time - which is not
+    a weak answer but an absent one.
+    """
+    dated = [(row, _parse_stamp(row.get("posted"))) for row in listed]
+    usable = [(row, when) for row, when in dated
+              if row.get("score") is not None and when is not None]
+    if len(usable) < _ORDERING_MIN_ROWS:
+        return None
+    usable.sort(key=lambda pair: pair[1])
+    usable = [row for row, _ in usable]
+
+    scores = [float(row["score"]) for row in usable]
+    reaches = [float(row["reach"]) for row in usable]
+    order = [float(index) for index in range(len(usable))]
+
+    rho = _spearman(scores, reaches)
+    if rho is None:
+        return None
+    score_by_date = _spearman(scores, order)
+    reach_by_date = _spearman(reaches, order)
+
+    # The pairwise form of a partial correlation. Guarded because a component
+    # of exactly +/-1 - every reel scored in posting order, which a short
+    # enough ledger can manage - leaves nothing to divide by.
+    partial = None
+    if score_by_date is not None and reach_by_date is not None:
+        residual = ((1.0 - score_by_date ** 2)
+                    * (1.0 - reach_by_date ** 2)) ** 0.5
+        if residual > 1e-9:
+            partial = (rho - score_by_date * reach_by_date) / residual
+            partial = max(-1.0, min(1.0, partial))
+
+    rng = random.Random(_RESAMPLE_SEED)
+    score_ranks, reach_ranks = _ranks(scores), _ranks(reaches)
+    shuffled = list(reach_ranks)
+    extreme = 0
+    for _ in range(_RESAMPLES):
+        rng.shuffle(shuffled)
+        drawn = _pearson(score_ranks, shuffled)
+        if drawn is not None and abs(drawn) >= abs(rho) - 1e-12:
+            extreme += 1
+
+    return {
+        "n": len(usable),
+        "rho": round(rho, 3),
+        "p": round(extreme / _RESAMPLES, 3),
+        "partial": None if partial is None else round(partial, 3),
+        "score_by_date": (None if score_by_date is None
+                          else round(score_by_date, 3)),
+        "reach_by_date": (None if reach_by_date is None
+                          else round(reach_by_date, 3)),
+    }
+
 
 def reach_exhibit(rows: list[dict], limit: int = 12) -> dict:
     """Every posted reel against the raw reach it got, ranked, with no floors.
@@ -1227,10 +1364,16 @@ def reach_exhibit(rows: list[dict], limit: int = 12) -> dict:
     ordinary reel for this account" is not a thing that exists.
 
     `by_score` re-sorts the same rows by what the board scored them, so the two
-    orderings can be read against each other. That comparison is left to the
-    reader on purpose - printing a correlation over eight rows, one of which is
-    four fifths of the total, would be inventing the finding this is here to
-    avoid inventing.
+    orderings can be read against each other, and `ordering` is what that
+    comparison is actually worth - see `score_ordering`. The comparison used to
+    be left to the reader, on the grounds that a correlation over eight rows,
+    one of which held four fifths of the total, would be inventing the finding
+    this block exists to avoid inventing. Leaving it turned out not to be
+    neutral: the tops of the two lists were compared instead, which is the same
+    inference drawn from four reels rather than fifteen, and it came out
+    backwards. A rank correlation is immune to the reel holding four fifths -
+    ranks do not know how big it is - so the objection that stood was n, and n
+    is now the thing being waited for rather than the thing being refused.
 
     A reel with no reach reading is counted in `unread` and never listed as a
     zero: never asked is not nobody saw it, the same distinction `won_a_follow`
@@ -1262,6 +1405,10 @@ def reach_exhibit(rows: list[dict], limit: int = 12) -> dict:
             "components": [str(name) for name in components]
                           if isinstance(components, list) else [],
             "hours": row.get("hours_after_post"),
+            # When the post went up, not when the reel was read. The exhibit
+            # does not print it; `score_ordering` needs it to hold the
+            # calendar still, and a row is no use to that without one.
+            "posted": row.get("posted_at") or "",
         })
 
     listed.sort(key=lambda entry: -entry["reach"])
@@ -1275,6 +1422,9 @@ def reach_exhibit(rows: list[dict], limit: int = 12) -> dict:
     return {
         "rows": listed[:limit],
         "by_score": scored[:2],
+        # Over every scored reel, not the `limit` that get printed: the
+        # correlation is about the ledger, not about the top of the page.
+        "ordering": score_ordering(listed),
         "of": len(listed),
         "total": total,
         "unread": unread,
@@ -2446,7 +2596,13 @@ def fetch(*, ledger: PerformanceLedger | None = None, provider=None,
     # the point - so the loop above never reaches it and the save below would
     # put the borrowed numbers straight back. Merging field by field cannot
     # express a deletion, so the disk row is adopted whole.
-    for run_id in [row["run_id"] for row in waiting]:
+    #
+    # Every row on disk and not just the ones asked about, because the row that
+    # loses a post is usually not a row anybody asked about: a settled reel
+    # sitting on a guess is invisible to `unsettled` and stays invisible right
+    # up until this fetch finds the caption that takes its post away. Scoped to
+    # `waiting`, this loop would drop exactly the disowning that matters.
+    for run_id in stored:
         saved = stored.get(run_id)
         held = ledger.reels.get(run_id)
         if not isinstance(saved, dict) or not isinstance(held, dict):
@@ -2831,6 +2987,54 @@ def _charged(components: list, width: int = 65) -> str:
     return out
 
 
+def _sign(value: float) -> str:
+    """A correlation with its sign always shown, so -0.06 and +0.06 line up."""
+    return f"{value:+.2f}"
+
+
+def _print_ordering(ordering: dict) -> None:
+    """The two orderings reduced to what they are worth, and the confound.
+
+    Printed underneath the lists rather than instead of them, because the
+    lists say *which* reels and this says whether the pairing means anything.
+    Both figures go up together or neither does: the raw one on its own reads
+    as the board working, the partial on its own reads as a verdict on the
+    board, and it is the gap between them that is the actual observation -
+    this account changed every week, so nearly anything that rose over those
+    weeks correlates with reach.
+    """
+    if not ordering:
+        return
+    rho = ordering.get("rho")
+    if rho is None:
+        return
+    count, chance = ordering.get("n"), ordering.get("p")
+    line = f"  score against reach: rho {_sign(rho)} over {count} scored reel(s)"
+    if chance is not None:
+        line += f", p {chance:.2f}"
+    print(line)
+
+    partial = ordering.get("partial")
+    by_date = ordering.get("score_by_date")
+    if by_date is None:
+        return
+    # The figure above, alone, reads as the board working. It is printed with
+    # the calendar beside it or it is not printed as an answer at all - which
+    # includes the case where the calendar leaves nothing to answer with.
+    if partial is None:
+        print(f"    score and post order are one ordering here (rho "
+              f"{_sign(by_date)}), so nothing")
+        print(f"    can be held still: the figure above is the calendar and "
+              f"the board at once")
+        return
+    print(f"  the same with post order held still: rho {_sign(partial)}")
+    print(f"    score and post order move together at rho {_sign(by_date)}, so "
+          f"the figure above")
+    print(f"    is largely the calendar - and what the board's ordering is "
+          f"worth on its own")
+    print(f"    is the second number, not the first")
+
+
 def _print_reach_exhibit(exhibit: dict) -> None:
     """The reach distribution itself, printed because no table can hold it.
 
@@ -2896,6 +3100,7 @@ def _print_reach_exhibit(exhibit: dict) -> None:
             print(f"    {float(row['score']):.2f}  "
                   f"{(row.get('topic') or row['run_id'])[:44]:<44} "
                   f"reached {row['reach']}")
+    _print_ordering(exhibit.get("ordering") or {})
     if unread:
         print(f"  {unread} posted reel(s) have no reach reading and are not "
               f"listed - never asked is not nobody saw it")

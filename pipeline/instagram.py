@@ -480,7 +480,8 @@ def match(features: dict, posts: list[dict]) -> dict:
 
 def assign(features_by_run: dict, posts: list[dict],
            pinned: dict | None = None,
-           remembered: dict | None = None) -> dict:
+           remembered: dict | None = None,
+           held: dict | None = None) -> dict:
     """Match every waiting reel at once, letting no post be claimed twice.
 
     `match` cannot see the other reels, which is right when a caption settles
@@ -513,12 +514,44 @@ def assign(features_by_run: dict, posts: list[dict],
     authoritative thing here, and one that matches nothing visible is worth
     seeing rather than silently dropping. But two pins on one post are a typo,
     not a fact, and the first one wins.
+
+    `held` is what the reels *outside* this call already hold: media id to how
+    they came by it. One post is one reel across the whole ledger, and this
+    function could only ever enforce it across the rows handed to it - which
+    is every row the first time and, once a reading settles, none of them. A
+    reel that settles stops being asked about and its post stops being spoken
+    for, so the next unmatched reel made nearby is free to guess its way onto
+    it. That is not the bug that was fixed in September; it is the same
+    invariant leaking through the other side, and it is how four rows in this
+    ledger came to wear three posts that belonged to other reels.
+
+    A held post is not absolutely unavailable, because that would let a guess
+    outrank evidence again with the ranks reversed: a settled *timestamp*
+    match is still only the nearest post, and a caption arriving later is the
+    evidence it was waiting for. So a post held on a guess can be taken by a
+    pin or a caption and by nothing else, and a post held on evidence cannot
+    be taken at all. The caller is left to notice what changed hands and
+    disown the row that lost it.
     """
     claimed: dict[str, str] = {}
     out: dict[str, dict] = {}
+    outside = {media_id: (how or "")
+               for media_id, how in (held or {}).items() if media_id}
+    _EVIDENCE = ("pinned", "caption")
+
+    def free(media_id: str, rung: str) -> bool:
+        """Whether this rung may take this post."""
+        if media_id in claimed:
+            return False
+        how = outside.get(media_id)
+        if how is None:
+            return True
+        return rung in _EVIDENCE and how not in _EVIDENCE
 
     for run_id, media_id in (pinned or {}).items():
-        if not media_id or run_id not in features_by_run or media_id in claimed:
+        if not media_id or run_id not in features_by_run:
+            continue
+        if not free(media_id, "pinned"):
             continue
         post = next((p for p in posts if (p.get("id") or "") == media_id), None)
         out[run_id] = (_found(post, "pinned") if post else
@@ -533,7 +566,7 @@ def assign(features_by_run: dict, posts: list[dict],
     hits.sort(key=lambda pair: _distance(features_by_run[pair[0]], pair[1]))
     for run_id, post in hits:
         media_id = post.get("id") or ""
-        if run_id in out or media_id in claimed:
+        if run_id in out or not free(media_id, "caption"):
             continue
         out[run_id] = _found(post, "caption")
         claimed[media_id] = run_id
@@ -546,7 +579,7 @@ def assign(features_by_run: dict, posts: list[dict],
     for run_id, media_id in (remembered or {}).items():
         if not media_id or run_id not in features_by_run or run_id in out:
             continue
-        if media_id in claimed:
+        if not free(media_id, "remembered"):
             continue
         post = next((p for p in posts if (p.get("id") or "") == media_id), None)
         if post is None:
@@ -565,7 +598,7 @@ def assign(features_by_run: dict, posts: list[dict],
     guesses.sort(key=lambda triple: (triple[0], triple[1]))
     for _, run_id, post in guesses:
         media_id = post.get("id") or ""
-        if run_id in out or media_id in claimed:
+        if run_id in out or not free(media_id, "timestamp"):
             continue
         out[run_id] = _found(post, "timestamp")
         claimed[media_id] = run_id
@@ -656,7 +689,33 @@ def fetch(run_ids, features_by_run: dict) -> dict:
     remembered = {run_id: entry.get("media_id") or ""
                   for run_id, entry in stored.items()
                   if run_id not in by_hand}
-    found_by_run = assign(features_by_run, posts, pinned, remembered)
+    # What the reels nobody is asking about already hold. `unsettled` stops
+    # offering a reel once its reading is final, so without this the posts of
+    # every settled reel look unspoken-for to the rungs below and the newest
+    # unmatched reel guesses its way onto one of them.
+    outside_rows = {run_id: entry for run_id, entry in ledger.reels.items()
+                    if run_id not in features_by_run
+                    and isinstance(entry, dict) and entry.get("media_id")}
+    held_by = {entry["media_id"]: run_id
+               for run_id, entry in outside_rows.items()}
+    held = {entry["media_id"]: (entry.get("matched_by") or "pinned")
+            for entry in outside_rows.values()}
+    found_by_run = assign(features_by_run, posts, pinned, remembered, held)
+
+    # A post that changed hands: some reel in this batch produced the evidence
+    # that beat a guess an older row was sitting on. The older row is not in
+    # `remembered` - nothing is asking about it - so the loop below is the only
+    # thing that can take the borrowed numbers off it.
+    for run_id, found in found_by_run.items():
+        media_id = (found or {}).get("media_id") or ""
+        loser = held_by.get(media_id, "")
+        if not media_id or not loser or loser == run_id:
+            continue
+        if ledger.disown(loser):
+            print(f"warning: {loser} no longer holds post {media_id}"
+                  f" - {run_id} matched it on its caption."
+                  " Its numbers came off that post and have been dropped.",
+                  file=sys.stderr)
 
     # A reel that held a post and does not any more kept numbers read off it,
     # and they stay in every table until something takes them out.

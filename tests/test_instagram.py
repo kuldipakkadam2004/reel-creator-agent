@@ -541,6 +541,62 @@ def test_a_caption_takes_its_post_off_a_remembered_guess(credentials, tmp_path):
     assert found["mole"]["media_id"] == ""
 
 
+def test_a_post_a_settled_reel_holds_is_not_guessed_onto_again(credentials,
+                                                                tmp_path):
+    """The other side of "one post is one reel", and how four rows broke it.
+
+    `unsettled` stops offering a reel once its reading is final, so a settled
+    reel is never in `features_by_run` and the post it holds used to look
+    unspoken-for. The next reel made within the match window then guessed its
+    way onto it - which is how two mole-rat runs, a beetle run and a bison run
+    came to wear three posts that had already been settled on their captions.
+    """
+    made = datetime(2026, 9, 14, 5, 41, tzinfo=timezone.utc)
+    rows = {"guesser": _row(tmp_path, "guesser", made=made)}
+    posts = [_post("18022390649870546", "Collectors have to use a drill.",
+                   made + timedelta(hours=36))]
+
+    found = instagram.assign(rows, posts, None, None,
+                             {"18022390649870546": "caption"})
+
+    assert found["guesser"]["media_id"] == ""
+
+
+def test_a_caption_still_takes_a_post_a_settled_guess_is_sitting_on(
+        credentials, tmp_path):
+    """Held is not sacred: a settled *guess* is still only the nearest post.
+
+    Refusing every held post would put the guess back above the evidence, with
+    the ranks reversed - the failure this matcher was rewritten to end.
+    """
+    made = datetime(2026, 9, 12, 16, 51, tzinfo=timezone.utc)
+    rows = {"brain": _row(tmp_path, "brain", made=made,
+                          caption="While you sleep, your brain floods itself.")}
+    posts = [_post("18100751702021813",
+                   "While you sleep, your brain floods itself. #sleep",
+                   made + timedelta(hours=19))]
+
+    found = instagram.assign(rows, posts, None, None,
+                             {"18100751702021813": "timestamp"})
+
+    assert found["brain"]["media_id"] == "18100751702021813"
+    assert found["brain"]["how"] == "caption"
+
+
+def test_a_timestamp_guess_cannot_take_a_post_off_another_guess(credentials,
+                                                                tmp_path):
+    """Only evidence may take a held post. A second guess is not evidence."""
+    made = datetime(2026, 9, 12, 16, 51, tzinfo=timezone.utc)
+    rows = {"guesser": _row(tmp_path, "guesser", made=made)}
+    posts = [_post("18100751702021813", "nothing this reel ever wrote",
+                   made + timedelta(hours=19))]
+
+    found = instagram.assign(rows, posts, None, None,
+                             {"18100751702021813": "timestamp"})
+
+    assert found["guesser"]["media_id"] == ""
+
+
 def test_a_remembered_match_keeps_its_post_when_nothing_contests_it(
         credentials, tmp_path):
     """The reason the id is stored at all: a reel keeps its post on a re-read."""

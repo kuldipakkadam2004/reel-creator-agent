@@ -2267,6 +2267,38 @@ does not move one: `curiosity_component` is worth `CURIOSITY_SIGNAL_WEIGHT`
 numbers are a declared prior that has now been *looked at* for the first time
 rather than validated.
 
+**Leaving the pair to the reader was not neutral.** Two orderings printed side
+by side with no number attached to them do not get read as an open question;
+they get read as the top of one against the top of the other, which is a claim
+about four reels drawn from a column with a forty-to-one spread. Read exactly
+that way on 2026-09-19 it said the board's score is unrelated to reach: the two
+reels holding 56% of all impressions were 3.74 and 3.90, while the board's own
+top two, 4.57 and 4.50, had reached 284 and 106. The rank correlation over all
+of them said the opposite — **+0.55, p 0.04** — which is what happens when a
+tail comparison is made to stand in for the file.
+
+So the block now prints the correlation, and the objection that kept it out for
+a month does not survive the switch to ranks: the worry was that one reel held
+four fifths of the total and a correlation would be describing that reel, but
+ranks do not know how big it is — 1852 and 289 are first and second whatever
+the gap. What the objection leaves standing is n, so nothing prints below
+`_ORDERING_MIN_ROWS`, which is `PERFORMANCE_MIN_SAMPLES`' shape of caution.
+
+It prints a second figure with it, always, because the first one alone is
+misleading in the other direction. On this account score and the calendar are
+nearly the same column: the 1.30s and 1.80s are the first week's reels and the
+4.50s are this week's, because the board and everything around it kept being
+changed, and reach rose over the same weeks for reasons that have nothing to do
+with the board. Score against post order is **+0.86**. Holding the calendar
+still takes the +0.61 the repaired ledger reports down to **+0.31** over 13
+scored reels — which is not the denial the 2026-09-19 reading claimed, and not
+a working board either. It is thirteen reels. The honest summary is that the
+board's ordering cannot be read at this n once the calendar is out of it, and
+the exhibit now says so in numbers instead of leaving a gap for a tail
+comparison to fill. When the calendar and the score are the *same* ordering the
+partial cannot be computed at all, and the block says that rather than printing
+the raw figure on its own.
+
 What the exhibit changes is that the question became answerable, and
 `PERFORMANCE_EXPLORE=curiosity` is the answer to it: a board trial that charges
 the component on alternate days and drops it on the rest, so the next twenty
@@ -2585,7 +2617,28 @@ Five things about it are worth knowing before relying on it:
   and goes back to `pending`, with a warning naming who took it. **The check
   that catches this is in `--report`'s own header:** if `REELS` says more
   posted than `AUDIENCE` says the account has posts, a post is being worn
-  twice. Numbers typed in by hand are never dropped this way;
+  twice. Numbers typed in by hand are never dropped this way.
+
+  That check was still failing on 2026-09-20 — 20 posted against an account
+  with 16 posts — because the rule had a second way out. `assign` can only
+  enforce *one post is one reel* across the rows it is handed, and `--fetch`
+  hands it `unsettled`: the reels with no numbers, plus the ones read too
+  recently to be final. A reel whose reading has settled is therefore never in
+  that set, and the post it holds stopped being spoken for. The next unmatched
+  reel made inside `INSTAGRAM_MATCH_HOURS` then guessed its way straight onto
+  it. Four rows had done this — two mole-rat runs on the brain reel's post, and
+  an earlier beetle and bison run on the posts their own re-runs had matched by
+  caption — inflating the ledger's total reach from 4,570 to 5,412 and putting
+  a topic score against reach that belonged to a different reel. So `--fetch`
+  now tells `assign` what every row *outside* the batch holds, and a held post
+  is not free. Held is not sacred, though: a settled **timestamp** match is
+  still only the nearest post, so a pin or a caption may take one off it — and
+  then the row that lost it is disowned, which is the one case where the row
+  being corrected is not the row anybody asked about. The four rows above
+  predate the fix and were settled, so nothing was going to ask about them
+  again; they were disowned by hand against
+  `output/performance.json.bak-before-dedup`, on the evidence that in each case
+  the other row's `post.txt` first line is the caption on the post;
 * **the metric names churn.** `plays` became `views`, the reels metrics have
   been consolidated more than once, and which ones a media node answers for
   depends on its type and on the API version. So the request is made from a
