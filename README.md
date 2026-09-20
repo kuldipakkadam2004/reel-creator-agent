@@ -923,7 +923,13 @@ of downloaded assets and a `manifest.json` for step 5.
   screens every beat's shortlist against its narration, reading the provider's
   own words for each file; rejects are demoted below the keepers rather than
   discarded, and a beat left with nothing is searched again on its fallback
-  query. Lenient by design: a "grey-headed flying fox" is a match for narration
+  query. A beat left *short* — it kept something, but fewer clips than it is
+  trying to fill — gets a second slice of its own ranking screened before
+  anything else is reached for, in one more batched call. That beat was always
+  sitting on the footage: across the 87 beats on disk the mean pool is 32.7
+  candidates per beat, of which 7.6 were ever shown to the screen, and the
+  fallbacks below were being chosen over 29 clips nobody had looked at.
+  Lenient by design: a "grey-headed flying fox" is a match for narration
   about bats, and only a different *subject* — a bear where the words are about
   people — is a reject. The one exception is culture: another civilisation's
   artefact under a named people ("intricate stone carvings of ancient indian
@@ -1275,7 +1281,8 @@ a cover problem, and it is the most common way a cover fails.
 
 *After the encode*, `REEL_LOOK_FRAMES` frames are sampled evenly across
 `reel.mp4` (at the midpoint of each slice, so neither the fade-in nor the tail
-is graded as footage) and the reel is graded 0–3, with problems named from a
+is graded as footage), nudged clear of the nearest cut, and the reel is graded
+0–3, with problems named from a
 closed list: `dark`, `blurry`, `watermark`, `static`, `off_topic`,
 `caption_unreadable`, `repetitive`, `artifact`. The list is closed because step
 9 turns each name into a facet, and free text would give a vocabulary of one-off
@@ -1296,6 +1303,20 @@ wrong shape: each comes back as a warning beside an empty verdict, and the
 caller keeps the blind score it already had. The reel grade runs after the
 encode, when the `.mp4` is already on disk. A grade at or below `REEL_LOOK_WARN_AT`
 is a warning on the run and never a failure.
+
+**Each verdict names its shot.** A frame verdict carries `shot` and `beat`
+alongside its timestamp, decided when the frame is taken rather than by
+reading the timestamp back out of `timeline` afterwards. The two are not the
+same: `timeline` is the plan, the encode rounds every shot to a whole number
+of frames, and the error accumulates — on the reel of 2026-09-19 a cut the
+plan put at 20.61s was rendered at about 20.50s, three frames early, nine
+shots in. The frame sampled at 20.53s came back *"a small shark swimming over
+a reef"*, graded 0/3, and the timeline says that instant is *"serene ocean
+waves in sunlight"*. Anything acting on that verdict would have replaced the
+ocean and left the shark up. Samples are now taken at least
+`_LOOK_SHOT_EDGE_SECONDS` inside their shot, so the label and the timeline
+agree, and `assembly_version` is 5 so a reader can tell an attributed verdict
+from one it would have to re-derive.
 
 **What it found first.** Run against the reel posted 2026-09-10 (reach 14), the
 grade came back 1/3 — `dark`, `off_topic`:

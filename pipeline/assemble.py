@@ -215,7 +215,15 @@ _COVER_EDGE_SECONDS = 0.25
 #: draws that line with `look_graded` rather than by reading this number, so
 #: the two stay independent: switching the look off has to be visible on a
 #: current run, not only on an old one.
-ASSEMBLY_VERSION = 4
+#: Bumped to 5 for the same distinction one level down: each entry in
+#: `look.frames` gained `shot` and `beat`, naming the clip that verdict is
+#: about. A version 4 file's verdicts are timestamps, and a timestamp only
+#: names a shot if you go back to `timeline` and `timeline` agrees with the
+#: render - which near a cut it does not, because the encode rounds every
+#: shot to whole frames and the error accumulates. So a reader that re-derives
+#: the shot from an old file will sometimes get the wrong one, and cannot tell
+#: from the file that it has. This number is how it can.
+ASSEMBLY_VERSION = 5
 
 
 # ---------------------------------------------------------------------------
@@ -2732,8 +2740,70 @@ def narration_lines(manifest: dict) -> list[tuple[float, float, str]]:
     return rows
 
 
+#: How far a sampled frame is kept from either end of the shot it belongs to.
+#: The timeline in assembly.json is the plan, and the render drifts from it:
+#: every shot is encoded as a whole number of frames, the rounding is per shot
+#: and it accumulates. On the giant squid reel of 2026-09-19 the plan put the
+#: cut at 20.61s and the render made it at about 20.50s - three frames early,
+#: nine shots in.
+#:
+#: That is enough to make a verdict name the wrong clip. The frame sampled at
+#: 20.53s came back "a small shark swimming over a reef", graded 0 of 3, and
+#: the timeline says 18.90-20.61s is "serene ocean waves in sunlight". Anything
+#: reading the grade back - a person, or one day a feedback edge - would have
+#: blamed the ocean and left the shark alone. Sampling inside this margin
+#: instead makes the label and the timeline agree.
+_LOOK_SHOT_EDGE_SECONDS = 0.25
+
+
+def _shot_at(shots: list[Shot] | None, at: float) -> Shot | None:
+    """The shot covering `at`, or None when there is no shot list to ask."""
+    for shot in shots or []:
+        if shot.start <= at < shot.start + shot.duration:
+            return shot
+    # Past the last shot is the tail, which is nobody's footage.
+    return None
+
+
+def _inside_shot(shot: Shot, at: float) -> float:
+    """Pull `at` clear of both ends of its shot, if the shot is long enough.
+
+    A shot shorter than twice the margin has no safe interior, so it is
+    sampled at its midpoint: the best available answer, and still the furthest
+    point from either cut.
+    """
+    end = shot.start + shot.duration
+    if shot.duration <= _LOOK_SHOT_EDGE_SECONDS * 2:
+        return round(shot.start + shot.duration / 2, 3)
+    return round(min(max(at, shot.start + _LOOK_SHOT_EDGE_SECONDS),
+                     end - _LOOK_SHOT_EDGE_SECONDS), 3)
+
+
+def _place_verdicts(record: dict, placement: dict[str, dict]) -> None:
+    """Name the shot each of step 5b's frame verdicts is about, in place.
+
+    A timestamp only names a shot if you go back to `timeline` and `timeline`
+    agrees with the render, and near a cut it does not - see
+    `_LOOK_SHOT_EDGE_SECONDS`. Writing the answer down where the verdict is
+    saves every later reader from re-deriving it, and from re-deriving it
+    wrongly in exactly the cases that matter, which are the ones where a shot
+    changed.
+
+    A verdict with no placement is left alone rather than given a null shot:
+    the two are different, and only one of them is "this frame was not in any
+    shot". Labels the model invents are already dropped by `look.grade_reel`,
+    so what reaches here and misses is a frame taken with no shot list.
+    """
+    for entry in record.get("frames") or []:
+        found = placement.get(entry.get("frame"))
+        if found:
+            entry.update(found)
+
+
 def sample_reel_frames(video_path: Path, duration: float, *,
                        count: int | None = None,
+                       shots: list[Shot] | None = None,
+                       placement: dict[str, dict] | None = None,
                        ) -> tuple[list[tuple[str, bytes]], list[str]]:
     """Take evenly spaced frames out of the finished reel.
 
@@ -2744,7 +2814,17 @@ def sample_reel_frames(video_path: Path, duration: float, *,
 
     Labels are timestamps, because that is what makes a verdict actionable -
     "dark at 22.4s" names a shot on the timeline in assembly.json, where
-    "frame 4" names nothing.
+    "frame 4" names nothing. `shots` is what makes that true rather than
+    nearly true: a sample landing within `_LOOK_SHOT_EDGE_SECONDS` of a cut is
+    moved to the nearest point inside its own shot, because the cut in the
+    rendered file is not exactly where the plan says it is.
+
+    `placement` is an out-parameter, filled with `{label: {"shot", "beat"}}` -
+    which shot each frame actually shows, decided here rather than by anyone
+    reading timestamps back out of the manifest afterwards. It leaves this way
+    for the reason the screener's `subject_keys` does: the callers that want
+    the frames mostly do not want this, and a third element in the return
+    would make every one of them carry it.
     """
     wanted = int(config.REEL_LOOK_FRAMES if count is None else count)
     if wanted < 1 or duration <= 0 or not Path(video_path).is_file():
@@ -2758,6 +2838,9 @@ def sample_reel_frames(video_path: Path, duration: float, *,
         work_dir = Path(work)
         for position in range(wanted):
             at = duration * (position + 0.5) / wanted
+            shot = _shot_at(shots, at)
+            if shot is not None:
+                at = _inside_shot(shot, at)
             output = work_dir / f"frame-{position}.jpg"
             args = [
                 ffmpeg_binary(), "-hide_banner", "-nostdin", "-y",
@@ -2777,7 +2860,11 @@ def sample_reel_frames(video_path: Path, duration: float, *,
             if done.returncode != 0 or not output.is_file():
                 notes.append(f"ffmpeg could not sample the reel at {at:.1f}s")
                 continue
-            frames.append((f"{at:.1f}s", output.read_bytes()))
+            label = f"{at:.1f}s"
+            frames.append((label, output.read_bytes()))
+            if placement is not None and shot is not None:
+                placement[label] = {"shot": shot.index,
+                                    "beat": shot.beat_index}
 
     if not frames and wanted:
         notes.append("no frame of the finished reel could be read back; "
@@ -3783,8 +3870,10 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
         # on disk, so this cannot cost a reel - what it costs is the honesty of
         # the row step 9 stores, which until now described the plan.
         if config.LOOK_ENABLED and config.REEL_LOOK_ENABLED:
+            placement: dict[str, dict] = {}
             frames, notes = sample_reel_frames(
-                video_path, float(rendered.get("duration") or total)
+                video_path, float(rendered.get("duration") or total),
+                shots=shots, placement=placement,
             )
             warnings += notes
             reel_look, notes = look.grade_reel(
@@ -3794,6 +3883,7 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
                 lines=narration_lines(manifest),
             )
             warnings += notes
+            _place_verdicts(reel_look, placement)
 
     # --- carry step 4's attribution forward --------------------------------
     credits = collect_attribution(manifest, shots)

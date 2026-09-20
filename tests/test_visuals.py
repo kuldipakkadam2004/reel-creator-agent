@@ -427,6 +427,10 @@ BATS = Beat(
     index=1, start=0.0, end=6.0, query="brown bat sleeping",
     text="Brown bats sleep for nineteen hours a day.",
 )
+SPERM_WHALE = Beat(
+    index=2, start=0.0, end=6.0, query="sperm whale hunting deep",
+    text="Except they have one predator that finds them every single day.",
+)
 
 
 def test_description_comes_from_the_url_when_the_title_is_empty():
@@ -465,6 +469,33 @@ def test_word_endings_do_not_defeat_the_match():
     # "sleeping" in the query, "sleep" in the description.
     clip = _described(6, "a-man-asleep-in-bed-sleep-study")
     assert visuals.lexical_relevance(clip, BATS) > 0.0
+
+
+def test_a_plural_reaches_its_own_singular():
+    # The giant squid reel of 2026-09-19: beat 2 asked for "sperm whale hunting
+    # deep" and Pexels answered "whales on sea" - the right animal, named in the
+    # query - and it was recorded at relevance 0.0. "es" was coming off
+    # unconditionally, so "whales" stemmed to "whal" while "whale" kept its "e",
+    # and `_matches` only tolerates a described word that is LONGER than the
+    # term. Every root ending in "e" was unreachable from its own plural.
+    whales = _described(60, "whales-on-sea")
+    assert visuals.lexical_relevance(whales, SPERM_WHALE) > 0.0
+
+
+def test_the_es_plural_still_comes_off_a_sibilant():
+    # The fix must not overshoot: after s/x/z/ch/sh the "es" is a real ending.
+    assert visuals._stem("boxes") == visuals._stem("box")
+    assert visuals._stem("beaches") == visuals._stem("beach")
+    assert visuals._stem("dishes") == visuals._stem("dish")
+
+
+def test_short_words_are_not_collapsed_onto_their_neighbours():
+    # A trailing "e" comes off "ripple" so that "rippling" can reach it, but
+    # doing the same to 4-letter words would merge shots this niche tells
+    # apart: a forest fire is not a fir, and a pine is not a pin.
+    assert visuals._stem("ripple") == visuals._stem("rippling") == visuals._stem("ripples")
+    for pair in (("fire", "fir"), ("pine", "pin"), ("care", "car")):
+        assert visuals._stem(pair[0]) != visuals._stem(pair[1]), pair
 
 
 def test_a_clip_with_no_description_at_all_is_not_judged():
@@ -583,6 +614,26 @@ def test_the_screen_prompt_tells_the_model_to_prefer_keeping():
     assert "flying fox" in visuals._SCREEN_SYSTEM_INSTRUCTION
 
 
+def test_the_establishing_rules_reverse_the_lenient_one():
+    """The neutral shot is not choosing against a blank screen.
+
+    "Prefer keeping" is right for a beat's own footage, where the alternative
+    is nothing. It is wrong for a fallback, where the beat already has
+    something and the fallback is only topping it up: staying one clip short
+    is an available answer there, so the close calls should go the other way.
+
+    Measured on the bison reel's neutral shot (four runs each, identical
+    every run): without these rules 2 of its 3 documented rejects were kept,
+    with them 0, and no good clip was lost either way.
+    """
+    rules = visuals._SCREEN_ESTABLISHING_RULES
+    assert "does not apply here" in rules
+    assert "Be strict, not lenient, about anything alive" in rules
+    # The daisies and the thistles are what needed saying. A wrong animal was
+    # already caught by the ordinary rules; a plant reads as scenery.
+    assert "an animal, a person or a plant" in rules
+
+
 def test_unknown_relevance_mode_warns_and_screens_nothing():
     warnings: list[str] = []
     plans = {0: [(9.0, _described(12, "anything"), "q")]}
@@ -640,7 +691,7 @@ def test_a_beat_with_no_match_is_researched_on_its_fallback_query(monkeypatch):
     # which is what the model returns for this beat on a live run.
     monkeypatch.setattr(
         visuals, "llm_screen",
-        lambda shortlists, beats, topic, subject_keys=None: (
+        lambda shortlists, beats, topic, subject_keys=None, establishing=False: (
             {0: {0: (False, "shows a bear")}}, []),
     )
     notes = visuals._screen_beats(
@@ -694,7 +745,7 @@ def _retry_settings():
     )
 
 
-def _reject_everything(shortlists, beats, topic, subject_keys=None):
+def _reject_everything(shortlists, beats, topic, subject_keys=None, establishing=False):
     return (
         {index: {position: (False, "shows modern construction")
                  for position in range(len(candidates))}
@@ -894,7 +945,7 @@ def test_the_subject_is_salvaged_before_the_neutral_shot(monkeypatch):
     }
     provider = _query_aware_provider(served)(session=None)
 
-    def screen(shortlists, beats, topic, subject_keys=None):
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
         # The live screen's exact verdict on those three clips: not usable for
         # this beat, and unmistakably the subject.
         if subject_keys is not None:
@@ -1042,7 +1093,7 @@ def test_the_neutral_shot_is_not_searched_when_the_fallback_query_works(monkeypa
     provider_cls = _query_aware_provider(served)
     provider = provider_cls(session=None)
 
-    def screen(shortlists, beats, topic, subject_keys=None):
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
         # Rejects the mixer, keeps the stone wall: the graded rule the live
         # prompt applies.
         out = {}
@@ -1091,7 +1142,7 @@ def test_the_retry_is_screened_by_the_model_not_the_lexical_check(monkeypatch):
     provider = _query_aware_provider(served)(session=None)
     seen_shortlists = []
 
-    def screen(shortlists, beats, topic, subject_keys=None):
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
         seen_shortlists.append(shortlists)
         return _reject_everything(shortlists, beats, topic, subject_keys)
 
@@ -1146,7 +1197,7 @@ def test_the_screen_names_the_keys_it_rejected(monkeypatch):
 def _keep_only(provider_ids, rejected_ids=None):
     """A screen that keeps the named candidates and rejects every other one."""
 
-    def screen(shortlists, beats, topic, subject_keys=None):
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
         verdicts = {}
         for index, candidates in shortlists.items():
             verdicts[index] = {}
@@ -1300,7 +1351,7 @@ def test_an_unscreened_run_does_not_hold_its_own_footage_back(sandbox):
         assert not any("never judged them" in note for note in beat["notes"])
 
 
-def _keep_only_the_first(shortlists, beats, topic, subject_keys=None):
+def _keep_only_the_first(shortlists, beats, topic, subject_keys=None, establishing=False):
     """Keeps one clip of a beat's own footage, and all of the neutral shot's.
 
     The beat's own shortlist is cut to a single keeper so that every beat ends
@@ -3169,7 +3220,7 @@ def test_the_neutral_shot_is_screened_like_everything_else(monkeypatch):
         {"underground dirt tunnels": [monastery, tunnel]}
     )(session=None)
 
-    def screen(shortlists, beats, topic, subject_keys=None):
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
         # The subject test, standing in for the model: it is told the beat was
         # searched for the neutral query, not for the narration's words.
         assert [b.query for b in beats] == ["underground dirt tunnels"]
@@ -3195,6 +3246,277 @@ def test_the_neutral_shot_is_screened_like_everything_else(monkeypatch):
         "the monastery was not demoted below the tunnel"
     )
     assert any("monastery" in note for note in notes), notes
+
+
+def test_the_neutral_shot_is_judged_as_an_establishing_shot(monkeypatch):
+    """Screened, and screened by the rules a fallback should be judged by.
+
+    Screening the neutral shot at all was the 2026-09-12 fix. It was still
+    being asked the ordinary question - "is this usable over the narration" -
+    whose rules end "a loose match beats a blank screen". A blank screen is
+    not what this path is choosing against: the beat has footage, it is one
+    clip short, and the honest alternative is to stay short.
+
+    What that costs is measured in `_SCREEN_ESTABLISHING_RULES`: the bison
+    reel's neutral shot kept two of its three documented rejects without the
+    flag and none with it.
+    """
+    beat = _mole_rat_beat()
+    tunnel = _described(80, "exploring-a-dark-earth-tunnel")
+    provider = _query_aware_provider(
+        {"underground dirt tunnels": [tunnel]}
+    )(session=None)
+    seen: dict = {}
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        seen["establishing"] = establishing
+        # The narration still goes in. The screen has to know what the clip
+        # must not contradict; what changes is which way the close calls go.
+        seen["text"] = [b.text for b in beats]
+        return {i: {p: (True, "") for p in range(len(c))}
+                for i, c in shortlists.items()}, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    visuals._neutral_plan(
+        beat, [provider], _retry_settings(), visuals.UsageLedger(), "run",
+        visuals._RunState(), {}, [], set(),
+        topic="how naked mole-rats survive without oxygen", notes=[],
+    )
+
+    assert seen["establishing"] is True, (
+        "the neutral shot was screened by the rules written for a beat's own "
+        "footage, which prefer keeping"
+    )
+    assert seen["text"] == [beat.text]
+
+
+def _deep_settings(**overrides):
+    """A beat wanting two clips, with a shortlist of two, so rows 2+ are deep."""
+    base = dict(
+        relevance_mode="llm",
+        relevance_floor=config.VISUAL_RELEVANCE_FLOOR,
+        relevance_shortlist=2,
+        assets_per_beat=2,
+        reuse_cooldown=0,
+        kinds=["video"],
+    )
+    base.update(overrides)
+    return _settings(**base)
+
+
+def test_a_beat_left_short_by_the_screen_looks_further_down_its_own_pool(monkeypatch):
+    """The clips were already ranked and already paid for.
+
+    A beat that kept nothing goes to the re-search. A beat that kept
+    *something* went nowhere: it was simply short, and pass 2 made up the
+    difference from the neutral shot or from rows nothing had judged. Both
+    are guesses made while an average of 29 screened-by-nobody candidates sat
+    in the same beat's ranking - mean pool per beat across the 87 beats on
+    disk is 32.7, of which 7.6 were ever shown to the screen.
+
+    Beat 4 of the giant squid reel is the case: 7 screened, 1 kept for 2
+    slots, 30 rows never looked at, and a neutral shark instead of any of
+    them.
+    """
+    good, bad = _described(1, "a-tunnel"), _described(2, "a-monastery")
+    deep = _described(3, "another-tunnel")
+    plans = {HADZA.index: [(9.0, good, "q"), (8.0, bad, "q"),
+                           (7.0, deep, "q")]}
+    calls: list[dict] = []
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        calls.append({i: [c.provider_id for c in cs]
+                      for i, cs in shortlists.items()})
+        return {i: {p: (c.provider_id != "v2", "" if c.provider_id != "v2"
+                        else "shows a monastery")
+                    for p, c in enumerate(cs)}
+                for i, cs in shortlists.items()}, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    notes = visuals._screen_beats(
+        plans, [HADZA], "topic", [], _deep_settings(),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+
+    assert len(calls) == 2, "the beat was left one short without looking deeper"
+    assert calls[1] == {HADZA.index: ["v3"]}, calls
+    # Both keepers in front, the rejected monastery behind them.
+    assert [row[1].provider_id for row in plans[HADZA.index]] == [
+        "v1", "v3", "v2"], (
+        "the newly screened keeper did not land above the earlier reject"
+    )
+    assert any("screened 1 more candidate" in n
+               for n in notes.get(HADZA.index, [])), notes
+
+
+def test_the_deeper_screen_fills_a_beat_that_would_have_gone_neutral(
+    sandbox, monkeypatch
+):
+    """End to end: the beat takes a screened clip over a generic one.
+
+    The squid reel's beat 4 kept 1 of 7 for 2 slots and reached straight past
+    30 unjudged rows of its own for "deep ocean underwater". Here the same
+    shape is set up with a stub provider, and the beat should now fill from
+    the pool it already had.
+    """
+    keepers = [make_candidate(1), make_candidate(4)]
+    StubProvider.catalog = [keepers[0], make_candidate(2), make_candidate(3),
+                            keepers[1], make_candidate(5)]
+    # A screen that keeps one clip per slice, so the first slice leaves every
+    # beat one short and the second slice is what completes it.
+    monkeypatch.setattr(
+        visuals, "llm_screen",
+        _keep_only({keepers[0].provider_id, keepers[1].provider_id}),
+    )
+
+    # A shortlist of 2 against a catalog of 5: rows 2-4 are below it, which
+    # is the shape this pass exists for.
+    monkeypatch.setattr(config, "VISUAL_RELEVANCE_SHORTLIST", 2)
+    manifest = run_visuals(
+        relevance_mode="llm", assets_per_beat=2, providers=["stub"],
+    )
+
+    opening = manifest["beats"][0]
+    used = {manifest["assets"][i]["source_url"] for i in opening["asset_indexes"]}
+    assert used == {c.source_url for c in keepers}, (
+        "the beat did not fill from the clips the deeper screen kept"
+    )
+    assert any("screened" in note and "below the shortlist" in note
+               for note in opening["notes"]), opening["notes"]
+    assert not any("neutral shot" in note for note in opening["notes"]), (
+        "reached for the neutral shot with screened footage still available"
+    )
+    assert opening["supply"]["screened"] >= 4, opening["supply"]
+
+
+def test_a_beat_the_screen_filled_does_not_pay_for_a_second_look(monkeypatch):
+    """The deeper screen is for beats that came up short, and costs a call."""
+    first, second = _described(1, "a-tunnel"), _described(2, "another-tunnel")
+    spare = _described(3, "a-third-tunnel")
+    plans = {HADZA.index: [(9.0, first, "q"), (8.0, second, "q"),
+                           (7.0, spare, "q")]}
+    calls: list[int] = []
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        calls.append(1)
+        return {i: {p: (True, "") for p in range(len(cs))}
+                for i, cs in shortlists.items()}, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    visuals._screen_beats(
+        plans, [HADZA], "topic", [], _deep_settings(),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+
+    assert len(calls) == 1, "screened deeper into a beat that was already full"
+
+
+def test_a_beat_the_screen_emptied_re_searches_rather_than_digging(monkeypatch):
+    """Nothing kept means the query landed in the wrong world.
+
+    More rows from the same query are more of the same, so these beats keep
+    the remedy they had - the fallback queries - and must not be diverted
+    into the deeper screen.
+    """
+    plans = {HADZA.index: [(9.0, _described(1, "a-mixer"), "q"),
+                           (8.0, _described(2, "a-lorry"), "q"),
+                           (7.0, _described(3, "a-crane"), "q")]}
+    shortlists: list[dict] = []
+
+    def screen(shortlists_, beats, topic, subject_keys=None, establishing=False):
+        shortlists.append({i: [c.provider_id for c in cs]
+                           for i, cs in shortlists_.items()})
+        return _reject_everything(shortlists_, beats, topic)
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    visuals._screen_beats(
+        plans, [HADZA], "topic", [], _deep_settings(),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+
+    assert shortlists == [{HADZA.index: ["v1", "v2"]}], (
+        "a beat with no keepers was sent to the deeper screen instead of the "
+        "re-search"
+    )
+
+
+def test_the_deeper_screen_never_shows_the_model_a_clip_twice(monkeypatch):
+    """It reaches below the shortlist, and only for rows nothing has judged."""
+    rows = [(9.0 - i, _described(i, f"clip-{i}"), "q") for i in range(6)]
+    plans = {HADZA.index: list(rows)}
+    seen: list[list[str]] = []
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        for candidates in shortlists.values():
+            seen.append([c.provider_id for c in candidates])
+        # Keep exactly one per slice, so the beat stays short and asks again.
+        return {i: {p: (p == 0, "" if p == 0 else "wrong subject")
+                    for p in range(len(cs))}
+                for i, cs in shortlists.items()}, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    visuals._screen_beats(
+        plans, [HADZA], "topic", [], _deep_settings(),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+
+    judged = [pid for slice_ in seen for pid in slice_]
+    assert len(judged) == len(set(judged)), f"screened a clip twice: {seen}"
+    assert seen == [["v0", "v1"], ["v2", "v3"]], seen
+
+
+def test_a_neutral_shot_the_screen_skipped_says_so(monkeypatch):
+    """The quiet half of the failure this path already has a comment about.
+
+    A failed call warns. A reply that came back keyed to some other beat does
+    not: `judged` is empty, the rows are returned unscreened, and they are
+    then placed with nothing recorded anywhere. That is the same silence the
+    mole-rat monastery shipped behind, arrived at by a different route.
+    """
+    beat = _mole_rat_beat()
+    tunnel = _described(80, "exploring-a-dark-earth-tunnel")
+    provider = _query_aware_provider(
+        {"underground dirt tunnels": [tunnel]}
+    )(session=None)
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        return {999: {0: (True, "")}}, []     # a verdict for nobody's beat
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    notes: list[str] = []
+    ranked = visuals._neutral_plan(
+        beat, [provider], _retry_settings(), visuals.UsageLedger(), "run",
+        visuals._RunState(), {}, [], set(),
+        topic="how naked mole-rats survive without oxygen", notes=notes,
+    )
+
+    assert ranked, "the beat was emptied instead of carrying on unscreened"
+    assert any("placed unscreened" in note for note in notes), notes
+
+
+def test_the_ordinary_screen_is_not_judged_as_an_establishing_shot(monkeypatch):
+    """The strict rule belongs to the fallback and must not leak.
+
+    A beat's own footage really is choosing against a blank screen, and
+    turning the strictness on everywhere would empty beats for the sake of
+    keeping the neutral shot honest.
+    """
+    seen: list[bool] = []
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        seen.append(establishing)
+        return {}, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    plans = {0: [(9.0, _described(12, "anything"), "q")]}
+    visuals._screen_beats(
+        plans, [HADZA], "topic", [], _retry_settings(),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+
+    assert seen and not any(seen), (
+        "the beat's own shortlist was screened as an establishing shot"
+    )
 
 
 def test_an_unscreened_neutral_shot_is_still_survivable(monkeypatch):

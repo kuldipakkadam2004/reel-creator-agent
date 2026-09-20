@@ -2445,6 +2445,117 @@ def test_nothing_is_sampled_out_of_a_reel_that_is_not_there(tmp_path):
     assert frames == [] and notes == []
 
 
+# --- which shot a verdict is about ------------------------------------------
+#
+# The timeline in assembly.json is the plan. The render drifts from it: each
+# shot is encoded as a whole number of frames and the rounding accumulates, so
+# by the middle of a reel a cut can be several frames from where the plan puts
+# it. A grade is only aimable if the frame's label and the timeline agree
+# about which clip was on screen, and near a cut they did not.
+
+def test_a_sample_landing_on_a_cut_is_pulled_back_inside_its_shot():
+    """The giant squid reel, 2026-09-19, exactly.
+
+    The sample fell at 20.53s. The plan says 18.90-20.61s is "serene ocean
+    waves in sunlight"; the render had already cut, and the model came back
+    "a small shark swimming over a reef", graded 0 of 3. Anything acting on
+    that verdict would have replaced the ocean and left the shark up.
+    """
+    waves = shot(index=8, beat_index=4, start=18.90, duration=1.71)
+    assert assemble._shot_at([waves], 20.5325) is waves
+    at = assemble._inside_shot(waves, 20.5325)
+    assert at == pytest.approx(20.36, abs=0.001)
+    assert at <= 20.61 - assemble._LOOK_SHOT_EDGE_SECONDS
+
+
+def test_a_sample_well_inside_its_shot_is_left_where_it_fell():
+    """Even coverage is the point of the sampling; the pull is only a nudge."""
+    long_shot = shot(index=3, beat_index=1, start=10.0, duration=6.0)
+    assert assemble._inside_shot(long_shot, 13.0) == 13.0
+
+
+def test_a_shot_too_short_to_have_an_interior_is_sampled_at_its_middle():
+    """Both margins overlap, so the midpoint is the furthest from either cut."""
+    brief = shot(index=0, beat_index=0, start=4.0, duration=0.3)
+    assert assemble._inside_shot(brief, 4.29) == pytest.approx(4.15)
+
+
+def test_a_sample_past_the_last_shot_belongs_to_no_shot():
+    """The tail is nobody's footage, and must not be blamed on the last clip."""
+    only = shot(index=0, beat_index=0, start=0.0, duration=3.0)
+    assert assemble._shot_at([only], 3.4) is None
+    assert assemble._shot_at(None, 1.0) is None
+
+
+def _stub_frame_grabs(monkeypatch):
+    """An ffmpeg that writes a byte to the path it was asked for.
+
+    The sampling under test is arithmetic - which timestamp, belonging to
+    which shot - so the encoder is the one part of it worth faking.
+    """
+    monkeypatch.setattr(assemble, "ffmpeg_binary", lambda: "ffmpeg")
+
+    def fake_run(args, **kwargs):
+        Path(args[-1]).write_bytes(b"jpeg")
+        return assemble.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(assemble.subprocess, "run", fake_run)
+
+
+def test_each_sampled_frame_records_the_shot_it_shows(tmp_path, monkeypatch):
+    """Written down here, so no later reader re-derives it from a timestamp."""
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"not really an mp4")
+    shots = [shot(index=0, beat_index=0, start=0.0, duration=5.0),
+             shot(index=1, beat_index=3, start=5.0, duration=5.0)]
+
+    _stub_frame_grabs(monkeypatch)
+    placement: dict[str, dict] = {}
+    frames, notes = assemble.sample_reel_frames(
+        video, 10.0, count=2, shots=shots, placement=placement,
+    )
+
+    assert notes == []
+    assert [label for label, _ in frames] == ["2.5s", "7.5s"]
+    assert placement == {"2.5s": {"shot": 0, "beat": 0},
+                         "7.5s": {"shot": 1, "beat": 3}}
+
+
+def test_the_grade_carries_the_shot_each_verdict_is_about():
+    """What `placement` is for: the verdict and the clip, in one place."""
+    record = {"graded": True, "grade": 1, "problems": ["off_topic"],
+              "summary": "a shark under a line about beaks",
+              "frames": [{"frame": "20.4s", "grade": 0, "shows": "a shark"},
+                         {"frame": "26.4s", "grade": 1, "shows": "a stone"}]}
+    assemble._place_verdicts(record, {"20.4s": {"shot": 8, "beat": 4},
+                                      "26.4s": {"shot": 11, "beat": 5}})
+
+    assert record["frames"][0] == {"frame": "20.4s", "grade": 0,
+                                   "shows": "a shark", "shot": 8, "beat": 4}
+    assert record["frames"][1]["shot"] == 11
+
+
+def test_a_verdict_with_no_placement_is_left_alone():
+    """No shot list to ask means no answer, which is not the same as shot 0."""
+    record = {"frames": [{"frame": "2.5s", "grade": 2, "shows": "a reef"}]}
+    assemble._place_verdicts(record, {})
+    assert record["frames"] == [{"frame": "2.5s", "grade": 2, "shows": "a reef"}]
+    # And a record nothing graded survives being offered placements.
+    blank = assemble.look.blank_grade()
+    assemble._place_verdicts(blank, {"2.5s": {"shot": 0, "beat": 0}})
+    assert blank == assemble.look.blank_grade()
+
+
+def test_sampling_still_works_with_no_shot_list_to_ask(tmp_path, monkeypatch):
+    """`shots` is an improvement to a label, not a thing a caller must have."""
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"not really an mp4")
+
+    _stub_frame_grabs(monkeypatch)
+    frames, notes = assemble.sample_reel_frames(video, 10.0, count=2)
+    assert [label for label, _ in frames] == ["2.5s", "7.5s"] and notes == []
+
+
 # --- the choice -------------------------------------------------------------
 
 def test_auto_opens_on_the_hook_card_when_the_crop_allows_it():

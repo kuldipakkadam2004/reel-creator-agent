@@ -1718,11 +1718,50 @@ def describe_candidate(candidate: Candidate) -> str:
     return " ".join(p for p in parts if p).strip().lower()
 
 
+#: The only letters an "es" plural really follows - "boxes", "dishes",
+#: "beaches". Everywhere else the "e" belongs to the root and the plural is
+#: just "+s", which is the distinction `_stem` was missing.
+_SIBILANTS = ("s", "x", "z", "ch", "sh")
+
+
 def _stem(word: str) -> str:
-    """Strip one plural/participle ending, if doing so leaves a real root."""
+    """Reduce a word to a root its other spellings reach too.
+
+    Not linguistics. The only property that matters here is that two forms of
+    the same word land on the same token, because `_matches` compares these for
+    equality and tolerates a *longer* described word, never a shorter one.
+
+    Both rules below exist because a real run scored a correct clip zero. On
+    the giant squid reel of 2026-09-19, beat 2 asked for "sperm whale hunting
+    deep" and Pexels answered "whales on sea" and "whales in the sea" - the
+    right animal, named in the query - and both were recorded at
+    `relevance: 0.0`. Stripping "es" unconditionally turned "whales" into
+    "whal" while "whale" kept its "e", so the singular and plural of every root
+    ending in "e" could never meet: whale/whal, wave/wav, tree/tre.
+
+      1. "es" only comes off after a sibilant. "boxes" is box+es; "whales" is
+         whale+s, so only the "s" goes.
+      2. A trailing "e" then comes off anything long enough to spare it, which
+         is what lets a participle reach its own noun - "ripples" -> ripple ->
+         rippl meets "rippling" -> rippl. The length guard is the point:
+         collapsing 4-letter words too would merge "fire" into "fir" and "pine"
+         into "pin", which in this niche are different shots.
+
+    Measured over the 626 placed assets on disk: 13 relevance scores rise and
+    none falls. Note what that does *not* claim - in the default `llm` mode
+    this number selects nothing (`_verdicts_for` returns the model's verdict
+    whenever it answered), so the fix repairs a recorded diagnostic, and the
+    audits that read it, rather than the footage a run picks.
+    """
     for suffix in _STEM_SUFFIXES:
         if len(word) > len(suffix) + 2 and word.endswith(suffix):
-            return word[: -len(suffix)]
+            root = word[: -len(suffix)]
+            if suffix == "es" and not root.endswith(_SIBILANTS):
+                root = word[:-1]
+            word = root
+            break
+    if word.endswith("e") and len(word) >= 5:
+        return word[:-1]
     return word
 
 
@@ -1886,6 +1925,56 @@ Return ONLY a JSON array, one object per beat, in beat order:
 "why": "shows a bear, not people"}}]}}]"""
 
 
+#: Appended to the prompt when the clips being judged came from a beat's
+#: neutral shot rather than from its own query. The rules above are written
+#: for a clip that is meant to illustrate the line; these are for one that is
+#: only meant not to contradict it, and the difference changes which way the
+#: close calls go.
+#:
+#: Measured on the bison reel's neutral shot, 2026-09-20, replaying the three
+#: clips the comment in `_screen_beats` records it shipping - sheep, daisies
+#: and thistles under "prairie grassland landscape". Four runs each, and the
+#: verdicts were identical every run:
+#:
+#:      without these rules   2 of the 3 kept   0 good clips lost
+#:      with them             0 of the 3 kept   0 good clips lost
+#:
+#: The sheep were already caught: they are an animal, and the ordinary rules
+#: catch a wrong animal. It is the daisies and the thistles that needed this,
+#: because a plant in a landscape does not read as a wrong subject, it reads
+#: as the landscape - and a close-up of one is not a landscape at all.
+#:
+#: What this is *not* for: the giant squid reel's shark of 2026-09-19. That
+#: was the case that prompted the change, and replaying it six times shows
+#: the ordinary rules already reject that clip, six times out of six. So
+#: something else put it on screen - see the note on the empty-verdict branch
+#: in `_neutral_plan`, which is the only way out of that path that left no
+#: trace, and which is now the only one of the two that is still silent.
+_SCREEN_ESTABLISHING_RULES = """\
+
+These candidates are different from the ones above: they did not come from \
+the beat's own query. The beat found nothing usable, and these come from a \
+fallback search for an establishing shot of the world the video is set in. \
+Judge them as establishing shots, which changes two of the rules.
+
+- Do not credit a clip for illustrating the line. It is not expected to. An \
+establishing shot passes by being somewhere the video could be set and by \
+contradicting nothing, not by depicting what is being said.
+- Be strict, not lenient, about anything alive. The rule that a loose match \
+beats a blank screen does not apply here - a blank is not the alternative, \
+the beat has other footage and this is a fallback. A clip whose subject is \
+an animal, a person or a plant that is not the video's own subject is a \
+reject, however well it matches the setting: a viewer reads a creature on \
+screen as the thing being talked about, and a wrong one states something \
+false where empty scenery would only have said less. A reef with a shark \
+over it is a shark, not a reef.
+- What passes is the setting with nothing living claiming the frame: water, \
+depth, rock, sand, ice, sky, light, weather, a landscape, a material, an \
+empty interior. What also passes is the video's own subject, doing anything \
+at all.
+- "subj" is answered exactly as above, against the topic."""
+
+
 def _parse_screen_json(
     raw: str,
 ) -> tuple[dict[int, dict[int, tuple[bool, str]]], dict[int, dict[int, bool]]]:
@@ -1947,7 +2036,7 @@ def _parse_screen_json(
 
 def llm_screen(
     shortlists: dict[int, list[Candidate]], beats: list[Beat], topic: str,
-    subject_keys: set[str] | None = None,
+    subject_keys: set[str] | None = None, establishing: bool = False,
 ) -> tuple[dict[int, dict[int, tuple[bool, str]]], list[str]]:
     """Screen every beat's shortlist in one Gemini call. Never raises.
 
@@ -1955,6 +2044,13 @@ def llm_screen(
     happen or gave nothing usable, and the caller falls back to the lexical
     check - the screener is a filter on footage that already exists, so failing
     to reach it must cost relevance, never the run.
+
+    `establishing` says these clips came from a neutral fallback search rather
+    than from the beat's own query, and swaps in the rules a fallback should
+    be judged by - see `_SCREEN_ESTABLISHING_RULES`. It is a separate call
+    rather than a flag per beat because the two questions cannot share a
+    prompt: one of them ends "a loose match beats a blank screen" and the
+    other has to say the opposite.
     """
     by_index = {b.index: b for b in beats}
     listing: list[str] = []
@@ -1980,6 +2076,8 @@ def llm_screen(
     prompt = _SCREEN_PROMPT_TEMPLATE.format(
         topic=topic or "(not given)", beats=rendered
     )
+    if establishing:
+        prompt += "\n" + _SCREEN_ESTABLISHING_RULES
     try:
         from google import genai
         from google.genai import types
@@ -2825,14 +2923,32 @@ def _neutral_plan(
     # it, so the lexical screen scores every one of these zero and a floor
     # here would reject the good with the bad. Only the subject test can tell
     # a tunnel from a monastery, and it is the reason this pass costs a call.
+    #
+    # `establishing=True` is what makes that sentence true of the code. The
+    # beat still goes in with its own narration, because the screen has to
+    # know what the clip must not contradict - but without the flag the model
+    # was reading the ordinary rules, which end "a loose match beats a blank
+    # screen", and a blank screen is not what this path is choosing against.
     shortlist_size = max(1, int(settings.get("relevance_shortlist") or 1))
     verdicts, screen_warnings = llm_screen(
         {beat.index: [row[1] for row in ranked[:shortlist_size]]},
         [dataclass_replace(beat, query=neutral)], topic,
+        establishing=True,
     )
     warnings.extend(screen_warnings)
     judged = verdicts.get(beat.index)
     if not judged:
+        # The screen ran and said nothing about this beat - the call failed,
+        # or the reply came back keyed to a beat that was not asked about.
+        # Either way what is returned here is unscreened, and it is about to
+        # be placed. Saying so is the whole lesson of this path: the version
+        # that shipped a subway platform and a monastery under "underground
+        # dirt tunnels" was not wrong about them, it was silent about them.
+        # A failed call already warns; a reply that simply skipped the beat
+        # did not, and that is the quieter of the two.
+        if notes is not None:
+            notes.append(f"neutral shot {neutral!r}: the screen returned no "
+                         f"verdict, so these were placed unscreened")
         return ranked
     # Demoted, not dropped, for the reason `_demote_rejects` gives: the caller
     # survives an empty neutral plan but is no better off for one, and the
@@ -2872,6 +2988,12 @@ def _screen_beats(
 
     shortlist_size = settings["relevance_shortlist"]
     floor = settings["relevance_floor"]
+    #: How many clips each beat is actually trying to fill. The first screen
+    #: cared only whether this was zero; the second slice below cares whether
+    #: it is enough, which is the number pass 2 will ask for.
+    want = max(1, int(settings.get("assets_per_beat") or 1))
+    #: Keepers per beat, carried between the two screening passes.
+    kept_count: dict[int, int] = {}
     notes: dict[int, list[str]] = {}
     # Demotion alone stops at the ranking. Acquisition walks past a demoted clip
     # whenever the keeper above it fails to download or is held back by the
@@ -2949,8 +3071,74 @@ def _screen_beats(
         plans[index] = reordered + tail
         if beat_notes:
             notes.setdefault(index, []).extend(beat_notes)
-        if not any(ok for ok, _ in verdicts.values()):
+        kept_count[index] = len([1 for ok, _ in verdicts.values() if ok])
+        if not kept_count[index]:
             retry.append(beat)
+
+    # --- a second slice for the beats the screen left short ----------------
+    # A beat that kept something never reaches the fallback chain below, so
+    # until now a beat that kept 1 of a wanted 2 was simply short, and pass 2
+    # made up the difference from the neutral shot or from rows nothing had
+    # judged. Both of those are guesses, and the beat was sitting on an
+    # average of 29 candidates the screen had never been shown: mean pool per
+    # beat over the 87 beats on disk is 32.7, of which 7.6 are screened.
+    #
+    # That is where the giant squid reel's shark came from. Beat 4 screened 7,
+    # kept 1 for 2 slots, and had 30 rows left unseen - and rather than look
+    # at any of them the run reached for "deep ocean underwater" and got a
+    # reef with a shark swimming over it, under a line about squid beaks.
+    #
+    # One batched call for every short beat at once, and only for beats that
+    # have rows below the shortlist - the same shape as the re-search below,
+    # and cheaper, because these candidates are already ranked and cost
+    # nothing to reach. Beats that kept nothing are deliberately left out:
+    # their remedy is a different query, which is what the re-search is for.
+    deeper: dict[int, list[tuple[float, Candidate, str]]] = {}
+    for index, ranked in plans.items():
+        if not 0 < kept_count.get(index, 0) < want:
+            continue
+        below = [row for row in ranked[shortlist_size:]
+                 if row[1].key not in screened_keys]
+        if below:
+            deeper[index] = below[:shortlist_size]
+
+    if mode == "llm" and deeper:
+        deep_beats = [by_index[i] for i in deeper if i in by_index]
+        deep_verdicts, screen_warnings = llm_screen(
+            {i: [row[1] for row in rows] for i, rows in deeper.items()},
+            deep_beats, topic, subject_keys=subject_keys,
+        )
+        warnings.extend(screen_warnings)
+        for index, rows in deeper.items():
+            beat = by_index.get(index)
+            if beat is None:
+                continue
+            verdicts = _verdicts_for(rows, beat, mode, deep_verdicts, floor)
+            if not verdicts:
+                continue
+            reordered, beat_notes = _demote_rejects(rows, verdicts)
+            screened_keys.update(row[1].key for row in rows)
+            rejected_keys.update(
+                row[1].key for position, row in enumerate(rows)
+                if not verdicts.get(position, (True, ""))[0]
+            )
+            found = len([1 for ok, _ in verdicts.values() if ok])
+            # Slotted in directly behind the first slice's keepers and ahead
+            # of its rejects. `plans[index]` is `reordered + tail` from the
+            # loop above, and `_demote_rejects` puts the keepers first, so the
+            # count of them is the boundary - and taking these rows out of the
+            # tail first is what stops one being listed twice.
+            boundary = kept_count.get(index, 0)
+            taken = {row[1].key for row in rows}
+            rest = [row for row in plans[index] if row[1].key not in taken]
+            plans[index] = rest[:boundary] + reordered + rest[boundary:]
+            kept_count[index] = boundary + found
+            notes.setdefault(index, []).append(
+                f"screened {len(rows)} more candidate(s) from below the "
+                f"shortlist: {found} usable"
+            )
+            if beat_notes:
+                notes[index].extend(beat_notes)
 
     # --- second look for the beats nothing matched -------------------------
     # Only these are searched again, and only on the fallback queries: the
