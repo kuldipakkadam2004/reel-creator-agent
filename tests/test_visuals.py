@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest  # noqa: E402
 
 import config  # noqa: E402
+from pipeline import pacing  # noqa: E402
 from pipeline import visuals  # noqa: E402
 from pipeline.visuals import Beat, Candidate  # noqa: E402
 
@@ -166,7 +167,17 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "VISUALS_USAGE_FILE", tmp_path / "usage.json")
     monkeypatch.setattr(visuals, "_PROVIDERS", {"stub": StubProvider})
 
-    StubProvider.catalog = [make_candidate(i) for i in range(30)]
+    # 40 clips served per search, not 15. The stub ignores the query, so every
+    # beat sees the same page and a clip one beat takes is gone for all the
+    # others - which makes the whole sandbox world SEARCH_PAGE_SIZE clips wide,
+    # where a real run gives each beat its own pool of about 30. At 15 the
+    # default 8-beat script was already spending the world down to nothing on
+    # its last beat, so a test about manifest shape would fail the moment any
+    # beat asked for a third clip. Widening it puts the capacity cliff out of
+    # the way of the tests that are not about capacity; the ones that are set
+    # their own catalog.
+    monkeypatch.setattr(visuals, "SEARCH_PAGE_SIZE", 40)
+    StubProvider.catalog = [make_candidate(i) for i in range(40)]
     StubProvider.failure = None
 
     session = FakeSession(default=unique_media)
@@ -174,6 +185,20 @@ def sandbox(tmp_path, monkeypatch):
     yield session
     StubProvider.catalog = []
     StubProvider.failure = None
+
+
+@pytest.fixture
+def one_shot_beats(monkeypatch):
+    """Pin every beat to a single shot, so it asks for `assets_per_beat` flat.
+
+    The tests below are about the headroom top-up and the acquisition order,
+    and they want the beats themselves to source as little as possible so that
+    what they are watching is the only thing that can add footage.
+    `assets_per_beat=1` used to say that by itself; now a beat also asks for a
+    clip per shot it will be cut into, and on this script the opening beat is
+    three shots long. Leaving `Beat.shots` at its default says the old thing.
+    """
+    monkeypatch.setattr(visuals, "plan_shot_demand", lambda beats, duration: None)
 
 
 def run_visuals(**kwargs):
@@ -216,6 +241,65 @@ def test_beat_durations_stay_inside_the_window():
             ceiling = visuals.BEAT_MAX_SECONDS + visuals.BEAT_MIN_SECONDS
             assert beat.duration <= ceiling + 0.01, beat
             assert beat.duration >= visuals.BEAT_MIN_SECONDS - 0.01, beat
+
+
+# ---------------------------------------------------------------------------
+# How much footage a beat asks for
+# ---------------------------------------------------------------------------
+
+def test_a_long_beat_is_planned_for_more_shots_than_a_short_one():
+    beats = visuals.segment_script(SCRIPT, 40.0)
+    visuals.plan_shot_demand(beats, 40.0)
+    assert all(b.shots >= 1 for b in beats)
+    longest = max(beats, key=lambda b: b.duration)
+    shortest = min(beats, key=lambda b: b.duration)
+    assert longest.shots > shortest.shots, (
+        "every beat was planned for the same number of shots regardless of "
+        "how long it is"
+    )
+
+
+def test_the_ask_matches_what_step_5_will_cut_the_beat_into():
+    """The defect this exists for: supply on a curve, demand on a constant.
+
+    Step 5 divides a beat by the pacing curve, so a long beat becomes three
+    shots. Step 4 used to source a flat two clips for it either way, and step 5
+    filled the third shot by cycling back to the first clip - which is how the
+    Crescent City reel closed on the aerial it had opened that same beat with.
+    """
+    beats = visuals.segment_script(SCRIPT, 40.0)
+    visuals.plan_shot_demand(beats, 40.0)
+    settings = {"assets_per_beat": 2}
+    for beat in beats:
+        wanted = visuals._assets_wanted(beat, settings)
+        shots = pacing.shot_count(
+            beat.duration, wanted,
+            position=beat.start, total=40.0 + config.VIDEO_TAIL_SECONDS,
+        )
+        assert shots <= wanted, (
+            f"beat {beat.index} is cut into {shots} shots with only "
+            f"{wanted} clips to fill them"
+        )
+
+
+def test_a_one_shot_beat_still_gets_its_alternate():
+    """The knob is a floor, not a target: a spare clip is cheap insurance."""
+    beat = visuals.Beat(index=0, text="x", start=0.0, end=3.0, shots=1)
+    assert visuals._assets_wanted(beat, {"assets_per_beat": 2}) == 2
+
+
+def test_the_ask_is_capped_at_twice_the_floor():
+    """One over-long beat may not spend the run's whole download budget."""
+    beat = visuals.Beat(index=0, text="x", start=0.0, end=60.0, shots=9)
+    assert visuals._assets_wanted(beat, {"assets_per_beat": 2}) == 4
+    assert visuals._assets_wanted(beat, {"assets_per_beat": 1}) == 2
+
+
+def test_every_beat_is_sourced_for_all_of_its_shots(sandbox):
+    manifest = run_visuals()
+    assert any(b["shots"] > 1 for b in manifest["beats"]), "nothing to prove"
+    for beat in manifest["beats"]:
+        assert len(beat["asset_indexes"]) >= min(beat["shots"], 4), beat
 
 
 def test_longer_audio_means_the_same_words_get_more_time():
@@ -1211,7 +1295,9 @@ def _keep_only(provider_ids, rejected_ids=None):
     return screen
 
 
-def test_a_rejected_clip_is_not_used_while_a_keeper_is_left(sandbox, monkeypatch):
+def test_a_rejected_clip_is_not_used_while_a_keeper_is_left(
+    sandbox, monkeypatch, one_shot_beats
+):
     """Acquisition walks down the ranking; the screen only reordered it.
 
     So a keeper that 404s used to hand the beat straight to the clip below it,
@@ -1265,7 +1351,9 @@ def test_a_reject_is_still_placed_when_it_is_the_only_thing_left(
     assert any("the relevance screen rejected" in w for w in manifest["warnings"])
 
 
-def test_rejected_footage_is_kept_out_of_the_headroom_top_up(sandbox, monkeypatch):
+def test_rejected_footage_is_kept_out_of_the_headroom_top_up(
+    sandbox, monkeypatch, one_shot_beats
+):
     """The top-up pulls spare shots from the leftovers.
 
     Rejected footage must not sit in there waiting to be collected as filler
@@ -2381,12 +2469,16 @@ def test_a_broken_stream_costs_one_asset_not_the_beat(sandbox, monkeypatch):
 
     beat = next(b for b in manifest["beats"] if b["index"] == 0)
     assert beat["status"] == "ok", "a broken stream took the beat down with it"
-    assert len(beat["asset_indexes"]) == 2, "the beat fell short of its shots"
+    assert len(beat["asset_indexes"]) == beat["shots"], (
+        "the beat fell short of its shots"
+    )
     assert not any(a["provider_id"] == "video0" for a in manifest["assets"])
     assert any("broke off" in w for w in manifest["warnings"])
-    # ...which is exactly how the same beat behaves when a URL is simply dead.
-    assert manifest["stats"]["beats_failed"] == 1  # the last beat, starved of
-    assert manifest["beats"][-1]["index"] == 7     # catalogue either way
+    # And it costs nothing anywhere else either. This used to read
+    # `beats_failed == 1`, which was never about the broken stream: the stub
+    # serves one page to every beat, and at a page of 15 the eighth beat ran
+    # out of catalogue whatever happened here.
+    assert manifest["stats"]["beats_failed"] == 0
 
 
 def test_oversized_file_is_refused_before_download(tmp_path):
@@ -2536,7 +2628,7 @@ def test_headroom_is_honoured(sandbox):
     )
 
 
-def test_short_headroom_sources_less(sandbox):
+def test_short_headroom_sources_less(sandbox, one_shot_beats):
     lean = run_visuals(headroom=0.2, assets_per_beat=1, run_id="lean")
     generous = run_visuals(headroom=3.0, assets_per_beat=1, run_id="generous")
     assert len(generous["assets"]) > len(lean["assets"])
@@ -2699,14 +2791,14 @@ def test_the_same_problem_is_only_reported_once(sandbox):
     assert len(manifest["warnings"]) == len(set(manifest["warnings"]))
 
 
-def test_asset_filenames_are_unique_including_spares(sandbox):
+def test_asset_filenames_are_unique_including_spares(sandbox, one_shot_beats):
     manifest = run_visuals(headroom=3.0, assets_per_beat=1)
     names = [a["relative_path"] for a in manifest["assets"]]
     assert len(names) == len(set(names))
     assert any(a["role"] == "spare" for a in manifest["assets"])
 
 
-def test_spares_do_not_all_pile_onto_the_first_beat(sandbox):
+def test_spares_do_not_all_pile_onto_the_first_beat(sandbox, one_shot_beats):
     """Ties in the top-up ordering used to hand every spare to beat 0."""
     manifest = run_visuals(headroom=3.0, assets_per_beat=1)
     spare_beats = {a["beat_index"] for a in manifest["assets"] if a["role"] == "spare"}
@@ -3378,8 +3470,15 @@ def test_the_deeper_screen_fills_a_beat_that_would_have_gone_neutral(
 
     opening = manifest["beats"][0]
     used = {manifest["assets"][i]["source_url"] for i in opening["asset_indexes"]}
-    assert used == {c.source_url for c in keepers}, (
+    # Subset, not equality: this beat is three shots long, so it asks for a
+    # third clip once both keepers are in and takes it from the rows below.
+    # What the pass is for is that the keepers come first and the neutral shot
+    # is never reached, and both of those are still exactly stated.
+    assert {c.source_url for c in keepers} <= used, (
         "the beat did not fill from the clips the deeper screen kept"
+    )
+    assert manifest["stats"]["beats_from_neutral"] == 0, (
+        "a beat reached for the neutral shot with screened clips still unused"
     )
     assert any("screened" in note and "below the shortlist" in note
                for note in opening["notes"]), opening["notes"]

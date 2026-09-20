@@ -895,8 +895,23 @@ VISUAL_PROVIDER_FLOORS = _parse_provider_floors(
     get_env("VISUAL_PROVIDER_FLOORS", "youtube:608x1080")
 )
 
-#: How many assets to source per visual beat. >1 gives step 5 alternates to cut
-#: between without going back to the network.
+#: The *floor* on how many assets to source per visual beat. >1 gives step 5
+#: alternates to cut between without going back to the network.
+#:
+#: A floor and not a flat number, because step 5 does not cut every beat into
+#: the same number of shots: it divides the beat by the pacing curve, so an
+#: 8.5s beat becomes three shots and a 3.7s one becomes two. Sourcing two for
+#: both left the long beat a clip short, and `_shot_count` then filled the
+#: third shot by cycling back to a clip already on screen. Measured across the
+#: 21 reels on disk, 15 had at least one beat in that state and 6 closed the
+#: reel on a clip the viewer had just seen - including the Crescent City reel,
+#: whose last 2.9s re-showed the aerial its own beat had opened with.
+#:
+#: `visuals._assets_wanted` raises the ask to one clip per shot, capped at
+#: twice this floor so a single over-long beat cannot spend the whole download
+#: budget. Across the 151 beats on disk the curve never asked for more than 3,
+#: so at the default the cap has never bound; matching demand costs about 0.8
+#: extra downloads per reel.
 VISUAL_ASSETS_PER_BEAT = get_env_int("VISUAL_ASSETS_PER_BEAT", 2)
 
 #: Source this multiple of the narration length so step 5 has slack to pace

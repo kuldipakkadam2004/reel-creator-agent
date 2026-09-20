@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import shutil
@@ -47,6 +46,7 @@ if __package__ in (None, ""):
 
 import config  # noqa: E402
 from pipeline import look  # noqa: E402
+from pipeline import pacing  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tunables. The look (resolution, font, colours, pacing) is config.py's job -
@@ -622,98 +622,15 @@ def _absorb_empty_slots(slots: list[_Slot], warnings: list[str]) -> list[_Slot]:
     return merged
 
 
-def shot_target_at(position: float, total: float) -> float:
-    """How long a shot should hold, `position` seconds into a `total`-second reel.
-
-    One rate for the whole reel is the obvious thing to do and the wrong one.
-    A cut costs the viewer a moment's re-orientation and buys back a moment's
-    attention, and the exchange rate is not constant: at the top there is no
-    attention yet to lose, so cuts are nearly free and nearly all of what keeps
-    someone watching; in the middle the viewer is following an argument, and a
-    cut every second is just noise over the top of it. At the close the reel
-    has to land rather than fade, so the rate comes back up.
-
-    So: SHOT_HOOK_SECONDS at t=0, easing linearly out to SHOT_TARGET_SECONDS
-    over SHOT_PACING_RAMP_SECONDS, then tightening to SHOT_OUTRO_SECONDS across
-    the final SHOT_OUTRO_WINDOW_SECONDS.
-    """
-    steady = max(0.3, config.SHOT_TARGET_SECONDS)
-    if (config.SHOT_PACING or "").strip().lower() != "curve":
-        return steady
-
-    target = steady
-    ramp = max(0.0, config.SHOT_PACING_RAMP_SECONDS)
-    if ramp > 0 and position < ramp:
-        opening = max(0.3, config.SHOT_HOOK_SECONDS)
-        target = opening + (steady - opening) * (position / ramp)
-
-    window = max(0.0, config.SHOT_OUTRO_WINDOW_SECONDS)
-    if window > 0 and total > 0 and position > total - window:
-        into = min(1.0, (position - (total - window)) / window)
-        closing = max(0.3, config.SHOT_OUTRO_SECONDS)
-        # `min` rather than a straight assignment: on a reel short enough that
-        # the ramp and the outro window overlap, whichever phase wants the
-        # faster cutting gets it, instead of the outro undoing the opening.
-        target = min(target, steady + (closing - steady) * into)
-
-    return max(0.3, target)
-
-
-def _curve_shots_in(start: float, end: float, total: float,
-                    steps: int = 64) -> float:
-    """How many shot-lengths the pacing curve fits between two times.
-
-    The integral of dt/target(t), which is the only honest way to ask the
-    question when the target is not constant across the window. Sampling the
-    curve once at the middle of the beat instead would quietly cancel the whole
-    feature on exactly the beat that matters: a long opening beat's midpoint
-    already sits past the ramp, so it would be handed the steady rate and the
-    reel would open at the same pace as its middle.
-    """
-    span = end - start
-    if span <= 0:
-        return 0.0
-    step = span / steps
-    return sum(step / max(0.3, shot_target_at(start + (i + 0.5) * step, total))
-               for i in range(steps))
-
-
-def _shot_count(window: float, available: int, *,
-                position: float = 0.0, total: float = 0.0) -> int:
-    """How many cuts a window of narration should get.
-
-    Follows the pacing curve across the window, then respects the floor and
-    both ceilings - the absolute SHOT_MAX_SECONDS and the SHOT_MAX_OVERRUN one
-    that is measured against the curve. An asset may be used twice inside one
-    beat if that is what a ceiling needs, but no further - past that the shot
-    simply runs long.
-
-    The floor gives way to the curve rather than fighting it. SHOT_MIN_SECONDS
-    exists to stop a short beat being chopped into flashes by the arithmetic;
-    where the curve is deliberately asking for 1.4s shots through the opening,
-    that is the edit and not an accident, so the floor steps aside.
-    """
-    count = max(1, int(round(_curve_shots_in(position, position + window, total))))
-
-    floor = min(config.SHOT_MIN_SECONDS,
-                shot_target_at(position + window / 2, total))
-    while count > 1 and window / count < floor:
-        count -= 1
-    if config.SHOT_MAX_SECONDS > 0:
-        count = max(count, math.ceil(window / config.SHOT_MAX_SECONDS - 1e-6))
-
-    # The ceiling that actually binds. SHOT_MAX_SECONDS sits at 6.0s while the
-    # curve asks for 3.2s, so it never fires, and what decided shot length was
-    # the rounding above: a window up to 1.49 targets long rounds to one shot
-    # and then holds for all of it. This charges that overrun against the curve
-    # instead of against a constant, which is the only ceiling that means the
-    # same thing at the top of a reel and in the middle of one.
-    if config.SHOT_MAX_OVERRUN > 0:
-        ceiling = shot_target_at(position + window / 2, total) * config.SHOT_MAX_OVERRUN
-        if ceiling > 0:
-            count = max(count, math.ceil(window / ceiling - 1e-6))
-
-    return max(1, min(count, max(1, available * 2)))
+# The pacing curve itself lives in `pipeline.pacing`. Step 4 has to ask the same
+# question this module answers - how many shots a beat becomes - before it can
+# decide how many clips to source for that beat, and while the two steps
+# answered it with different arithmetic a long beat was cut into more shots
+# than it had footage for. The names are kept so the rest of this module reads
+# as it always did.
+shot_target_at = pacing.shot_target_at
+_curve_shots_in = pacing.curve_shots_in
+_shot_count = pacing.shot_count
 
 
 def _shot_spans(start: float, end: float, count: int,
@@ -1077,6 +994,21 @@ def plan_timeline(manifest: dict, audio_duration: float,
         wanted = _shot_count(slot.duration, len(available),
                              position=slot.start, total=total)
         chosen = [available[position % len(available)] for position in range(wanted)]
+
+        # Step 4 now sources a clip per shot, so this is rare and worth saying
+        # out loud when it happens: the run is about to put footage back on
+        # screen that the same beat showed a few seconds ago, and until now the
+        # only trace of that was a look grade after the encode. What is left of
+        # it is beats that inherited seconds from a neighbour with no usable
+        # footage, which step 4 cannot see coming - 2 of the 151 beats on disk.
+        if wanted > len(available):
+            short = wanted - len(available)
+            warnings.append(
+                f"beat {slot.beat_index} was cut into {wanted} shots from "
+                f"{len(available)} clip(s) - "
+                f"{'one of them re-shows' if short == 1 else f'{short} of them re-show'} "
+                f"footage from earlier in the same beat"
+            )
 
         spans = _shot_spans(slot.start, slot.end, len(chosen), total)
         longest = max(end - start for start, end in spans)

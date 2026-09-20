@@ -164,6 +164,39 @@ def test_every_shot_uses_an_asset_step_4_gave_that_beat():
     assert not any("borrow" in warning for warning in warnings)
 
 
+def test_a_beat_that_re_shows_its_own_footage_says_so():
+    """Step 4 now sources a clip per shot, so this is rare - and audible.
+
+    Until this warning existed, a beat cycling back over a clip it had shown
+    three seconds earlier left no trace in the run at all. The only signal was
+    the look grade, which arrives after the encode has been paid for, and which
+    calls it "repetitive" without saying which beat or why.
+    """
+    manifest = make_manifest(assets_per_beat=1, beats=3)
+    shots, warnings = plan(manifest)
+
+    repeated = [beat for beat in range(3)
+                if len([s for s in shots if s.beat_index == beat])
+                > len({s.asset_index for s in shots if s.beat_index == beat})]
+    assert repeated, "no beat repeated a clip, so this proves nothing"
+    for beat in repeated:
+        assert any(f"beat {beat} was cut into" in w for w in warnings), (
+            f"beat {beat} re-showed its own footage without saying so"
+        )
+
+
+def test_a_beat_with_a_clip_per_shot_stays_quiet():
+    # Eight beats, so each is short enough that four clips covers its shots.
+    # Three would make every beat a third of the narration long, and four
+    # clips would not be enough for any of them.
+    manifest = make_manifest(assets_per_beat=4, beats=8)
+    shots, warnings = plan(manifest)
+    for beat in range(8):
+        here = [s for s in shots if s.beat_index == beat]
+        assert len(here) == len({s.asset_index for s in here}), beat
+    assert not any("same beat" in warning for warning in warnings)
+
+
 def test_no_shot_outstays_the_configured_ceiling():
     manifest = make_manifest(assets_per_beat=4, beats=3)
     shots, _ = plan(manifest)

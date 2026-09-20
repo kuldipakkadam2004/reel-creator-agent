@@ -5,9 +5,12 @@ ordered set of downloaded video/photo assets for step 5 to assemble.
 
 What happens, in order:
 
-  1. the script is cut into *visual beats* - runs of sentences short enough to
-     hold one shot - and each beat is given start/end timestamps scaled to the
-     measured length of the narration .mp3, not to an estimate;
+  1. the script is cut into *visual beats* - runs of sentences that share a
+     subject - and each beat is given start/end timestamps scaled to the
+     measured length of the narration .mp3, not to an estimate. A beat is not
+     one shot: step 5 divides it by the pacing curve, and `plan_shot_demand`
+     reads off that same curve so a beat is sourced for every shot it will be
+     cut into rather than a flat two;
   2. every beat gets a search query (Gemini writes them by default, with a
      keyword-extraction fallback that needs no API call);
   3. the queries are run against the configured stock providers until enough
@@ -50,6 +53,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
+from pipeline import pacing  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tunables. Provider choice, API keys, the resolution floor, assets-per-beat and
@@ -277,6 +281,11 @@ class Beat:
     neutral_query: str = ""
     image_prompt: str = ""
     query_source: str = "heuristic"
+    #: How many shots step 5 will cut this beat into, read off the same pacing
+    #: curve step 5 uses. `plan_shot_demand` fills it in once the beat timings
+    #: are final; it is 1 until then, which is what a caller that segments
+    #: beats for itself and never asks the question gets.
+    shots: int = 1
 
     @property
     def duration(self) -> float:
@@ -294,6 +303,7 @@ class Beat:
             "neutral_query": self.neutral_query,
             "image_prompt": self.image_prompt,
             "query_source": self.query_source,
+            "shots": self.shots,
         }
 
 
@@ -510,6 +520,45 @@ def segment_script(script: str, total_duration: float) -> list[Beat]:
 
     beats[-1].end = float(total_duration)  # absorb accumulated rounding
     return beats
+
+
+def plan_shot_demand(beats: list[Beat], narration_duration: float) -> None:
+    """Record how many shots step 5 will cut each beat into.
+
+    Step 5 divides a beat's window by the pacing curve, so a long beat becomes
+    three shots and a short one becomes a single shot. Sourcing a flat
+    VISUAL_ASSETS_PER_BEAT for both meant the long beat was cut into more shots
+    than it had clips, and step 5 filled the gap by cycling back over footage
+    already on screen - which is how the Crescent City reel spent its closing
+    2.9s re-showing the aerial it had opened that same beat with.
+
+    The number is stored on the beat rather than recomputed at each use, so the
+    manifest records what the run believed it needed and a finished run can be
+    audited without replaying the curve.
+    """
+    total = round(narration_duration + max(0.0, config.VIDEO_TAIL_SECONDS), 3)
+    for beat in beats:
+        beat.shots = pacing.shot_count(
+            beat.duration, position=beat.start, total=total
+        )
+
+
+def _assets_wanted(beat: Beat, settings: dict) -> int:
+    """How many clips to source for one beat.
+
+    VISUAL_ASSETS_PER_BEAT stays the floor - a beat that will hold one shot
+    still gets an alternate, because a download can fail and the variety check
+    can hold a clip back, and neither is worth a second trip to the network.
+    What is new is the ceiling on top of it: a beat gets enough footage for
+    every shot it will be cut into.
+
+    Capped at twice the floor so one over-long beat cannot spend the run's
+    whole download budget. Across the 151 beats on disk the curve never asked
+    for more than 3, so at the default of 2 the cap does not bind on anything
+    that has actually been made; it is a guard, not a policy.
+    """
+    base = max(1, int(settings.get("assets_per_beat") or 1))
+    return max(base, min(int(beat.shots or 1), base * 2))
 
 
 # ---------------------------------------------------------------------------
@@ -2704,7 +2753,8 @@ def _gather_candidates(
     # Judge sufficiency on candidates that would actually survive the filter.
     # Counting raw hits instead would never trip: one provider returns a page of
     # 15, and half of those can be landscape 1080p that the 9:16 floor rejects.
-    needed = min(settings["assets_per_beat"] * CANDIDATE_MARGIN, CANDIDATE_POOL_SIZE)
+    needed = min(_assets_wanted(beat, settings) * CANDIDATE_MARGIN,
+                 CANDIDATE_POOL_SIZE)
 
     plan = queries if queries is not None else (beat.query, *beat.alt_queries)
     for position, query in enumerate(plan):
@@ -2988,10 +3038,6 @@ def _screen_beats(
 
     shortlist_size = settings["relevance_shortlist"]
     floor = settings["relevance_floor"]
-    #: How many clips each beat is actually trying to fill. The first screen
-    #: cared only whether this was zero; the second slice below cares whether
-    #: it is enough, which is the number pass 2 will ask for.
-    want = max(1, int(settings.get("assets_per_beat") or 1))
     #: Keepers per beat, carried between the two screening passes.
     kept_count: dict[int, int] = {}
     notes: dict[int, list[str]] = {}
@@ -3016,6 +3062,15 @@ def _screen_beats(
     if subject_keys is None:
         subject_keys = set()
     by_index = {b.index: b for b in beats}
+
+    #: How many clips a beat is actually trying to fill. The first screen cared
+    #: only whether this was zero; the second slice below cares whether it is
+    #: enough, which is the number pass 2 will ask for - and that is a per-beat
+    #: number, because a beat step 5 will cut into three shots needs three
+    #: clips and a one-shot beat does not.
+    def wanted(index: int) -> int:
+        beat = by_index.get(index)
+        return _assets_wanted(beat, settings) if beat else 1
 
     shortlists = {
         index: [row[1] for row in ranked[:shortlist_size]]
@@ -3095,7 +3150,7 @@ def _screen_beats(
     # their remedy is a different query, which is what the re-search is for.
     deeper: dict[int, list[tuple[float, Candidate, str]]] = {}
     for index, ranked in plans.items():
-        if not 0 < kept_count.get(index, 0) < want:
+        if not 0 < kept_count.get(index, 0) < wanted(index):
             continue
         below = [row for row in ranked[shortlist_size:]
                  if row[1].key not in screened_keys]
@@ -3768,6 +3823,7 @@ def source_visuals(
 
     warnings: list[str] = []
     beats = segment_script(script_text, narration_duration)
+    plan_shot_demand(beats, narration_duration)
     warnings.extend(build_queries(beats, topic, settings["query_mode"]))
 
     target_duration = round(narration_duration * settings["headroom"], 3)
@@ -3894,7 +3950,7 @@ def source_visuals(
                 beat_records.append(record)
                 continue
 
-            want = settings["assets_per_beat"]
+            want = _assets_wanted(beat, settings)
             rejects = [r for r in ranked if r[1].key in rejected_keys]
             if screened_keys:
                 # The screen only ever judged the shortlist. What sits below it
@@ -4078,7 +4134,7 @@ def source_visuals(
             assets.append(asset)
 
         record["status"] = (
-            "ok" if len(acquired) >= settings["assets_per_beat"] else "partial"
+            "ok" if len(acquired) >= _assets_wanted(beat, settings) else "partial"
         )
         beat_records.append(record)
 
