@@ -1234,6 +1234,33 @@ than a constant. At the 1080x1920 default the card sits 320px down:
 
 `hook_card` keeps the card regardless and says so; `footage` never uses it.
 
+**When the card pool has nothing in it.** In card mode the candidates are only
+the shots the card sits over, and the card runs 2.2s — so the pool is one or
+two shots deep and `COVER_LOOK_MAX_CANDIDATES` has never once bound under a
+card. That is fine while one of those shots is worth shipping, and useless when
+the reel opens on the wrong image: there is no second candidate for the look to
+prefer, so the choice falls through to proxies that know the clip's size and
+slot and nothing about what is in it. The spider reel of 2026-09-22 opened on a
+hook line built from a comparison — *"the milk in your fridge has less protein
+than a spider's"* — and both candidates were stock footage of a cafe latte,
+which step 5b graded 1 and refused twice over. The coffee shipped anyway.
+
+So when step 5b refuses *every* frame under the card, `auto` grades the footage
+pool as well and takes the cover from there, dropping the card. The card cannot
+ride along onto a later frame: `cover_frame_time` keeps the cover inside the
+window the card is actually up, because a headline over footage the viewer
+never saw it over is a frame the reel does not contain — the one thing a cover
+is not allowed to be.
+
+It is a second encoder pass and a second model call, so it is spent only on
+that answer. Across the 22 reels assembled so far it would have fired on three.
+The card is kept when the footage is refused too — nothing distinguishes two
+refused pools, and the card at least puts the hook in the grid — and kept, with
+a different warning, when the second look never came back at all, so a failed
+call is never written up as a verdict nobody gave. `COVER_SOURCE=hook_card` is
+exempt: a caller that asked for the card knowing what it costs is not overruled
+by the model disliking it.
+
 Everything about the choice — which shot, which frame, which mode, the reason in
 words, whether the card cleared the crop, and what step 5b made of every
 candidate it chose between — goes into `assembly.json` under `cover`, so step 9

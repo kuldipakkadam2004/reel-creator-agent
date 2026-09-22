@@ -2357,6 +2357,110 @@ def cover_candidates(shots: list[Shot], *, card: str, card_seconds: float,
             "aspect": aspect}
 
 
+def cover_look_exhausted(shortlist: dict, verdicts: dict[str, dict]) -> bool:
+    """Whether every graded frame under the hook card was one to reject. Pure.
+
+    The card pool is only the shots the card runs over - the card is 2.2s, so
+    one or two shots - which means a reel whose opening image is wrong has no
+    second candidate for the look to prefer, and the choice falls through to
+    proxies that know the clip's size and slot and nothing about what is in
+    it. COVER_LOOK_MAX_CANDIDATES is 6 and has never bound under a card.
+
+    When the answer is yes the caller drops the card and grades the footage
+    instead - a pool the model has not been shown, and the one the `else`
+    branch above already builds. The card cannot simply be pasted over a
+    later frame: `cover_frame_time` keeps the cover inside the window the
+    card is actually up, because a headline over footage the viewer never
+    saw it over is a frame the reel does not contain.
+
+    Only "auto" is answered for. COVER_SOURCE=hook_card is a caller that
+    asked for the card knowing what it costs, and a rejection is not a
+    licence to overrule it.
+    """
+    if shortlist.get("mode") != "auto" or not shortlist.get("want_card"):
+        return False
+    if not verdicts:
+        # No verdicts means the look did not happen - a failed model call, or
+        # frames that would not render. That is not the model rejecting the
+        # pool, and re-grading a pool nobody graded spends a second call to
+        # learn the same nothing.
+        return False
+    return not any(one.get("ok", True) for one in verdicts.values())
+
+
+def look_at_covers(shots: list[Shot], *, card: str, card_seconds: float,
+                   font_name: str, font_file: Path | None,
+                   fonts_dir: Path | None, topic: str,
+                   source: str | None,
+                   ) -> tuple[str | None, dict[str, dict], list[str]]:
+    """Grade the cover candidates, looking twice when the first pool is refused.
+
+    Returns (the source `plan_cover` should use, verdicts, warnings). Split
+    out of `assemble_video` so the two-pass decision can be tested without an
+    encoder: the rendering and the model call both go through module-level
+    names a test can stand in for.
+
+    The second pass costs an encoder pass and a model call, so it is not spent
+    on every run. It is spent when `cover_look_exhausted` says the model
+    refused everything the hook card had to offer - on the reels made so far
+    that is about one run in seven, and on those it is the difference between
+    a cover chosen by proxies and one chosen by looking.
+    """
+    shortlist = cover_candidates(shots, card=card, card_seconds=card_seconds,
+                                 font_file=font_file, source=source)
+    warnings: list[str] = []
+    previews, notes = preview_cover_frames(
+        shortlist["pool"], card=card, card_seconds=card_seconds,
+        want_card=shortlist["want_card"], font_name=font_name,
+        font_file=font_file, fonts_dir=fonts_dir,
+    )
+    warnings += notes
+    verdicts, notes = look.judge_covers(previews, topic=topic, hook=card)
+    warnings += notes
+
+    if not cover_look_exhausted(shortlist, verdicts):
+        return source, verdicts, warnings
+
+    retry = cover_candidates(shots, card=card, card_seconds=card_seconds,
+                             font_file=font_file, source="footage")
+    retry_looks: dict[str, dict] = {}
+    if any(cover_label(one) not in verdicts for one in retry["pool"]):
+        frames, notes = preview_cover_frames(
+            retry["pool"], card=card, card_seconds=card_seconds,
+            want_card=retry["want_card"], font_name=font_name,
+            font_file=font_file, fonts_dir=fonts_dir,
+        )
+        warnings += notes
+        retry_looks, notes = look.judge_covers(frames, topic=topic, hook=card)
+        warnings += notes
+    # else: nothing starts after the card inside COVER_SEARCH_SECONDS, so
+    # `cover_candidates` handed back the card pool again. Grading it a second
+    # time would buy the same verdicts twice.
+
+    if any(one.get("ok", True) for one in retry_looks.values()):
+        warnings.append(
+            f"the cover look rejected all {len(verdicts)} frame(s) under the "
+            f"hook card, so the cover was taken from the footage instead "
+            f"({len(retry_looks)} candidate(s))"
+        )
+        return "footage", retry_looks, warnings
+
+    if retry_looks:
+        # Both pools refused. Nothing distinguishes them, so keep the card: it
+        # at least puts the hook in the grid, and swapping on a tie would spend
+        # the difference for no reason.
+        warnings.append("the cover look rejected the footage as well as the "
+                        "hook card; kept the card")
+    else:
+        # Either there was no second pool, or the look did not come back -
+        # `preview_cover_frames` and `judge_covers` each say which in their own
+        # note. Neither is the footage being refused, so this does not claim
+        # it was.
+        warnings.append("there was no second opinion to take a cover from; "
+                        "kept the hook card")
+    return source, verdicts, warnings
+
+
 def cover_frame_time(shot: Shot, *, card_seconds: float,
                      want_card: bool) -> tuple[float, float]:
     """Which frame of `shot` the cover is: (time in the reel, time in the file).
@@ -3743,26 +3847,19 @@ def assemble_video(audio, visuals, *, output_dir: str | Path | None = None,
     # dry run - it costs an encoder pass and a model call, and a dry run is
     # meant to cost neither.
     cover_looks: dict[str, dict] = {}
+    cover_source = None if cover is False else cover
     if (cover is not False and config.COVER_ENABLED and shots and not dry_run
             and config.LOOK_ENABLED and config.COVER_LOOK_ENABLED):
-        shortlist = cover_candidates(
+        cover_source, cover_looks, notes = look_at_covers(
             shots, card=card, card_seconds=card_seconds,
-            font_file=font_file, source=cover,
-        )
-        previews, notes = preview_cover_frames(
-            shortlist["pool"], card=card, card_seconds=card_seconds,
-            want_card=shortlist["want_card"], font_name=font_name,
-            font_file=font_file, fonts_dir=fonts_dir,
-        )
-        warnings += notes
-        cover_looks, notes = look.judge_covers(
-            previews, topic=manifest.get("topic") or "", hook=card,
+            font_name=font_name, font_file=font_file, fonts_dir=fonts_dir,
+            topic=manifest.get("topic") or "", source=cover,
         )
         warnings += notes
 
     cover = None if cover is False else plan_cover(
         shots, manifest, probes, card=card, card_seconds=card_seconds,
-        font_file=font_file, source=cover, looks=cover_looks,
+        font_file=font_file, source=cover_source, looks=cover_looks,
         warnings=warnings,
     )
 

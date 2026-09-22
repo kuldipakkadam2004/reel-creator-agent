@@ -2368,6 +2368,195 @@ def test_a_cover_nobody_could_ship_is_still_shipped_and_said_out_loud():
     assert any("too dark" in note for note in warnings)
 
 
+def card_shortlist(shots, **overrides):
+    kwargs = dict(card="Hook card", card_seconds=2.2, font_file=None)
+    kwargs.update(overrides)
+    return assemble.cover_candidates(shots, **kwargs)
+
+
+def test_the_card_pool_is_shallower_than_the_look_is_allowed_to_see():
+    # The reason the fallback exists. COVER_LOOK_MAX_CANDIDATES is 6, but the
+    # card runs 2.2s, so the pool under it is one or two shots deep and the
+    # cap has nothing to cap. A reel that opens on the wrong image has no
+    # second candidate, and the choice falls through to proxies that know the
+    # clip's size and slot and nothing about what is in it.
+    shots, _ = plan(cover_manifest())
+    under = card_shortlist(shots)["pool"]
+    # The pool the fallback builds, which keeps the real card_seconds - not
+    # `footage_pool`, which asks as though there were no card at all and so
+    # still offers the shots underneath one.
+    footage = card_shortlist(shots, source="footage")["pool"]
+
+    assert len(under) < config.COVER_LOOK_MAX_CANDIDATES
+    assert len(footage) > len(under), "the footage pool is the deeper one"
+    assert {one.index for one in under} & {one.index for one in footage} == set(), \
+        "the two pools are disjoint - the footage pool starts after the card"
+
+
+def test_a_card_pool_the_model_rejects_outright_is_exhausted():
+    shots, _ = plan(cover_manifest())
+    shortlist = card_shortlist(shots)
+    looks = {assemble.cover_label(one): verdict(grade=1, ok=False,
+                                                why="misleading")
+             for one in shortlist["pool"]}
+
+    assert assemble.cover_look_exhausted(shortlist, looks)
+
+
+def test_one_frame_worth_shipping_is_enough_to_keep_the_card():
+    shots, _ = plan(cover_manifest())
+    shortlist = card_shortlist(shots)
+    pool = shortlist["pool"]
+    looks = {assemble.cover_label(one): verdict(grade=1, ok=False)
+             for one in pool}
+    looks[assemble.cover_label(pool[0])] = verdict(grade=2, ok=True)
+
+    assert not assemble.cover_look_exhausted(shortlist, looks)
+
+
+def test_an_ungraded_pool_is_not_a_rejected_one():
+    # No verdicts means the look did not happen - a failed call, or frames
+    # that would not render. Re-grading a pool nobody graded would spend a
+    # second model call to learn the same nothing.
+    shots, _ = plan(cover_manifest())
+    assert not assemble.cover_look_exhausted(card_shortlist(shots), {})
+
+
+def test_asking_for_the_card_outright_survives_the_model_disliking_it():
+    # COVER_SOURCE=hook_card is a caller that asked for the card knowing what
+    # it costs. A rejection is not a licence to overrule it.
+    shots, _ = plan(cover_manifest())
+    shortlist = card_shortlist(shots, source="hook_card")
+    looks = {assemble.cover_label(one): verdict(grade=0, ok=False)
+             for one in shortlist["pool"]}
+
+    assert shortlist["want_card"]
+    assert not assemble.cover_look_exhausted(shortlist, looks)
+
+
+def test_a_footage_cover_is_never_asked_to_fall_back_to_itself():
+    shots, _ = plan(cover_manifest())
+    shortlist = assemble.cover_candidates(shots, card="", card_seconds=0.0,
+                                          font_file=None)
+    looks = {assemble.cover_label(one): verdict(grade=0, ok=False)
+             for one in shortlist["pool"]}
+
+    assert not shortlist["want_card"]
+    assert not assemble.cover_look_exhausted(shortlist, looks)
+
+
+def test_the_footage_cover_drops_the_card_rather_than_pasting_it_later():
+    # What the fallback hands `plan_cover`. The card cannot ride along: a
+    # headline over footage the viewer never saw it over is a frame the reel
+    # does not contain, which is the one thing the cover is not allowed to be.
+    shots, _ = plan(cover_manifest())
+    cover = plan_a_cover(shots=shots, source="footage")
+
+    assert cover["source"] == "footage"
+    assert cover["hook_card_text"] == ""
+    assert cover["shot_index"] in {one.index for one in footage_pool(shots)}
+
+
+def stub_the_cover_look(monkeypatch, verdicts_by_round):
+    """Stand in for the encoder and the model. Returns the rounds it was asked.
+
+    `verdicts_by_round` is one {label: verdict} per call to `judge_covers`, so
+    a test says what the model thinks of the card pool and then of the footage
+    pool without rendering a frame or spending a call.
+    """
+    rounds: list[list[str]] = []
+
+    def fake_preview(pool, **kwargs):
+        return [(assemble.cover_label(one), b"") for one in pool], []
+
+    def fake_judge(frames, **kwargs):
+        labels = [label for label, _ in frames]
+        rounds.append(labels)
+        answers = verdicts_by_round[len(rounds) - 1]
+        return {label: answers[label] for label in labels if label in answers}, []
+
+    monkeypatch.setattr(assemble, "preview_cover_frames", fake_preview)
+    monkeypatch.setattr(assemble.look, "judge_covers", fake_judge)
+    return rounds
+
+
+def look_at(shots, **overrides):
+    kwargs = dict(card="Hook card", card_seconds=2.2, font_name="Arial",
+                  font_file=None, fonts_dir=None, topic="deep ocean",
+                  source=None)
+    kwargs.update(overrides)
+    return assemble.look_at_covers(shots, **kwargs)
+
+
+def test_a_refused_card_pool_sends_the_look_to_the_footage(monkeypatch):
+    shots, _ = plan(cover_manifest())
+    card = card_shortlist(shots)["pool"]
+    footage = card_shortlist(shots, source="footage")["pool"]
+    rounds = stub_the_cover_look(monkeypatch, [
+        {assemble.cover_label(one): verdict(grade=1, ok=False) for one in card},
+        {assemble.cover_label(one): verdict(grade=3, ok=True) for one in footage},
+    ])
+
+    source, verdicts, warnings = look_at(shots)
+
+    assert len(rounds) == 2, "the footage pool was graded too"
+    assert rounds[0] == [assemble.cover_label(one) for one in card]
+    assert rounds[1] == [assemble.cover_label(one) for one in footage]
+    assert source == "footage"
+    assert set(verdicts) == {assemble.cover_label(one) for one in footage}
+    assert any("taken from the footage instead" in note for note in warnings)
+
+
+def test_a_card_pool_the_model_will_ship_is_never_looked_past(monkeypatch):
+    shots, _ = plan(cover_manifest())
+    card = card_shortlist(shots)["pool"]
+    rounds = stub_the_cover_look(monkeypatch, [
+        {assemble.cover_label(one): verdict(grade=3, ok=True) for one in card},
+    ])
+
+    source, verdicts, warnings = look_at(shots)
+
+    assert len(rounds) == 1, "the second pass costs a call and was not needed"
+    assert source is None, "plan_cover is left to resolve COVER_SOURCE itself"
+    assert set(verdicts) == {assemble.cover_label(one) for one in card}
+
+
+def test_footage_the_model_also_refuses_leaves_the_card_where_it_was(monkeypatch):
+    shots, _ = plan(cover_manifest())
+    card = card_shortlist(shots)["pool"]
+    footage = card_shortlist(shots, source="footage")["pool"]
+    refused = [
+        {assemble.cover_label(one): verdict(grade=1, ok=False) for one in card},
+        {assemble.cover_label(one): verdict(grade=0, ok=False) for one in footage},
+    ]
+    rounds = stub_the_cover_look(monkeypatch, refused)
+
+    source, verdicts, warnings = look_at(shots)
+
+    assert len(rounds) == 2
+    assert source is None, "kept the card rather than swapping on a tie"
+    assert set(verdicts) == {assemble.cover_label(one) for one in card}
+    assert any("as well as the hook card" in note for note in warnings)
+
+
+def test_a_look_that_never_answered_is_not_reported_as_a_refusal(monkeypatch):
+    # An empty second round is a failed call or a frame that would not render,
+    # not the model turning the footage down. Saying otherwise would put a
+    # verdict nobody gave into the run log.
+    shots, _ = plan(cover_manifest())
+    card = card_shortlist(shots)["pool"]
+    stub_the_cover_look(monkeypatch, [
+        {assemble.cover_label(one): verdict(grade=1, ok=False) for one in card},
+        {},
+    ])
+
+    source, _, warnings = look_at(shots)
+
+    assert source is None
+    assert any("no second opinion" in note for note in warnings)
+    assert not any("rejected the footage" in note for note in warnings)
+
+
 def test_the_cover_records_what_it_beat_and_not_only_what_it_is():
     shots, _ = plan(cover_manifest())
     pool = footage_pool(shots)
