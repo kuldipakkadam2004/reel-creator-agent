@@ -952,6 +952,21 @@ of downloaded assets and a `manifest.json` for step 5.
   0 pays a premium for motion and for a clip long enough to hold without looping
   back to its own first frame — enough of one that a landscape clip which has to
   be cropped beats a perfectly framed vertical still;
+* **the opening beat shows the video's subject**, even when its line is about
+  something else. The spider reel of 2026-09-22 opened on *"the milk in your
+  fridge has less protein than a spider's"*: the query was `pouring milk into
+  glass`, the screen kept six milk clips on the line's own words, and the first
+  frame and the cover were a latte. A line addressed to the viewer puts *their*
+  thing first, purely for scale, and the old rule — shoot the thing being
+  described, never the comparison — pointed straight at the milk, with "than"
+  not even counted as a comparison. The query prompt now says beat 0 names the
+  topic's subject; replayed on that line, which the prompt does not quote, it
+  asked for the spider 3 times in 3, against milk on 3 of 4 before. Behind the
+  prompt is a check that needs no judgement of its own: the screen already
+  answers `subj` for every clip, so when nothing beat 0 kept shows the subject,
+  approved subject footage goes in front of it — from what other beats have to
+  spare, and one clip another beat needs only if the opening would otherwise
+  have none. The beat's own footage stays behind it, and it warns;
 * downloads are content-addressed in `assets/visuals/cache/` and hardlinked into
   the run directory, so re-running a script costs no bytes and no API calls;
 * a usage ledger keeps the same stock clip from opening every video.
@@ -1260,6 +1275,12 @@ a different warning, when the second look never came back at all, so a failed
 call is never written up as a verdict nobody gave. `COVER_SOURCE=hook_card` is
 exempt: a caller that asked for the card knowing what it costs is not overruled
 by the model disliking it.
+
+That is the cover's half. The other half is step 4 not handing the card a latte
+in the first place — see *the opening beat shows the video's subject*. Two of
+the three reels whose every card candidate was refused opened this way: the
+spider's milk, and the ironclad beetle's `space shuttle on launchpad` for *"your
+bones would need to support forty space shuttles"*.
 
 Everything about the choice — which shot, which frame, which mode, the reason in
 words, whether the card cleared the crop, and what step 5b made of every

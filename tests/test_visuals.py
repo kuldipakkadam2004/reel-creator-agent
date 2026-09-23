@@ -1098,6 +1098,188 @@ def test_salvage_never_fires_on_a_clip_the_screen_did_not_call_the_subject(
     assert not any("salvaged" in note for note in notes[0])
 
 
+# ---------------------------------------------------------------------------
+# The opening beat opens on the subject
+#
+# The spider reel of 2026-09-22 opened on "The milk in your fridge has less
+# protein than a spider's". Step 4 searched for milk, the screen kept six milk
+# clips on the line's own words and marked none of them `subj`, and the first
+# frame and the cover were both a latte.
+# ---------------------------------------------------------------------------
+
+_SPIDER_TOPIC = "how a jumping spider produces milk"
+
+
+def _milk_beat(shots=2):
+    return Beat(
+        index=0, start=0.0, end=3.3, query="pouring milk into glass",
+        text="The milk in your fridge has less protein than a spider's.",
+        shots=shots,
+    )
+
+
+def _spider_beat():
+    return Beat(
+        index=1, start=3.3, end=7.5, query="jumping spider with babies",
+        text="One species of jumping spider raises its young almost entirely "
+             "on milk.",
+    )
+
+
+def _screen_by_key(verdicts_by_key):
+    """A screen answering each clip by key: `{key: (ok, subj)}`."""
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        verdicts = {}
+        for index, candidates in shortlists.items():
+            verdicts[index] = {}
+            for position, candidate in enumerate(candidates):
+                ok, subj = verdicts_by_key[candidate.key]
+                verdicts[index][position] = (ok, "" if ok else "wrong thing")
+                if subj and subject_keys is not None:
+                    subject_keys.add(candidate.key)
+        return verdicts, []
+    return screen
+
+
+def _screen_opening(monkeypatch, plans, beats, verdicts_by_key):
+    monkeypatch.setattr(visuals, "llm_screen", _screen_by_key(verdicts_by_key))
+    warnings = []
+    notes = visuals._screen_beats(
+        plans, beats, _SPIDER_TOPIC, [_query_aware_provider({})(session=None)],
+        _retry_settings(), visuals.UsageLedger(), "run", visuals._RunState(),
+        {}, warnings,
+    )
+    return notes, warnings
+
+
+def test_the_opening_beat_opens_on_the_subject_not_the_comparison(monkeypatch):
+    """The spider reel, in miniature: the milk stays, but behind the spider."""
+    latte = _described(70, "pouring-milk-for-a-perfect-cafe-latte")
+    glasses = _described(71, "pouring-milk-into-black-coffee-glasses")
+    pipe = _described(72, "close-up-of-jumping-spider-on-outdoor-pipe")
+    branch = _described(73, "a-spider-on-a-branch-with-a-blue-sky")
+    leaf = _described(74, "jumping-spider-on-a-green-leaf")
+    plans = {
+        0: [(14.7, latte, "pouring milk into glass"),
+            (14.7, glasses, "pouring milk into glass")],
+        1: [(8.7, pipe, "jumping spider with babies"),
+            (8.7, branch, "jumping spider with babies"),
+            (8.7, leaf, "jumping spider with babies")],
+    }
+    notes, warnings = _screen_opening(monkeypatch, plans,
+                                      [_milk_beat(), _spider_beat()], {
+        latte.key: (True, False), glasses.key: (True, False),
+        pipe.key: (True, True), branch.key: (True, True),
+        leaf.key: (True, True),
+    })
+
+    opening = [row[1].provider_id for row in plans[0]]
+    # Two slots, filled from what beat 1 has to spare - not from the one clip
+    # beat 1 will itself place first.
+    assert opening[:2] == ["v73", "v74"], opening
+    assert "v72" not in opening[:2]
+    # The line's own footage is still there, behind the subject.
+    assert opening[2:] == ["v70", "v71"], opening
+    assert any("first frame and the cover" in note for note in notes[0])
+    assert any("borrowed" in w and "beat 0" in w for w in warnings), warnings
+
+
+def test_the_first_frame_may_take_a_clip_another_beat_needs(monkeypatch):
+    """Only one, though. The first frame is worth another beat's clip; the
+    second shot is not, so a beat with nothing to spare gives up exactly one."""
+    latte = _described(70, "pouring-milk-for-a-perfect-cafe-latte")
+    pipe = _described(72, "close-up-of-jumping-spider-on-outdoor-pipe")
+    web = _described(75, "spider-web-with-morning-fog")
+    plans = {
+        0: [(14.7, latte, "pouring milk into glass")],
+        1: [(8.7, pipe, "jumping spider with babies"),
+            (8.7, web, "jumping spider with babies")],
+    }
+    spider = _spider_beat()
+    spider.shots = 2      # beat 1 will place both of its clips
+    notes, warnings = _screen_opening(monkeypatch, plans, [_milk_beat(), spider], {
+        latte.key: (True, False), pipe.key: (True, True),
+        web.key: (True, False),
+    })
+
+    opening = [row[1].provider_id for row in plans[0]]
+    assert opening == ["v72", "v70"], opening
+    assert any("borrowed" in w for w in warnings)
+
+
+def test_the_opening_beats_own_subject_footage_goes_first(monkeypatch):
+    """Nothing is borrowed while the beat's own screen kept the subject."""
+    latte = _described(70, "pouring-milk-for-a-perfect-cafe-latte")
+    own_spider = _described(76, "jumping-spider-beside-a-milk-droplet")
+    branch = _described(73, "a-spider-on-a-branch-with-a-blue-sky")
+    leaf = _described(74, "jumping-spider-on-a-green-leaf")
+    plans = {
+        0: [(14.7, latte, "pouring milk into glass"),
+            (9.0, own_spider, "pouring milk into glass")],
+        1: [(8.7, branch, "jumping spider with babies"),
+            (8.7, leaf, "jumping spider with babies")],
+    }
+    notes, warnings = _screen_opening(
+        monkeypatch, plans, [_milk_beat(shots=1), _spider_beat()], {
+            latte.key: (True, False), own_spider.key: (True, True),
+            branch.key: (True, True), leaf.key: (True, True),
+        })
+
+    assert [row[1].provider_id for row in plans[0]] == ["v76", "v70"]
+    assert any("moved 1 clip(s)" in note for note in notes[0])
+    assert not any("borrowed" in w for w in warnings)
+
+
+def test_a_run_the_screen_named_no_subject_for_is_left_alone(monkeypatch):
+    """`subj` defaults false, and a topic that is a process answers false
+    throughout. Neither is evidence the opening is wrong."""
+    latte = _described(70, "pouring-milk-for-a-perfect-cafe-latte")
+    pipe = _described(72, "close-up-of-jumping-spider-on-outdoor-pipe")
+    plans = {
+        0: [(14.7, latte, "pouring milk into glass")],
+        1: [(8.7, pipe, "jumping spider with babies")],
+    }
+    notes, warnings = _screen_opening(monkeypatch, plans,
+                                      [_milk_beat(), _spider_beat()], {
+        latte.key: (True, False), pipe.key: (True, False),
+    })
+
+    assert [row[1].provider_id for row in plans[0]] == ["v70"]
+    assert not any("first frame" in note for note in notes.get(0, []))
+    assert not any("beat 0" in w for w in warnings), warnings
+
+
+def test_a_rejected_subject_clip_is_never_moved_to_the_front(monkeypatch):
+    """A reject put first would still be placed last - pass 2 reads
+    `rejected_keys` run-wide - and un-rejecting it here would un-reject it on
+    every beat that turned it down. So the opening says it is off-subject
+    instead of pretending to have fixed it."""
+    latte = _described(70, "pouring-milk-for-a-perfect-cafe-latte")
+    hunting = _described(77, "close-up-of-spider-eating-prey")
+    leaf_litter = _described(78, "forest-leaf-litter-close-up")
+    plans = {
+        0: [(14.7, latte, "pouring milk into glass")],
+        1: [(8.7, hunting, "jumping spider with babies"),
+            (8.7, leaf_litter, "jumping spider with babies")],
+    }
+    rejected_keys: set[str] = set()
+    monkeypatch.setattr(visuals, "llm_screen", _screen_by_key({
+        latte.key: (True, False), hunting.key: (False, True),
+        leaf_litter.key: (True, False),
+    }))
+    warnings = []
+    visuals._screen_beats(
+        plans, [_milk_beat(), _spider_beat()], _SPIDER_TOPIC,
+        [_query_aware_provider({})(session=None)], _retry_settings(),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, warnings,
+        rejected_keys,
+    )
+
+    assert [row[1].provider_id for row in plans[0]] == ["v70"]
+    assert hunting.key in rejected_keys
+    assert any("beat 0" in w and "approved no clip" in w for w in warnings), warnings
+
+
 def test_a_beat_no_provider_answered_still_reaches_the_neutral_shot(monkeypatch):
     """"beat 8 had 0 hits and its 7.0s was absorbed by beat 7."
 
@@ -3226,6 +3408,18 @@ def test_the_prompt_tells_the_model_which_half_to_shoot():
     """The warning notices the failure; the prompt is what prevents it."""
     assert "never the comparison" in visuals._QUERY_PROMPT_TEMPLATE
     assert "tin can" in visuals._QUERY_PROMPT_TEMPLATE
+
+
+def test_the_prompt_puts_the_subject_on_the_first_frame():
+    """"The milk in your fridge has less protein than a spider's" was searched
+    as milk on 3 of 4 tries, because "than" was not a tell and the sentence
+    names the milk first. Replayed with these rules, 3 of 3 asked for the
+    spider - on a line the prompt does not quote, so it was not reading the
+    answer back."""
+    prompt = visuals._QUERY_PROMPT_TEMPLATE
+    assert '"than"' in prompt
+    assert "Beat 0" in prompt and "cover" in prompt
+    assert "spider" not in prompt.lower()
 
 
 # ---------------------------------------------------------------------------

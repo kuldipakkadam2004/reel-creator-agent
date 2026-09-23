@@ -686,8 +686,8 @@ A good query names something a camera can actually point at: a place, an object,
 a person doing something, a material, a weather condition. It is 2 to 5 words, \
 with no punctuation, no camera directions, no abstractions such as "success" or \
 "innovation", and no words that only make sense as metaphor. When the narration \
-compares one thing to another, the query names the thing being described, never \
-the thing it is being compared to.
+compares one thing to another, the query names whichever of the two the video \
+is about, never the thing it is being measured against.
 
 You always return valid JSON and nothing else."""
 
@@ -720,11 +720,23 @@ so it must carry enough of the subject to land in the right world on its own. \
 Any word that means something different in another setting has to be pinned \
 down in the query itself. For a video about the ocean, "salt crystals" returns \
 a kitchen worktop; "sea salt crystals" returns the coast.
-- A beat that describes one thing by comparing it to another is still about \
-the first thing. Shoot the subject, never the comparison. "Enough to crush a \
-submarine like a tin can" is a shot of a submarine or the crushing deep, not a \
-shot of a tin can; "clouds like cotton wool" is a shot of clouds. The words \
-"like", "as if", "as though" and "the size of" are the tell.
+- A beat that compares two things is about whichever of them the video is \
+about, and that is not always the one the sentence names first. Shoot the \
+video's subject, never the comparison. "Enough to crush a submarine like a \
+tin can" is a shot of a submarine or the crushing deep, not a shot of a tin \
+can; "clouds like cotton wool" is a shot of clouds. The words "like", "as \
+if", "as though" and "the size of" are the tell, and so are "than" and \
+"would need".
+- A line addressed to the viewer often puts their own everyday thing first \
+and the video's subject second, purely for scale. In a video about the \
+ironclad beetle, "Your bones would need to support forty space shuttles to \
+be this tough" is a shot of the beetle - not of a space shuttle, and not of \
+a skeleton. The viewer's thing is the yardstick, not the picture.
+- Beat 0 is the first frame of the video and the frame its cover is taken \
+from, so its query always names the video's subject, the thing the topic \
+line is about, even when the words of beat 0 are about something else. A \
+viewer deciding whether to stop scrolling sees that shot before they have \
+heard the comparison that would explain it.
 - "alt" is a second query for the same shot, used when the first finds \
 nothing. Simpler, but still in the right world: widening by deleting the \
 subject is exactly what puts an office worker under narration about the \
@@ -3372,7 +3384,117 @@ def _screen_beats(
                else "a contradicting one")
         )
 
+    _open_on_the_subject(plans, beats, settings, state, screened_keys,
+                         rejected_keys, subject_keys, notes, warnings)
     return notes
+
+
+def _open_on_the_subject(
+    plans: dict[int, list[tuple[float, Candidate, str]]], beats: list[Beat],
+    settings: dict, state: "_RunState", screened_keys: set[str],
+    rejected_keys: set[str], subject_keys: set[str],
+    notes: dict[int, list[str]], warnings: list[str],
+) -> None:
+    """Put the video's subject in front of the opening beat's footage.
+
+    The spider reel of 2026-09-22 opened on "The milk in your fridge has less
+    protein than a spider's." Step 4 searched "pouring milk into glass", the
+    screen kept all six milk clips - rightly, on the line's own words - and
+    both opening shots were milk poured into coffee. The cover is taken from
+    the shots under the hook card, so it was a latte too, on a reel about
+    spiders. The screen had answered the question that would have caught it:
+    `subj` is false on every one of those clips. Nothing asked.
+
+    Every other beat is judged against its line, and should be. This one is
+    also the first frame and the cover, which is where a viewer decides what
+    the video is about before hearing a word of the comparison that justifies
+    the milk. So here only, footage of the subject goes first:
+
+      1. the beat's own approved clips that show the subject, then
+      2. approved subject clips another beat has to spare - past the number
+         that beat will place - to fill the rest of the opening's slots, and
+      3. only when the opening would otherwise hold no subject at all, one
+         clip another beat was counting on. The first frame is worth that;
+         the second shot is not.
+
+    The beat's own footage stays behind them, so a failed download still
+    leaves it something that matches the line. Only clips the screen approved
+    are moved: pass 2 reads `rejected_keys` run-wide, so a reject put first
+    here would still be placed last, and un-rejecting one would un-reject it
+    on every beat that turned it down.
+
+    Nothing happens without `subj` answers. They default to false, and a
+    topic with no single subject answers false throughout, so a run the
+    screen could not name a subject for is left exactly as it was.
+    """
+    if not beats or not subject_keys:
+        return
+    opening = min(beats, key=lambda b: b.index)
+    rows = plans.get(opening.index) or []
+
+    def approved(row) -> bool:
+        key = row[1].key
+        return (key in screened_keys and key not in rejected_keys
+                and key not in state.taken_keys)
+
+    want = _assets_wanted(opening, settings)
+    own = [row for row in rows if approved(row) and row[1].key in subject_keys]
+
+    spare: list[tuple[float, Candidate, str]] = []
+    needed: list[tuple[float, Candidate, str]] = []
+    seen = {row[1].key for row in rows}
+    if len(own) < want:
+        for beat in sorted(beats, key=lambda b: b.index):
+            if beat.index == opening.index:
+                continue
+            theirs = [row for row in plans.get(beat.index) or [] if approved(row)]
+            for position, row in enumerate(theirs):
+                key = row[1].key
+                if key not in subject_keys or key in seen:
+                    continue
+                seen.add(key)
+                if position >= _assets_wanted(beat, settings):
+                    spare.append(row)
+                else:
+                    needed.append(row)
+    borrowed = spare[:want - len(own)]
+    if not own and not borrowed:
+        borrowed = needed[:1]
+
+    lead = own + borrowed
+    if not lead:
+        warnings.append(
+            f"beat {opening.index} ({opening.query!r}): the opening shot does "
+            f"not show the video's subject, and the screen approved no clip "
+            f"anywhere in the run that does - the first frame and the cover "
+            f"will show something else"
+        )
+        return
+    lead_keys = {row[1].key for row in lead}
+    reordered = lead + [row for row in rows if row[1].key not in lead_keys]
+    if [row[1].key for row in reordered] == [row[1].key for row in rows]:
+        return
+    plans[opening.index] = reordered
+
+    if not borrowed:
+        notes.setdefault(opening.index, []).append(
+            f"moved {len(own)} clip(s) of the video's subject to the front: "
+            f"this beat is the first frame and the cover"
+        )
+        return
+    notes.setdefault(opening.index, []).append(
+        f"opened on {len(borrowed)} clip(s) of the video's subject from later "
+        f"beats, ahead of this beat's own: of what the screen kept for "
+        f"{opening.query!r}, {len(own)} show the subject, and this beat is "
+        f"the first frame and the cover"
+    )
+    found = ("footage of the line but none of the video's subject" if not own
+             else f"{len(own)} clip(s) of the video's subject for {want} slot(s)")
+    warnings.append(
+        f"beat {opening.index} ({opening.query!r}): the query found {found}, "
+        f"so the opening plays {len(borrowed)} subject clip(s) borrowed from "
+        f"later in the run"
+    )
 
 
 @dataclass
