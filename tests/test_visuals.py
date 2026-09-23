@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 from hashlib import sha1
 from pathlib import Path
@@ -1043,10 +1044,12 @@ def test_the_subject_is_salvaged_before_the_neutral_shot(monkeypatch):
     plans = {0: [(9.0, standing, "bison wallow with water")]}
     warnings = []
     rejected_keys = set()
+    salvaged_keys = {}
     notes = visuals._screen_beats(
         plans, [wallow], "how bison help restore a natural landscape",
         [provider], _retry_settings(), visuals.UsageLedger(), "run",
         visuals._RunState(), {}, warnings, rejected_keys,
+        salvaged_keys=salvaged_keys,
     )
 
     placed = [row[1].provider_id for row in plans[0]]
@@ -1055,10 +1058,12 @@ def test_the_subject_is_salvaged_before_the_neutral_shot(monkeypatch):
     )
     assert any("salvaged" in note for note in notes[0])
     assert any("subject but not the action" in w for w in warnings)
-    # And it must stop reading as a reject, or pass 2 places it with the
-    # "nothing else could be downloaded" warning - the wrong sentence for a
-    # clip chosen deliberately.
-    assert standing.key not in rejected_keys
+    # It must stop reading as a reject on this beat, or pass 2 places it with
+    # the "nothing else could be downloaded" warning - the wrong sentence for
+    # a clip chosen deliberately. On this beat only: the run-wide set still
+    # holds it, for every other beat that turned it down.
+    assert salvaged_keys == {0: {standing.key}}
+    assert standing.key in rejected_keys
 
 
 def test_salvage_never_fires_on_a_clip_the_screen_did_not_call_the_subject(
@@ -1127,13 +1132,17 @@ def _spider_beat():
 
 
 def _screen_by_key(verdicts_by_key):
-    """A screen answering each clip by key: `{key: (ok, subj)}`."""
+    """A screen answering each clip by key: `{key: (ok, subj)}`.
+
+    A clip not named is kept and is not the subject, which is what the filler
+    beats of an end-to-end run want.
+    """
     def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
         verdicts = {}
         for index, candidates in shortlists.items():
             verdicts[index] = {}
             for position, candidate in enumerate(candidates):
-                ok, subj = verdicts_by_key[candidate.key]
+                ok, subj = verdicts_by_key.get(candidate.key, (True, False))
                 verdicts[index][position] = (ok, "" if ok else "wrong thing")
                 if subj and subject_keys is not None:
                     subject_keys.add(candidate.key)
@@ -1278,6 +1287,79 @@ def test_a_rejected_subject_clip_is_never_moved_to_the_front(monkeypatch):
     assert [row[1].provider_id for row in plans[0]] == ["v70"]
     assert hunting.key in rejected_keys
     assert any("beat 0" in w and "approved no clip" in w for w in warnings), warnings
+
+
+def test_a_clip_salvaged_for_one_beat_stays_rejected_on_the_others(
+    sandbox, monkeypatch, one_shot_beats
+):
+    """The spider reel's beat 5, end to end.
+
+    Beat 3 kept nothing and salvaged every clip the screen had called the
+    subject. That used to take them out of the run-wide `rejected_keys`, so
+    beat 5 - whose own screen had rejected "close up of spider on dewy web" by
+    name - read it as a keeper, placed it the moment its real keepers ran out,
+    and said nothing. Here beat 1 salvages, and beat 2 is the one that turned
+    `dew` down: when beat 2's keeper fails it must go to its neutral shot, not
+    to the clip it rejected.
+    """
+    opening = _described(80, "jumping-spider-close-up")
+    wrong = _described(81, "spider-web-weaving")
+    salvaged = _described(82, "spider-eating-prey")
+    keeper = _described(83, "spiderlings-on-a-leaf")
+    dew = _described(84, "close-up-of-spider-on-dewy-web")
+    neutral = _described(85, "forest-undergrowth-close-up")
+    served = {"q0": [opening], "q1": [wrong, salvaged], "q2": [keeper, dew],
+              "neutral": [neutral]}
+    fillers: dict[str, list] = {}
+
+    class PerBeatProvider(visuals.Provider):
+        name = "stub"
+        kinds = ("video",)
+        key_env = ()
+        attribution_required = False
+
+        def search(self, query, kind, limit):
+            if query in served:
+                return list(served[query])
+            if not re.fullmatch(r"q\d+", query):
+                return []
+            number = 90 + int(query[1:])
+            return fillers.setdefault(query, [_described(number, f"filler-{number}")])
+
+    def queries(beats, topic, mode):
+        for beat in beats:
+            beat.query = f"q{beat.index}"
+            beat.alt_queries = ()
+            beat.neutral_query = "neutral" if beat.index == 2 else ""
+        return []
+
+    monkeypatch.setattr(visuals, "_PROVIDERS", {"stub": PerBeatProvider})
+    monkeypatch.setattr(visuals, "build_queries", queries)
+    monkeypatch.setattr(visuals, "llm_screen", _screen_by_key({
+        opening.key: (True, True),
+        wrong.key: (False, False), salvaged.key: (False, True),
+        keeper.key: (True, False), dew.key: (False, True),
+    }))
+    sandbox.routes[keeper.download_url] = FakeResponse(404, body=b"gone")
+
+    manifest = run_visuals(relevance_mode="llm", assets_per_beat=1,
+                           topic=_SPIDER_TOPIC)
+
+    def placed(beat_index):
+        return {manifest["assets"][i]["source_url"]
+                for i in manifest["beats"][beat_index]["asset_indexes"]}
+
+    # Every beat sourced something. A provider that raises is swallowed into a
+    # warning, and this test would otherwise pass on an empty run.
+    assert all(beat["asset_indexes"] for beat in manifest["beats"]), (
+        manifest["warnings"]
+    )
+    assert any("salvaged" in note for note in manifest["beats"][1]["notes"])
+    assert salvaged.source_url in placed(1)
+    assert dew.source_url not in placed(2), (
+        "beat 2 placed a clip its own screen rejected, because beat 1 salvaged it"
+    )
+    assert neutral.source_url in placed(2)
 
 
 def test_a_beat_no_provider_answered_still_reaches_the_neutral_shot(monkeypatch):

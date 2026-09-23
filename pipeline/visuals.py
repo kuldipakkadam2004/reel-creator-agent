@@ -3029,6 +3029,7 @@ def _screen_beats(
     rejected_keys: set[str] | None = None,
     screened_keys: set[str] | None = None,
     subject_keys: set[str] | None = None,
+    salvaged_keys: dict[int, set[str]] | None = None,
 ) -> dict[int, list[str]]:
     """Check every beat's shortlist against its narration, in one pass.
 
@@ -3073,6 +3074,11 @@ def _screen_beats(
     # set is to let one beat reach a clip another beat found and turned down.
     if subject_keys is None:
         subject_keys = set()
+    # Rejects a beat salvaged on purpose, keyed by that beat and no other. See
+    # the salvage step below for why this cannot simply be `rejected_keys`
+    # with the salvaged clips taken out.
+    if salvaged_keys is None:
+        salvaged_keys = {}
     by_index = {b.index: b for b in beats}
 
     #: How many clips a beat is actually trying to fill. The first screen cared
@@ -3328,12 +3334,21 @@ def _screen_beats(
                         seen_here.add(key)
                         salvage.append(row)
         if salvage:
-            # The run has decided these are acceptable footage, so they must
-            # stop reading as rejects downstream - pass 2 classifies a beat's
-            # rows against `rejected_keys` and would otherwise place one with
-            # the "nothing else could be downloaded" warning, which is exactly
-            # the wrong sentence for a clip chosen on purpose.
-            rejected_keys.difference_update(seen_here)
+            # This beat has decided these are acceptable footage, so here they
+            # must stop reading as rejects - pass 2 classifies a beat's rows
+            # against `rejected_keys` and would otherwise place one with the
+            # "nothing else could be downloaded" warning, which is exactly the
+            # wrong sentence for a clip chosen on purpose.
+            #
+            # Here, and nowhere else. This used to take them out of
+            # `rejected_keys` itself, which is run-wide, so a clip salvaged for
+            # one beat became a keeper on every beat that had turned it down.
+            # On the spider reel of 2026-09-22 beat 3 salvaged twelve subject
+            # clips, and beat 5 then shipped one of them - "close up of spider
+            # on dewy web" - that its own screen had rejected by name: *shows
+            # dew on web, not droplet from spider*. Nothing warned, because by
+            # then nothing on record said it was a reject.
+            salvaged_keys.setdefault(beat.index, set()).update(seen_here)
             plans[beat.index] = salvage + plans.get(beat.index, [])
             notes.setdefault(beat.index, []).append(
                 f"salvaged {len(salvage)} clip(s) the screen marked as the "
@@ -4002,6 +4017,7 @@ def source_visuals(
     rejected_keys: set[str] = set()
     screened_keys: set[str] = set()
     subject_keys: set[str] = set()
+    salvaged_keys: dict[int, set[str]] = {}
     unjudged_keys: set[str] = set()
     assets: list[dict] = []
     beat_records: list[dict] = []
@@ -4031,6 +4047,7 @@ def source_visuals(
     screen_notes = _screen_beats(
         plans, beats, topic, active, settings, ledger, run_id, state,
         rejections, warnings, rejected_keys, screened_keys, subject_keys,
+        salvaged_keys,
     )
 
     # The screen has already handed whole beats to the neutral shot, and those
@@ -4073,7 +4090,10 @@ def source_visuals(
                 continue
 
             want = _assets_wanted(beat, settings)
-            rejects = [r for r in ranked if r[1].key in rejected_keys]
+            # A reject stays a reject on every beat but the one that salvaged
+            # it - see the salvage step in `_screen_beats`.
+            rejected_here = rejected_keys - salvaged_keys.get(beat.index, set())
+            rejects = [r for r in ranked if r[1].key in rejected_here]
             if screened_keys:
                 # The screen only ever judged the shortlist. What sits below it
                 # is not approved footage, it is unjudged footage, and walking
@@ -4081,15 +4101,15 @@ def source_visuals(
                 # walking into the rejects.
                 keepers = [r for r in ranked
                            if r[1].key in screened_keys
-                           and r[1].key not in rejected_keys]
+                           and r[1].key not in rejected_here]
                 unscreened = [r for r in ranked
                               if r[1].key not in screened_keys
-                              and r[1].key not in rejected_keys]
+                              and r[1].key not in rejected_here]
             else:
                 # No screen ran at all (mode "off", or it said nothing about
                 # any beat). Then unjudged is all there is, and holding it back
                 # would leave every beat empty.
-                keepers = [r for r in ranked if r[1].key not in rejected_keys]
+                keepers = [r for r in ranked if r[1].key not in rejected_here]
                 unscreened = []
             unscreened_keys = {r[1].key for r in unscreened}
             unjudged_keys.update(unscreened_keys)
@@ -4225,7 +4245,7 @@ def source_visuals(
                 and row[1].key not in state.failed_keys
                 # The headroom top-up pulls extra shots from here, so rejected
                 # footage must not sit in it waiting to be picked up as filler.
-                and row[1].key not in rejected_keys
+                and row[1].key not in rejected_here
             ]
             # A spare is on screen exactly as long as a planned shot, so the
             # top-up spends what the screen approved before it reaches what the
