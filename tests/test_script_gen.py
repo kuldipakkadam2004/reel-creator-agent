@@ -1362,16 +1362,99 @@ def test_the_prompt_asks_for_the_component_the_scorer_pays_most_for():
     long time nothing in the prompt asked for it: 10 of the 135 candidates on
     disk put the viewer in the sentence, and 4 of those 10 won their script -
     a 40% win rate against a field of 16%. The scorer cannot choose what it is
-    never shown, so the ask and the weight have to move together."""
-    assert '"you", "your"' in script_gen._HOOK_PROMPT_TEMPLATE
+    never shown, so the ask and the weight have to move together.
+
+    Since 2026-09-29 the scorer pays for a "you" only when the line points at
+    the screen, so that is what the prompt has to ask for: asking for the kind
+    it refunds would fill the field with lines built to lose."""
+    template = script_gen._HOOK_PROMPT_TEMPLATE
+    assert '"you" together with "this"' in template
+    assert '"you are looking at"' in template
+    assert "something they stand on, breathe, own" not in template
 
     plain = script_gen.score_hook("Rain carries salt from the rocks to the sea.")
-    viewer = script_gen.score_hook("Rain carries salt from the rocks to your sea.")
+    viewer = script_gen.score_hook("Rain carries salt from the rocks to this sea you swim in.")
     figure = script_gen.score_hook("Rain carries 50 tonnes of salt to the sea.")
 
     assert viewer["score"] - plain["score"] > figure["score"] - plain["score"], (
         "the prompt asks for a viewer because the scorer pays more for one "
         "than for a number - re-read the ask if that stops being true")
+
+
+# --- a "you" that points at nothing on screen ------------------------------
+
+@pytest.mark.parametrize("shipped, passed_over", [
+    # glacial till, 2026-09-28: 0.22 of the reel watched
+    ("Your front yard might be a crime scene from the Ice Age.",
+     "This boulder doesn't belong here; it came from a hundred miles away."),
+    # jumping spider, 2026-09-22: 0.25
+    ("The milk in your fridge has less protein than a spider's.",
+     "This spider feeds its babies milk that it lays like an egg."),
+    # Crescent City tsunami, 2026-09-21: 0.17
+    ("The ground you are standing on is younger than the trees.",
+     "Every few decades, the ocean floor washes ashore right here."),
+])
+def test_a_you_that_points_at_nothing_on_screen_no_longer_wins(shipped, passed_over):
+    """Three shipped openers, each against the subject line it beat.
+
+    Every one of the seven "your X" openers posted after the ripples reel had
+    a line like the second in its field and won on the "you" alone. None held
+    past 0.35 of the reel; the openers that pointed at the screen are the
+    account's biggest reels.
+    """
+    assert (script_gen.score_hook(passed_over)["score"]
+            > script_gen.score_hook(shipped)["score"])
+    assert script_gen.HOOK_OFF_SCREEN in script_gen.score_hook(shipped)["components"]
+
+
+@pytest.mark.parametrize("line", [
+    "You are looking at a two-hundred-ton rock that floated.",           # Nepal, 1081
+    "You can’t run your fingers through this sand.",                     # ripples, 1852
+    "This much pressure would shatter your thumbnail; the beetle is fine.",  # beetle, 704
+    "You're watching the Rockies get rebuilt in the Gulf of Mexico.",
+])
+def test_a_you_that_points_at_the_screen_keeps_its_credit(line):
+    """The three openers that broke out all say "you" and all point at the
+    footage - the change must not touch any of them. The curly apostrophe is
+    how the ripples line actually came back from the model."""
+    components = script_gen.score_hook(line)["components"]
+    assert components["second person"] == 1.0
+    assert script_gen.HOOK_OFF_SCREEN not in components
+
+
+def test_the_charge_gives_back_exactly_what_the_you_collected():
+    """A refund, not a penalty: the line ends where it would have with no
+    "you" in it. An opener starting "Your" gives back the strong opener too,
+    because that 0.8 was paid for the same word."""
+    opening = script_gen.score_hook("Your own cat's family tree just grew a new branch.")
+    parts = opening["components"]
+    assert parts[script_gen.HOOK_OFF_SCREEN] == -(parts["second person"]
+                                                  + parts["strong opener"])
+
+    midline = script_gen.score_hook(
+        "In old London, the air was a poison you could actually taste.")
+    assert midline["components"][script_gen.HOOK_OFF_SCREEN] == -1.0
+
+
+def test_second_person_still_fires_on_every_you():
+    """The performance ledger has recorded `second person` on any "you" since
+    the first reel. Withholding it instead of charging for it would have
+    changed what that column means halfway down the file."""
+    components = script_gen.score_hook(
+        "Your body has a biological circuit breaker for absolute terror."
+    )["components"]
+    assert "second person" in components
+    assert "strong opener" in components
+
+
+@pytest.mark.parametrize("line", [
+    "Your kitchen holds a mineral that formed inside a volcano.",
+    "Scientists looking at the seafloor found something your eyes cannot.",
+])
+def test_that_and_a_bare_looking_at_do_not_count_as_pointing(line):
+    """"That" is a conjunction far more often than it points, and "looking at"
+    without "you are" is somebody else looking."""
+    assert script_gen.HOOK_OFF_SCREEN in script_gen.score_hook(line)["components"]
 # --- the hook against the body it is joined to -----------------------------
 
 def test_a_hook_the_body_repeats_is_charged_for_it():
@@ -1521,16 +1604,20 @@ def test_the_setup_then_turn_is_no_longer_buried():
     assert "turns on itself" in turn["components"]
 
 
-def test_a_question_answered_in_the_same_breath_beats_a_flat_fact():
-    # Both are real candidates from the sleep reel. The second person and the
-    # concrete comparison used to lose to the sentence penalty.
+def test_a_question_answered_in_the_same_breath_is_not_charged_as_two_sentences():
+    # A real candidate from the sleep reel. It used to lose to the sentence
+    # penalty, and that penalty no longer touches it. It used to beat "We are
+    # getting less sleep than our Stone Age ancestors did." as well, and since
+    # 2026-09-29 it does not: "your six hours" points at nothing on screen, so
+    # its 1.8 of direct address is given back. See
+    # test_a_you_that_points_at_nothing_on_screen_no_longer_wins.
     asked = script_gen.score_hook(
         "Your six hours of sleep? That's barely half what a gorilla gets."
     )
-    stated = script_gen.score_hook(
-        "We are getting less sleep than our Stone Age ancestors did."
-    )
-    assert asked["score"] > stated["score"]
+    assert "more than one sentence" not in asked["components"]
+    assert "more than two sentences" not in asked["components"]
+    assert "a number" in asked["components"]
+    assert asked["score"] > 0
 
 
 def test_a_trailing_clause_is_not_a_turn():
@@ -2569,7 +2656,9 @@ def _staged_gemini(monkeypatch, calls: list[str]):
     same as the incumbent, and reject it - which is a pass doing nothing while
     looking like a pass doing its job.
     """
-    hook = "Rain is the reason your ocean tastes of salt."
+    # Points at the screen, so the pass still picks it over the incumbent now
+    # that a "you" aimed at nothing on screen is refunded.
+    hook = "Rain is the reason this ocean you swim in tastes of salt."
     rewritten = (
         f"{hook} "
         "Rivers pick up minerals as they run. "
@@ -2631,7 +2720,7 @@ def test_a_disobedient_rewrite_cannot_cost_the_script_its_bridge(monkeypatch):
     The shipped reel that proved it opened on a concrete sarcophagus, lost the
     bridge that set up its rebuttal, and said "Not even close." to nothing.
     """
-    hook = "Rain is the reason your ocean tastes of salt."
+    hook = "Rain is the reason this ocean you swim in tastes of salt."
     bridge = "And that rain is only the start of it."
 
     def dispatch(prompt, **kwargs):

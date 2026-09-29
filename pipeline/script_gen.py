@@ -602,6 +602,16 @@ You always return valid JSON and nothing else."""
 #: buys 1.0 and spends more than that on sounding like an advert. Asking every
 #: line for it would also flatten the field on the one component that most
 #: often separates it.
+#:
+#: What it asks for changed on 2026-09-29. It used to ask for "something they
+#: stand on, breathe, own or are made of", and it got exactly that: "The ground
+#: you walk on / are standing on" opened three reels, then came "your fridge",
+#: "your car", "your front yard". None of the openers that pointed the viewer
+#: at their own world held an audience, and the two "you" openers that pointed
+#: at the screen are the account's two biggest reels. `score_hook` now pays for the "you"
+#: only alongside "this", "these", "here" or "you are looking at", so the ask
+#: names those - a prompt asking for the kind the scorer refunds would fill
+#: the field with lines built to lose.
 _HOOK_PROMPT_TEMPLATE = """\
 Topic of the video: {topic}
 
@@ -619,11 +629,14 @@ Rules for every line:
 - It is spoken aloud, so write it for the ear.
 - Be concrete: a number, an image, a named thing, a claim that sounds wrong \
 until it is explained. Something the viewer can picture or check.
-- One or two of the {count} lines should put the viewer inside the fact: \
-"you", "your", or something they stand on, breathe, own or are made of. Not \
-as an address - "have you ever" is throat-clearing and banned below - but as \
-the sentence's subject. Only where the material takes it honestly; a "you" \
-bolted onto a fact about somewhere else is worse than none.
+- One or two of the {count} lines should put the viewer in front of what the \
+first shot shows, which is the subject itself: "you" together with "this", \
+"these" or "here", or "you are looking at". Never open on something from the \
+viewer's own life instead - their fridge, their car, their front yard, the \
+ground they stand on. That points them away from the screen in the one second \
+that decides whether they stay. A comparison to their world can follow the \
+subject, never lead it. And not as an address either: "have you ever" is \
+throat-clearing and banned below.
 - No throat-clearing. Never open with "in this video", "have you ever", \
 "did you know", "let me tell you", "imagine if", "welcome to" or "today".
 - No hype adjectives: amazing, incredible, mind-blowing, insane, crazy.
@@ -671,6 +684,30 @@ _HOOK_STRONG_OPENERS = (
     "you", "your", "there is", "there are", "it took", "every", "scientists",
     "we", "they", "this",
 )
+
+#: The strong openers that are direct address. A line opening on one of these
+#: collects the strong opener's 0.8 for the same "you" that `second person`
+#: pays 1.0 for, which is why `HOOK_OFF_SCREEN` gives both back together.
+_HOOK_ADDRESS_OPENERS = ("you", "your")
+
+#: Words that point at the footage. A hook is spoken over the first shot, and
+#: since 2adb858 that shot is the subject, so "this", "these", "here" and "you
+#: are looking at" are the viewer being shown the thing the reel is about.
+#:
+#: "That" is left out on purpose. It is a conjunction or a relative pronoun far
+#: more often than it points ("the milk that...", "so heavy that..."), and
+#: counting it would hand the credit back to most of the lines it is withheld
+#: from. "Looking at" and "watching" count only after "you are", because on
+#: their own they describe someone else looking.
+_HOOK_ON_SCREEN_RE = re.compile(
+    r"\b(?:this|these|here)\b|\byou(?:\s+are|['’]re)\s+(?:looking\s+at|watching)\b",
+    re.IGNORECASE,
+)
+
+#: The component that takes direct address back when it points at nothing on
+#: screen. Public because the performance ledger has to know it is newer than
+#: the rows already in the file - see `perform._COMPONENTS_SINCE`.
+HOOK_OFF_SCREEN = "points the viewer off screen"
 
 _HOOK_NUMBER_RE = re.compile(r"\b\d")
 
@@ -1029,14 +1066,57 @@ def score_hook(text: str, *, max_words: int | None = None,
     if says_a_number(clean):
         parts["a number"] = 0.8
 
-    # Direct address. "You" makes the line about the viewer rather than about
-    # the subject, which is most of what stops a scroll.
+    # Direct address. Recorded on any "you", and kept only where the line also
+    # points at the screen - see the charge two rules down.
     if any(word.lower() in ("you", "your", "you're", "youre") for word in words):
         parts["second person"] = 1.0
 
     if "throat-clearing" not in parts:
         if any(lowered.startswith(opener + " ") for opener in _HOOK_STRONG_OPENERS):
             parts["strong opener"] = 0.8
+
+    # A "you" that points at nothing on screen gives its credit back.
+    #
+    # The 1.0 above was paid on the reasoning that "you" makes the line about
+    # the viewer, and the first reels to find an audience seemed to bear it
+    # out: "You are looking at a two-hundred-ton rock that floated" (0.55 of
+    # the reel watched, 1081 reached) and "You can't run your fingers through
+    # this sand" (0.50, 1852). Both point at the footage. The nine reels after
+    # them mostly opened on the viewer's own things instead - "Your front yard
+    # might be a crime scene from the Ice Age", "The milk in your fridge has
+    # less protein than a spider's" - and not one held past 0.35 or reached
+    # past 156. On each of the seven "your X" openers the pass had also written
+    # a line about the subject, and this scorer ranked it lower. A line
+    # starting "Your" collected the 1.0 and the strong opener's 0.8, a full
+    # point ahead of "This boulder doesn't belong here" before either had said
+    # anything.
+    #
+    # Across the posted reels that reached 30 accounts, openers pointing at the
+    # screen held a median 0.42 against 0.22. That is seven a side, sorted
+    # after the numbers were in, and tangled up with topic (p 0.07). The
+    # within-run half does not depend on it: the better line was being written
+    # and turned down. Replayed over the 16 fields on disk since the prompt
+    # began asking for a "you", with the scriptwriter's own opening competing
+    # as it does here, 10 picks change - 7 of the 9 after the ripples reel -
+    # and none of the three that broke out. Five of the ten go back to the
+    # scriptwriter's line, among them the Apollo opening whose swap had
+    # deleted the only sentence naming the astronauts.
+    #
+    # Charged as its own component rather than the credits being withheld, so
+    # that `second person` and `strong opener` still mean on this run what
+    # they meant on every row already in the performance ledger, and so the
+    # readout says why the line lost.
+    #
+    # It cannot see order. "Your car weighs two tons; this single rock weighs
+    # fifteen" keeps its credit for the "this" in its second half. The prompt
+    # asks for the subject to lead, but that rests on one reel (0.25 against
+    # the Nepal reel's 0.55 on nearly the same topic), too little to score.
+    if "second person" in parts and not _HOOK_ON_SCREEN_RE.search(clean):
+        refund = parts["second person"]
+        if "strong opener" in parts and any(
+                lowered.startswith(opener + " ") for opener in _HOOK_ADDRESS_OPENERS):
+            refund += parts["strong opener"]
+        parts[HOOK_OFF_SCREEN] = -refund
 
     # A capitalised word that does not open a sentence is a named thing - a
     # place, a person, a product. Specific by construction.

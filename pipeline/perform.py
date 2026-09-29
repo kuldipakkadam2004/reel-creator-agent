@@ -68,6 +68,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
+from pipeline import script_gen  # noqa: E402
 from pipeline import visuals  # noqa: E402
 
 #: Bumped when the shape of a features row changes. Old rows are kept and read
@@ -111,7 +112,14 @@ from pipeline import visuals  # noqa: E402
 #: the only column that separates the two reels step 5b graded 1/3 from the one
 #: it graded 2. An older row cannot answer it: the count exists in manifests
 #: going back only as far as the counter, and "no such column" is not "none".
-FEATURES_VERSION = 7
+#: 8 is the first version whose hook can carry `script_gen.HOOK_OFF_SCREEN`,
+#: the charge that takes back a "you" pointing at nothing on screen. Nothing
+#: about the row's shape changed, only what one column can hold, so it is
+#: gated by name in `_COMPONENTS_SINCE` rather than by column. An older row
+#: was scored by a scorer that never asked, so "absent" there is not "the
+#: opener pointed at the screen" - most of the openers it was written for are
+#: in those rows.
+FEATURES_VERSION = 8
 
 #: 2 adds `watch_ratio` and the `measurements` history, and both are derived
 #: for rows already in the file rather than left blank - the numbers needed
@@ -302,6 +310,14 @@ _COMPONENT_KINDS = (
     # people" is asked exactly like "did the reels tagged #ecology".
     ("look", "look_problems"),
 )
+
+#: Component names that joined a column after rows were already being written
+#: into it, and the version from which a row can answer for them. The column
+#: gates above are too coarse for these: a version 7 row has a perfectly good
+#: `hook_components`, it just comes from a scorer that could not fire this one.
+_COMPONENTS_SINCE = {
+    ("hook", script_gen.HOOK_OFF_SCREEN): 8,
+}
 
 
 def _written_since(features: dict, version: int) -> bool:
@@ -1564,6 +1580,9 @@ def facets(features: dict, vocabulary: dict[str, list[str]]) -> list[tuple[str, 
             continue
         fired = {str(name) for name in features.get(key) or []}
         for name in vocabulary.get(kind, ()):
+            since = _COMPONENTS_SINCE.get((kind, name))
+            if since and not _written_since(features, since):
+                continue
             pairs.append((f"{kind}: {name}", "fired" if name in fired else "absent"))
 
     return pairs

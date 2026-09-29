@@ -584,6 +584,44 @@ material the viewer is not standing in, and a `you` reached for where the
 fact has no honest use for one buys 1.0 and spends more than that on sounding
 like an advert.
 
+**The ask worked, and then it was measured, and only half of it was worth
+having.** The two "you" openers that pointed at the screen — *"You are looking
+at a two-hundred-ton rock that floated"*, *"You can't run your fingers through
+this sand"* — are the account's two biggest reels, at 0.55 and 0.50 of the reel
+watched. The prompt had asked for "something they stand on, breathe, own", and
+the nine reels after the second of those mostly opened on exactly that: *the
+ground you are standing on*, *the milk in your fridge*, *your front yard*. Not
+one held past 0.35 or reached past 156 accounts. On each of those seven "your X"
+openers, the pass had also written a line about the subject, and the scorer
+turned it down:
+
+```
+   1.10  Your front yard might be a crime scene from the Ice Age.
+         length +0.4, second person +1, strong opener +0.8,
+         points the viewer off screen -1.8, names something +0.7
+   2.00  This boulder doesn't belong here; it came from a hundred miles away.
+         length +0.4, a number +0.8, strong opener +0.8
+```
+
+That is the scorer today. The reel shipped the first line at 2.90, because
+before `points the viewer off screen` a line starting "Your" collected the 1.0
+*and* the strong opener's 0.8, a full point ahead of "This…" before either had
+said anything. Now a "you" earns its credit only alongside `this`, `these`,
+`here` or `you are looking at`. Without one, the charge gives back exactly what
+the "you" collected. It is a charge rather than a withheld credit so that
+`second person` still means "any you" on every row of the performance ledger;
+the new name is asked only of `FEATURES_VERSION` 8 rows, since an older row was
+scored by a scorer that never asked. Replayed over the 16 hook fields on disk,
+10 picks change, including 7 of the 9 reels after the ripples reel, and none of
+the three that broke out. The prompt now asks for the pointing kind, and says
+a comparison to the viewer's world can follow the subject but never lead it.
+
+The evidence is thin, and it is stated where it is used: across posted reels
+that reached 30 accounts, openers pointing at the screen held a median 0.42
+against 0.22. That is seven reels a side, sorted after the numbers were in, and
+confounded with topic (p 0.07). The part that does not depend on it is the
+within-run comparison: the better line was already being written and losing.
+
 **An opening is not a free-standing sentence — it is the first half of a
 join**, and for a long time nothing here had ever been shown the script. Every
 rule above scores a hook on its own, while `apply_hook` swapped sentence one

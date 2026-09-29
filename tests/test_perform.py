@@ -24,6 +24,7 @@ import pytest  # noqa: E402
 
 import config  # noqa: E402
 from pipeline import perform  # noqa: E402
+from pipeline import script_gen  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +255,23 @@ def test_take_away_components_are_not_asked_of_an_older_row(paths):
                    for q, _ in perform.facets(old, vocabulary))
     assert ("takeaway: puts the viewer in front of it", "fired") in \
         perform.facets(new, vocabulary)
+
+
+def test_the_off_screen_charge_is_not_asked_of_a_row_scored_before_it():
+    """Most of the "your X" openers the charge was written for sit in version 7
+    rows, scored by a scorer that never asked. Reading them as "absent" would
+    put the very reels that motivated it in the arm that pointed at the screen.
+    The column itself is not gated - only the one name that is newer than it."""
+    name = script_gen.HOOK_OFF_SCREEN
+    vocabulary = {"hook": ["second person", name]}
+    old = {**_features("r1", hook_components=("second person",)),
+           "features_version": 7}
+    new = _features("r2", hook_components=("second person", name))
+
+    asked_old = dict(perform.facets(old, vocabulary))
+    assert asked_old["hook: second person"] == "fired"
+    assert f"hook: {name}" not in asked_old
+    assert dict(perform.facets(new, vocabulary))[f"hook: {name}"] == "fired"
 
 
 def test_features_read_the_run_directory_s_manifests(paths, tmp_path):
