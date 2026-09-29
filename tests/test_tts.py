@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -573,3 +574,100 @@ def test_the_voice_settings_come_from_config_not_from_constants():
     assert tts.SPEED == config.TTS_SPEED
     assert tts.SIMILARITY_BOOST == config.TTS_SIMILARITY_BOOST
     assert tts.USE_SPEAKER_BOOST == config.TTS_SPEAKER_BOOST
+
+
+# ---------------------------------------------------------------------------
+# read_balance - what step 8 asks before it spends anything
+# ---------------------------------------------------------------------------
+
+#: The fields /user/subscription returned for this project's key on 2026-09-24,
+#: trimmed to the ones read_balance looks at.
+_SUBSCRIPTION = {
+    "tier": "free",
+    "character_count": 7826,
+    "character_limit": 10000,
+    "can_extend_character_limit": False,
+    "allowed_to_extend_character_limit": False,
+    "next_character_count_reset_unix": 1791932140,
+}
+
+
+@pytest.fixture
+def captured_get(monkeypatch):
+    """Patch requests.get; record the call and return a canned response."""
+    calls = []
+
+    def _install(response):
+        def fake_get(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            if isinstance(response, Exception):
+                raise response
+            return response
+        monkeypatch.setattr(requests, "get", fake_get)
+        return calls
+
+    return _install
+
+
+def test_balance_reads_the_subscription_with_the_project_key(captured_get):
+    calls = captured_get(FakeResponse(200, payload=_SUBSCRIPTION))
+
+    balance = tts.read_balance()
+
+    assert calls[0]["url"].endswith("/user/subscription")
+    assert calls[0]["headers"]["xi-api-key"] == "sk_test_key"
+    assert balance["used"] == 7826
+    assert balance["limit"] == 10000
+    assert balance["remaining"] == 2174
+    assert balance["tier"] == "free"
+    assert balance["resets"] == datetime.fromtimestamp(1791932140).date()
+    assert balance["extendable"] is False
+
+
+def test_balance_is_extendable_only_when_the_plan_offers_it_and_it_is_on(captured_get):
+    offered = {**_SUBSCRIPTION, "can_extend_character_limit": True}
+    captured_get(FakeResponse(200, payload=offered))
+    assert tts.read_balance()["extendable"] is False
+
+    captured_get(FakeResponse(200, payload={
+        **offered, "allowed_to_extend_character_limit": True}))
+    assert tts.read_balance()["extendable"] is True
+
+
+def test_balance_never_goes_negative(captured_get):
+    captured_get(FakeResponse(200, payload={
+        **_SUBSCRIPTION, "character_count": 10040}))
+
+    assert tts.read_balance()["remaining"] == 0
+
+
+def test_balance_without_a_reset_date_still_reads(captured_get):
+    body = {k: v for k, v in _SUBSCRIPTION.items()
+            if k != "next_character_count_reset_unix"}
+    captured_get(FakeResponse(200, payload=body))
+
+    assert tts.read_balance()["resets"] is None
+
+
+def test_balance_refused_is_a_tts_error_carrying_the_message(captured_get):
+    captured_get(FakeResponse(401, payload={"detail": {
+        "status": "missing_permissions",
+        "message": "The API key you used is missing the permission user_read.",
+    }}))
+
+    with pytest.raises(tts.TTSError, match="missing the permission user_read"):
+        tts.read_balance()
+
+
+def test_balance_without_the_counts_is_a_tts_error(captured_get):
+    captured_get(FakeResponse(200, payload={"tier": "free"}))
+
+    with pytest.raises(tts.TTSError, match="without its character counts"):
+        tts.read_balance()
+
+
+def test_balance_unreachable_is_a_tts_error(captured_get):
+    captured_get(requests.exceptions.ConnectionError("no route"))
+
+    with pytest.raises(tts.TTSError, match="Could not reach ElevenLabs"):
+        tts.read_balance()

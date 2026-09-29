@@ -1911,6 +1911,19 @@ RUN_LOG_KEEP_DAYS = get_env_int("RUN_LOG_KEEP_DAYS", 30)
 #: something knowable at second zero.
 REQUIRED_RUN = REQUIRED_SCRIPT_GEN + REQUIRED_TTS
 
+#: ElevenLabs characters the account must have left before a run starts. The
+#: same argument as REQUIRED_RUN, for the balance instead of the key: step 3 is
+#: the first step to ask ElevenLabs for anything, and by then step 0 and step 2
+#: have been paid for in Gemini - on 2026-09-24 that was 19 calls and six
+#: minutes. An empty balance is knowable at second zero.
+#:
+#: 900 is the most any reel has billed (842, of 36 in runs.json on 2026-09-24;
+#: the median is 608) with a little over. Lower it to squeeze a short reel out
+#: of the end of a month, 0 to never ask. A plan that bills past its limit is
+#: never stopped by this, and a balance that cannot be read is a warning: step
+#: 3 still refuses a real shortfall itself, this only refuses it sooner.
+RUN_MIN_TTS_CHARACTERS = get_env_int("RUN_MIN_TTS_CHARACTERS", 900)
+
 
 # --- step 9: how it did -----------------------------------------------------
 # `pipeline/perform.py` records what a reel did once it was posted, and reads

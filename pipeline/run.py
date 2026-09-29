@@ -465,6 +465,38 @@ def _read_insights(record: dict) -> None:
         record["warnings"].append(f"insights: {_one_line(exc)}")
 
 
+def _check_balance(record: dict) -> str:
+    """Stop before step 0 when ElevenLabs cannot pay for the narration.
+
+    The balance guard: see config.RUN_MIN_TTS_CHARACTERS for why it sits here
+    and not at step 3. Returns the reason to stop, or "" to carry on.
+
+    A balance that cannot be read is a warning and never a stop. Step 3 still
+    refuses a real shortfall on its own; this is only there to refuse it before
+    a script has been bought, and a read that failed has learned nothing.
+    """
+    floor = config.RUN_MIN_TTS_CHARACTERS
+    if floor <= 0:
+        return ""
+    try:
+        balance = tts.read_balance()
+    except (tts.TTSError, config.MissingConfigError) as exc:
+        record["warnings"].append(
+            f"tts: the balance was not checked - {_one_line(exc)}")
+        return ""
+
+    record["spend"]["tts_balance"] = balance["remaining"]
+    resets = f", resets {balance['resets']}" if balance["resets"] else ""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    print(f"{stamp}  [-/{len(STEPS)}] balance   "
+          f"{balance['remaining']:,} ElevenLabs characters left{resets}",
+          flush=True)
+    if balance["extendable"] or balance["remaining"] >= floor:
+        return ""
+    return (f"tts: ElevenLabs has {balance['remaining']:,} characters left and "
+            f"a reel needs about {floor:,} (RUN_MIN_TTS_CHARACTERS){resets}")
+
+
 def _one_line(text) -> str:
     """An error boiled down to something a ledger column can hold.
 
@@ -537,8 +569,10 @@ def new_record(*, scheduled: bool = False, dry_run: bool = False,
         "duration_seconds": None,
         "attempts": [],
         "steps": {},
+        #: tts_balance is what ElevenLabs had left when the run started, or
+        #: None when it was not asked.
         "spend": {"tts_characters": 0, "downloaded_bytes": 0,
-                  "gemini": {}},
+                  "gemini": {}, "tts_balance": None},
         "warnings": [],
     }
 
@@ -643,6 +677,13 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
         except config.MissingConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return finish("failed", _one_line(exc))
+
+        # "failed", not "skipped": nothing chose not to make this reel, and the
+        # exit code is how anyone not reading the log finds out.
+        short = _check_balance(record)
+        if short:
+            print(f"error: {short}", file=sys.stderr)
+            return finish("failed", short)
 
     # --- the one thing this reel does differently -------------------------
     # Chosen here rather than inside `_make_reel`, where it used to be, because
@@ -1010,8 +1051,14 @@ def _print_summary(record: dict) -> None:
                                        if name in record["steps"]))
     print(f"TOOK    : {record['seconds']:g}s total")
     if record["spend"]["tts_characters"]:
+        # What is left is the start-of-run read less this run's bill - the
+        # number that decides whether tomorrow's run gets past the guard.
+        balance = record["spend"].get("tts_balance")
+        left = (f" ({balance - record['spend']['tts_characters']:,} left)"
+                if balance is not None else "")
         print(f"SPENT   : {record['spend']['tts_characters']} ElevenLabs "
-              f"characters, {record['spend']['downloaded_bytes'] / 1024 / 1024:.1f} MB "
+              f"characters{left}, "
+              f"{record['spend']['downloaded_bytes'] / 1024 / 1024:.1f} MB "
               f"of footage")
     gemini = record["spend"].get("gemini") or {}
     if gemini.get("calls"):

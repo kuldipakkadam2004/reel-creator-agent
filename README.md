@@ -1828,6 +1828,13 @@ Both keys are checked **before** the board is scouted. A run that spends two
 minutes on step 0 and then dies on a missing `ELEVENLABS_API_KEY` has paid to
 discover something knowable at second zero.
 
+So is the ElevenLabs balance, for the same reason. The run reads it before step
+0 and stops, `failed`, when fewer than `RUN_MIN_TTS_CHARACTERS` (default 900,
+just over the most any reel has billed) are left. The balance is printed on
+every run, and `SPENT` says what is left after it. A plan that bills past its
+limit is never stopped, a balance that cannot be read only warns, and `0` turns
+the check off.
+
 ### What it leaves behind
 
 Nobody is watching stdout at 17:00, so:

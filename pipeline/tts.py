@@ -93,6 +93,11 @@ RETRY_BASE_SECONDS = 2.0
 #: the backoff above. A provider asking for five minutes is not worth blocking.
 RETRY_AFTER_CAP_SECONDS = 30.0
 
+#: (connect, read) seconds for the balance read. A small JSON body, so nothing
+#: like the audio's 180s - and step 8 asks it before a run, where a hang is a
+#: run that never starts.
+BALANCE_TIMEOUT = (10, 20)
+
 # --- input guards -----------------------------------------------------------
 
 #: Per-request ceiling. Deliberately below the 10k the current model allows: a
@@ -415,6 +420,72 @@ def generate_audio(script: str, output_path: str, voice_id: str = None) -> dict:
         "audio_path": str(destination.resolve()),
         "duration_seconds": read_duration_seconds(destination),
         "character_count": len(text),
+    }
+
+
+def read_balance() -> dict:
+    """What the ElevenLabs account has left to spend, read live.
+
+    One GET to /user/subscription with the project's own key. Nothing is
+    billed for asking.
+
+    Returns:
+        {"tier": str, "used": int, "limit": int, "remaining": int,
+         "resets": date | None, "extendable": bool}
+        `extendable` means the plan bills characters past its limit rather
+        than refusing them, so a remaining of zero does not stop a render.
+
+    Raises:
+        config.MissingConfigError: ELEVENLABS_API_KEY is not in .env.
+        TTSError: the balance could not be read - unreachable, refused (a key
+            scoped without user_read gets a 401 here and nowhere else), or an
+            answer without the fields above.
+    """
+    import requests
+
+    api_key = config.require(*config.REQUIRED_TTS)["ELEVENLABS_API_KEY"]
+    try:
+        response = requests.get(f"{API_BASE_URL}/user/subscription",
+                                headers={"xi-api-key": api_key},
+                                timeout=BALANCE_TIMEOUT)
+    except requests.exceptions.RequestException as exc:
+        raise TTSError(
+            f"Could not reach ElevenLabs: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    if response.status_code != 200:
+        slug, message = _describe_api_error(response)
+        raise TTSError(
+            f"ElevenLabs would not report the balance "
+            f"[{response.status_code}{'/' + slug if slug else ''}]: {message}"
+        )
+
+    try:
+        body = response.json()
+        used = int(body["character_count"])
+        limit = int(body["character_limit"])
+    except (ValueError, TypeError, KeyError) as exc:
+        raise TTSError(
+            f"ElevenLabs answered the balance without its character counts: "
+            f"{(response.text or '')[:200]}"
+        ) from exc
+
+    reset_at = body.get("next_character_count_reset_unix")
+    try:
+        resets = datetime.fromtimestamp(int(reset_at)).date() if reset_at else None
+    except (ValueError, TypeError, OverflowError, OSError):
+        resets = None
+
+    return {
+        "tier": str(body.get("tier") or ""),
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+        "resets": resets,
+        # Both, because the first is the plan offering overage and the second
+        # is the account having switched it on. Either alone still refuses.
+        "extendable": bool(body.get("can_extend_character_limit")
+                           and body.get("allowed_to_extend_character_limit")),
     }
 
 

@@ -71,6 +71,20 @@ class Steps:
         #: What step 2's claim check reports it did. "off" is the shape a run
         #: takes when VERIFY_MODE is turned down.
         self.verify_mode = "llm"
+        #: What ElevenLabs says is left, or an exception to raise instead.
+        #: Plenty by default, so unrelated tests are not measuring the guard.
+        self.balance: dict | Exception = {
+            "tier": "free", "used": 1000, "limit": 10000, "remaining": 9000,
+            "resets": date(2026, 10, 14), "extendable": False}
+        self.balance_reads = 0
+
+    # --- the balance guard, before step 0 ------------------------------
+    def read_balance(self):
+        # Counted apart from `calls`, which is the six steps in order.
+        self.balance_reads += 1
+        if isinstance(self.balance, Exception):
+            raise self.balance
+        return dict(self.balance)
 
     # --- step 0 --------------------------------------------------------
     def find_topics(self, **kwargs):
@@ -178,6 +192,7 @@ def steps(tmp_path, monkeypatch):
     monkeypatch.setattr(script_gen, "generate_script", stub.generate_script)
     monkeypatch.setattr(script_gen, "save_script", stub.save_script)
     monkeypatch.setattr(tts, "generate_audio", stub.generate_audio)
+    monkeypatch.setattr(tts, "read_balance", stub.read_balance)
     monkeypatch.setattr(visuals, "source_visuals", stub.source_visuals)
     monkeypatch.setattr(assemble, "assemble_video", stub.assemble_video)
     monkeypatch.setattr(caption, "generate_caption", stub.generate_caption)
@@ -197,6 +212,7 @@ def steps(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "RUN_ONCE_PER_DAY", True)
     monkeypatch.setattr(config, "RUN_TOPIC_ATTEMPTS", 2)
     monkeypatch.setattr(config, "RUN_TOPIC_MIN_SCORE", 0.0)
+    monkeypatch.setattr(config, "RUN_MIN_TTS_CHARACTERS", 900)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
     return stub
@@ -446,6 +462,79 @@ def test_a_missing_key_is_caught_before_the_board_is_scouted(steps, monkeypatch)
     assert record["status"] == "failed"
     assert "ELEVENLABS_API_KEY" in record["reason"]
     assert steps.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The balance guard
+# ---------------------------------------------------------------------------
+
+def test_a_short_balance_stops_the_run_before_the_board_is_scouted(steps):
+    steps.balance["remaining"] = 340
+
+    record = run.run_pipeline()
+
+    assert record["status"] == "failed"
+    assert record["reason"].startswith("tts:")
+    assert "340" in record["reason"] and "RUN_MIN_TTS_CHARACTERS" in record["reason"]
+    assert steps.calls == []
+
+
+def test_a_balance_at_the_floor_is_enough(steps):
+    steps.balance["remaining"] = 900
+
+    assert run.run_pipeline()["status"] == "ok"
+
+
+def test_a_plan_that_bills_past_its_limit_is_never_stopped(steps):
+    steps.balance.update(remaining=0, extendable=True)
+
+    assert run.run_pipeline()["status"] == "ok"
+
+
+def test_an_unreadable_balance_warns_and_carries_on(steps):
+    """Step 3 still refuses a real shortfall; a failed read learned nothing."""
+    steps.balance = tts.TTSError("ElevenLabs would not report the balance [401]")
+
+    record = run.run_pipeline()
+
+    assert record["status"] == "ok"
+    assert record["spend"]["tts_balance"] is None
+    assert any(w.startswith("tts: the balance was not checked")
+               for w in record["warnings"])
+
+
+def test_a_floor_of_zero_never_asks(steps, monkeypatch):
+    monkeypatch.setattr(config, "RUN_MIN_TTS_CHARACTERS", 0)
+    steps.balance["remaining"] = 0
+
+    assert run.run_pipeline()["status"] == "ok"
+    assert steps.balance_reads == 0
+
+
+def test_the_balance_is_asked_after_the_day_guard(steps):
+    """A day that already has a reel is skipped without a network call."""
+    run.run_pipeline()
+    reads = steps.balance_reads
+
+    assert run.run_pipeline()["status"] == "skipped"
+    assert steps.balance_reads == reads
+
+
+def test_a_dry_run_does_not_ask_for_the_balance(steps):
+    run.run_pipeline(dry_run=True)
+
+    assert steps.balance_reads == 0
+
+
+def test_the_summary_says_what_is_left_after_the_run(steps, capsys):
+    steps.balance["remaining"] = 2215
+
+    record = run.run_pipeline()
+    run._print_summary(record)
+
+    assert record["spend"]["tts_balance"] == 2215
+    left = 2215 - record["spend"]["tts_characters"]
+    assert f"({left:,} left)" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
