@@ -829,7 +829,8 @@ def llm_queries(beats: list[Beat], topic: str) -> list[str]:
         client = genai.Client(
             api_key=api_key, http_options=script_gen.client_http_options()
         )
-        response = client.models.generate_content(
+        response = script_gen.generate_content(
+            client,
             model=config.GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(**kwargs),
@@ -2160,7 +2161,8 @@ def llm_screen(
         client = genai.Client(
             api_key=api_key, http_options=script_gen.client_http_options()
         )
-        response = client.models.generate_content(
+        response = script_gen.generate_content(
+            client,
             model=config.GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(**kwargs),

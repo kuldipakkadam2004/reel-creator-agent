@@ -33,6 +33,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -192,6 +193,14 @@ RETRY_BASE_SECONDS = 1.0
 #: the service is under load. Everything else - 400 malformed request, 401 bad
 #: key, 404 unknown model - fails identically on a second attempt.
 RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+#: How far past its timeout one call may run before it is abandoned outright.
+#: See `generate_content`: the timeout alone did not end the 2026-09-30 hang.
+DEADLINE_FACTOR = 1.5
+
+
+class GeminiDeadlineError(TimeoutError):
+    """A Gemini call outlived its wall-clock deadline and was abandoned."""
 
 
 SYSTEM_INSTRUCTION = """\
@@ -444,10 +453,66 @@ def client_http_options(timeout: float | None = None):
     return types.HttpOptions(timeout=int(seconds * 1000))
 
 
+def generate_content(client, *, timeout: float | None = None, **request):
+    """`client.models.generate_content(**request)`, abandoned at a deadline.
+
+    The timeout in `client_http_options` is not a deadline. httpx applies it
+    to each connect, read and write separately, so it ends a call only when
+    one of those waits that long with nothing happening. On 2026-09-30 a step 2
+    call ran 44 minutes with it set to 120s, holding an open connection to
+    Google at 0% CPU until it was killed by hand. The SDK had also sent the
+    server a 120s `X-Server-Timeout`, so neither end's limit held. Why is not
+    known - there is no stack trace of that hang - and this does not need to
+    know: it bounds the call from outside, however it is stuck.
+
+    The call runs on a daemon thread that the caller waits on for at most
+    DEADLINE_FACTOR times the timeout. A healthy call is not cut short by that.
+    The request is not streamed, so its first byte comes only once the whole
+    answer exists, and a call slower than the timeout has already failed on
+    it. Past the deadline the client is closed, which closes the socket the
+    thread is stuck on, and GeminiDeadlineError is raised, which
+    `_is_retryable` counts as a blip.
+
+    Every Gemini request in the project goes through here - `call_gemini`
+    and step 4's two clients - for the reason `client_http_options` gives:
+    the call site left without it is the one that hangs.
+    """
+    seconds = config.GEMINI_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = seconds * DEADLINE_FACTOR
+    outcome: dict = {}
+    finished = threading.Event()
+
+    def work() -> None:
+        try:
+            outcome["response"] = client.models.generate_content(**request)
+        except BaseException as exc:  # re-raised on the caller's thread below
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=work, name="gemini-call", daemon=True).start()
+    if not finished.wait(deadline):
+        # Best effort. The thread is a daemon either way, so a call that
+        # ignores the close still cannot keep the process alive after the run.
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001 - already abandoning this client
+            pass
+        raise GeminiDeadlineError(
+            f"no answer after {deadline:g}s (timeout {seconds:g}s x "
+            f"{DEADLINE_FACTOR:g}); the call was abandoned"
+        )
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["response"]
+
+
 def _is_retryable(exc: Exception) -> bool:
     """True when the identical call could plausibly succeed on a second try."""
     from google.genai import errors
 
+    if isinstance(exc, GeminiDeadlineError):
+        return True
     if isinstance(exc, errors.APIError):
         return getattr(exc, "code", None) in RETRY_STATUS_CODES
 
@@ -535,7 +600,9 @@ def call_gemini(prompt: str, *, system_instruction: str,
             client = genai.Client(
                 api_key=api_key, http_options=client_http_options(timeout)
             )
-            response = client.models.generate_content(
+            response = generate_content(
+                client,
+                timeout=timeout,
                 model=model,
                 contents=contents,
                 config=_build_generation_config(

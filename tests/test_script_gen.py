@@ -210,6 +210,91 @@ def test_a_call_that_never_answers_is_retried_like_any_other_blip(
     assert len(calls) == 2
 
 
+def test_a_call_the_timeout_does_not_end_is_abandoned_and_retried(
+        monkeypatch, _no_real_sleeping):
+    """2026-09-30: a step 2 call held its connection for 44 minutes with the
+    120s timeout set, and nothing raised. Here the first call never returns at
+    all - which no transport timeout can see - and the run still moves on."""
+    import threading
+
+    monkeypatch.setattr(config, "GEMINI_TIMEOUT_SECONDS", 0.05)
+    release = threading.Event()
+    calls, closed = [], []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                release.wait(5)          # the hang, until the test lets go
+            return FakeGeminiResponse("ok")
+
+    class HangingClient:
+        def __init__(self, api_key=None, http_options=None):
+            self.models = FakeModels()
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(genai, "Client", HangingClient)
+    try:
+        assert script_gen.call_gemini("p", system_instruction="s") == "ok"
+    finally:
+        release.set()
+
+    assert len(calls) == 2
+    assert closed == [True]              # the stuck client's socket is let go
+    assert _no_real_sleeping == [script_gen.RETRY_BASE_SECONDS]
+
+
+def test_a_deadline_that_never_clears_fails_the_call_instead_of_hanging(
+        monkeypatch, _no_real_sleeping):
+    import threading
+
+    monkeypatch.setattr(config, "GEMINI_TIMEOUT_SECONDS", 0.02)
+    release = threading.Event()
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            release.wait(5)
+            return FakeGeminiResponse("too late")
+
+    class HangingClient:
+        def __init__(self, api_key=None, http_options=None):
+            self.models = FakeModels()
+
+    monkeypatch.setattr(genai, "Client", HangingClient)
+    try:
+        with pytest.raises(script_gen.ScriptGenerationError,
+                           match="GeminiDeadlineError"):
+            script_gen.call_gemini("p", system_instruction="s")
+    finally:
+        release.set()
+
+
+def test_the_deadline_leaves_a_healthy_call_and_its_errors_alone(monkeypatch):
+    """The worker thread must hand back exactly what the SDK did."""
+    class Models:
+        def __init__(self, outcome):
+            self.outcome = outcome
+
+        def generate_content(self, **kwargs):
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+            return self.outcome
+
+    class Client:
+        def __init__(self, outcome):
+            self.models = Models(outcome)
+
+    answer = FakeGeminiResponse("fine")
+    assert script_gen.generate_content(Client(answer), model="m") is answer
+
+    refusal = api_error(400, "bad request")
+    with pytest.raises(type(refusal)) as caught:
+        script_gen.generate_content(Client(refusal), model="m")
+    assert caught.value is refusal
+
+
 def test_generate_script_rides_out_a_blip(scripted_gemini):
     scripted_gemini(
         api_error(503), FakeGeminiResponse("Rain is acidic. The salt stays."),
