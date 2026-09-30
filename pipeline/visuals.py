@@ -105,6 +105,13 @@ CANDIDATE_POOL_SIZE = 30
 #: reuse cooldown; going wider than that only spends other providers' quota.
 CANDIDATE_MARGIN = 4
 
+#: Hits for a beat's `archive_query` shown to the relevance screen on top of
+#: its shortlist. They have to be added, not ranked in: a landscape still
+#: scores about 2-3 against a vertical clip's 8-10, so on shot quality alone
+#: the photograph of the actual subject sits at the bottom of a 30-row pool
+#: that only the top 6 of are ever looked at. See `_shortlist`.
+ARCHIVE_SHORTLIST = 2
+
 #: (connect, read) seconds. Searches are small; downloads stream real media.
 SEARCH_TIMEOUT = (10, 30)
 DOWNLOAD_TIMEOUT = (10, 180)
@@ -279,6 +286,10 @@ class Beat:
     query: str = ""
     alt_queries: tuple[str, ...] = ()
     neutral_query: str = ""
+    #: The name an archive files this beat's subject under - see the "archive"
+    #: rule in `_QUERY_PROMPT_TEMPLATE`. Searched only on providers with
+    #: `Provider.archive`, and empty when the beat names nothing in particular.
+    archive_query: str = ""
     image_prompt: str = ""
     query_source: str = "heuristic"
     #: How many shots step 5 will cut this beat into, read off the same pacing
@@ -301,6 +312,7 @@ class Beat:
             "query": self.query,
             "alt_queries": list(self.alt_queries),
             "neutral_query": self.neutral_query,
+            "archive_query": self.archive_query,
             "image_prompt": self.image_prompt,
             "query_source": self.query_source,
             "shots": self.shots,
@@ -747,12 +759,20 @@ landscape, architecture or material, with no people, no machinery and no \
 vehicles in it. It is used only for a beat that can find nothing honest, \
 so it has to be able to sit under any line of this script without \
 contradicting it. The same answer for every beat is fine.
+- "archive" is the name a photograph of this beat's subject is filed under \
+on Wikimedia Commons, which is searched as well as the stock libraries. It \
+returns nothing unless every word matches, so it is 1 to 3 words: the \
+proper name of the object, place, species or event and nothing around it. \
+When the subject belongs to one country, use the name that country's own \
+archives use - "Stolperstein", not "brass memorial stone". Use "" when the \
+beat names nothing in particular, which is most beats that are not about \
+the subject itself. The same answer on several beats is fine.
 - "image_prompt" is one sentence describing the same shot for an image \
 generator, naming both the subject and the setting.
 
 Return ONLY a JSON array, one object per beat, in beat order:
 [{{"index": 0, "query": "...", "alt": "...", "neutral": "...", \
-"image_prompt": "..."}}]"""
+"archive": "...", "image_prompt": "..."}}]"""
 
 
 def _parse_query_json(raw: str, expected: int) -> dict[int, dict]:
@@ -786,6 +806,7 @@ def _parse_query_json(raw: str, expected: int) -> dict[int, dict]:
                 "query": query,
                 "alt": str(entry.get("alt") or "").strip(),
                 "neutral": str(entry.get("neutral") or "").strip(),
+                "archive": str(entry.get("archive") or "").strip(),
                 "image_prompt": str(entry.get("image_prompt") or "").strip(),
             }
     return parsed
@@ -860,6 +881,7 @@ def llm_queries(beats: list[Beat], topic: str) -> list[str]:
         beat.query = entry["query"]
         beat.alt_queries = tuple(dict.fromkeys(alts))
         beat.neutral_query = entry["neutral"]
+        beat.archive_query = entry["archive"]
         beat.image_prompt = (
             entry["image_prompt"] or f"{entry['query']}, {IMAGE_PROMPT_STYLE}"
         )
@@ -1056,6 +1078,9 @@ class Provider:
     kinds: tuple[str, ...] = ()
     key_env: tuple[str, ...] = ()
     attribution_required = False
+    #: Indexes museum and encyclopedia collections rather than stock, so it is
+    #: also asked each beat's `archive_query`. See `_gather_candidates`.
+    archive = False
 
     def __init__(self, session):
         self.session = session
@@ -1287,6 +1312,7 @@ class OpenverseProvider(Provider):
     kinds = ("image",)
     key_env = ()
     attribution_required = True
+    archive = True
     SEARCH_URL = "https://api.openverse.org/v1/images/"
 
     def search(self, query: str, kind: str, limit: int) -> list[Candidate]:
@@ -2809,7 +2835,44 @@ def _gather_candidates(
                 break
         if usable >= needed or len(pool) >= CANDIDATE_POOL_SIZE:
             break     # the first query that satisfies the beat is the best match
+
+    # --- the name the archive files it under ------------------------------
+    # Asked of the archive providers only, only on the beat's first search,
+    # and whatever the stock searches above found. They cannot answer for a
+    # named thing, and the hunger stones reel of 2026-09-30 shows it. Every
+    # query Openverse was asked - "European hunger stone inscription", "Elbe
+    # river hunger stone" - came back with 0 results, as did "hunger stone
+    # Decin": it returns nothing unless every word matches. Asked
+    # "Hungerstein", it returns twenty
+    # Commons photographs of the stones, the Decin one among them at
+    # 5472x3080. The reel shipped a Greek stele as its cover instead.
+    archive = (beat.archive_query or "").strip() if queries is None else ""
+    # The local name is asked for, and it arrives with its accents - but the
+    # archive is every-word-exact, and Commons titles mostly spell places
+    # without them. "Hungerstein Děčín" found 1 usable photograph on
+    # 2026-09-30, and "Hungerstein Decin" found 20. Both are asked, and every
+    # hit is filed under the query the beat wrote, since that is how
+    # `_shortlist` finds them.
+    folded = _without_accents(archive)
+    for asked in dict.fromkeys(q for q in (archive, folded) if q):
+        for rank, provider in enumerate(providers):
+            if not provider.archive or provider.disabled_reason:
+                continue
+            for kind in settings["kinds"]:
+                if kind not in provider.kinds:
+                    continue
+                for candidate in _search_provider(provider, asked, kind,
+                                                  warnings):
+                    if candidate.key not in seen:
+                        seen.add(candidate.key)
+                        pool.append((candidate, rank, archive))
     return pool
+
+
+def _without_accents(text: str) -> str:
+    """`text` with its diacritics taken off: "Děčín" -> "Decin"."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def _rank_pool(
@@ -3023,6 +3086,77 @@ def _neutral_plan(
     return ranked
 
 
+Row = tuple[float, Candidate, str]
+
+
+def _shortlist(ranked: list[Row], beat: Beat | None, size: int,
+               claimed: set[str] | None = None) -> tuple[list[Row], list[Row]]:
+    """Split a beat's ranking into what the screen is shown, and the rest.
+
+    The top `size` on rank, then up to ARCHIVE_SHORTLIST of the best-ranked
+    hits for the beat's archive query that rank alone left out. The rest
+    keeps its order. The first screen splits every beat once, through here,
+    because a verdict is addressed by its position in what it was shown.
+
+    `claimed` is the archive hits already added to an earlier beat's
+    shortlist, and this beat's are added to it. Beats share an archive query
+    far more often than a stock one - four of nine asked for "Hungerstein" on
+    the 2026-09-30 re-run - and each was shown the same two photographs. The
+    first beat took both, and the other three found theirs spent and fell to
+    the neutral shot, one of them onto an ocean beach. Nineteen usable
+    photographs had come back.
+    """
+    head = list(ranked[:size])
+    archive = (beat.archive_query or "").strip() if beat else ""
+    if archive:
+        claimed = claimed if claimed is not None else set()
+        extra = [row for row in ranked[size:] if row[2] == archive
+                 and row[1].key not in claimed][:ARCHIVE_SHORTLIST]
+        claimed.update(row[1].key for row in extra)
+        head += extra
+    shown = {row[1].key for row in head}
+    return head, [row for row in ranked if row[1].key not in shown]
+
+
+def _archive_first(rows: list[Row], beat: Beat, screened_keys: set[str],
+                   rejected_keys: set[str],
+                   subject_keys: set[str]) -> tuple[list[Row], str]:
+    """Lead a beat with its archive photograph, when nothing else it kept
+    shows the subject. Returns (rows, note) - the note is "" when nothing
+    moved.
+
+    Rank is shot quality, and it puts any vertical clip ahead of any still,
+    so an approved photograph of the thing itself still plays after the
+    stock footage the screen merely did not object to - and a two-slot beat
+    never reaches it. On the hunger stones reel of 2026-09-30 that was "The
+    most famous one, in the Elbe river ... If you see me, weep" over a snowy
+    mountain stream.
+
+    Only when none of the beat's other approved clips shows the subject, so a
+    bison reel keeps its bison video ahead of a bison photograph. Only one
+    photograph, so the beat's next slot still goes to footage that moves.
+    "Approved" is `_open_on_the_subject`'s test: screened, and rejected by no
+    beat, since pass 2 reads `rejected_keys` run-wide.
+    """
+    archive = (beat.archive_query or "").strip()
+    if not archive:
+        return rows, ""
+    approved = [row for row in rows if row[1].key in screened_keys
+                and row[1].key not in rejected_keys]
+    if any(row[1].key in subject_keys for row in approved if row[2] != archive):
+        return rows, ""
+    lead = next((row for row in approved
+                 if row[2] == archive and row[1].key in subject_keys), None)
+    if lead is None or lead is rows[0]:
+        return rows, ""
+    return [lead] + [row for row in rows if row is not lead], (
+        f"led with {lead[1].key} "
+        f"({describe_candidate(lead[1]) or 'no description'}) from the "
+        f"archive query {archive!r}: the screen marked it as the video's "
+        f"subject, and none of this beat's stock footage shows the subject"
+    )
+
+
 def _screen_beats(
     plans: dict[int, list[tuple[float, Candidate, str]]],
     beats: list[Beat], topic: str, providers: list[Provider], settings: dict,
@@ -3092,10 +3226,17 @@ def _screen_beats(
         beat = by_index.get(index)
         return _assets_wanted(beat, settings) if beat else 1
 
-    shortlists = {
-        index: [row[1] for row in ranked[:shortlist_size]]
-        for index, ranked in plans.items() if ranked
+    # Split once, in beat order, so the archive photographs are dealt out
+    # across the beats that share a query rather than repeated - see
+    # `_shortlist`. The screen and the loop below read the same split.
+    claimed: set[str] = set()
+    split = {
+        index: _shortlist(plans[index], by_index.get(index), shortlist_size,
+                          claimed)
+        for index in sorted(plans) if plans[index]
     }
+    shortlists = {index: [row[1] for row in head]
+                  for index, (head, _) in split.items()}
     llm_verdicts: dict[int, dict[int, tuple[bool, str]]] = {}
     if mode == "llm" and shortlists:
         llm_verdicts, screen_warnings = llm_screen(
@@ -3133,7 +3274,7 @@ def _screen_beats(
             retry.append(beat)
             empty.add(index)
             continue
-        head, tail = ranked[:shortlist_size], ranked[shortlist_size:]
+        head, tail = split[index]
         verdicts = _verdicts_for(head, beat, mode, llm_verdicts, floor)
         if not verdicts:
             continue
@@ -3143,6 +3284,10 @@ def _screen_beats(
             row[1].key for position, row in enumerate(head)
             if not verdicts.get(position, (True, ""))[0]
         )
+        reordered, lead_note = _archive_first(
+            reordered, beat, screened_keys, rejected_keys, subject_keys)
+        if lead_note:
+            beat_notes.append(lead_note)
         plans[index] = reordered + tail
         if beat_notes:
             notes.setdefault(index, []).extend(beat_notes)
@@ -4546,6 +4691,17 @@ def _print_result(manifest: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The guard run.py, topics.py and caption.py already put on their own
+    # output. The archive query brings back titles in the subject's own
+    # language - "Hungerstein in Decin" with its hacek - and on 2026-09-30 one
+    # of them, quoted in a demotion note, took this summary down on a cp1252
+    # console after the whole run had been sourced and written.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(
         description="Source stock visuals for a narration script (step 4)."
     )

@@ -4127,6 +4127,14 @@ def _print_result(assembly: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Step 4's warnings travel into this summary, and they quote archive titles
+    # in the subject's own language. See the same guard in `visuals.main`.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(
         description="Assemble a 9:16 reel from step 3's audio and step 4's visuals."
     )

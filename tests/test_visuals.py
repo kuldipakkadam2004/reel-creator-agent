@@ -3914,3 +3914,299 @@ def test_an_unscreened_neutral_shot_is_still_survivable(monkeypatch):
     )
 
     assert [row[1].provider_id for row in ranked] == ["v82"]
+
+
+
+# ---------------------------------------------------------------------------
+# The archive query - a named thing no stock library holds
+#
+# The hunger stones reel of 2026-09-30 never showed a hunger stone. Openverse
+# answered 0 to every query step 4 wrote for it, and 20 Commons photographs of
+# the stones to "Hungerstein". Even found, a landscape still ranks at the
+# bottom of a pool only whose top 6 are ever screened.
+# ---------------------------------------------------------------------------
+
+_HUNGER_TOPIC = "what are the hunger stones of Europe"
+
+
+def _still(index: int, title: str, provider: str = "archive") -> Candidate:
+    """A Commons photograph as Openverse returns it: big, landscape, a still."""
+    return Candidate(
+        provider=provider, provider_id=f"i{index}", kind="image",
+        width=5472, height=3080,
+        download_url=f"https://stub.test/image/{index}.jpg",
+        source_url=f"https://commons.wikimedia.org/w/index.php?curid={index}",
+        license="CC BY-SA 3.0", title=title,
+    )
+
+
+def _hunger_opening():
+    return Beat(index=0, start=0.0, end=3.0, query="European hunger stone",
+                text="You are looking at Europe's most desperate climate data.",
+                archive_query="Hungerstein")
+
+
+def _elbe_beat(archive: str = "Hungerstein") -> Beat:
+    return Beat(index=4, start=18.2, end=24.8, query="Elbe river hunger stone",
+                text="The most famous one, in the Elbe river, has an "
+                     "inscription from sixteen sixteen: If you see me, weep.",
+                archive_query=archive, shots=2)
+
+
+class _Stock(visuals.Provider):
+    name = "stock"
+    kinds = ("video",)
+    key_env = ()
+    asked: list = []
+
+    def search(self, query, kind, limit):
+        _Stock.asked.append(query)
+        return [make_candidate(n, provider="stock") for n in range(limit)]
+
+
+class _Archive(visuals.Provider):
+    name = "archive"
+    kinds = ("image",)
+    key_env = ()
+    archive = True
+    asked: list = []
+
+    def search(self, query, kind, limit):
+        _Archive.asked.append(query)
+        if query != "Hungerstein":
+            return []                    # every word must match, as on Openverse
+        return [_still(n, f"Hungerstein in Decin ({n})") for n in range(3)]
+
+
+@pytest.fixture
+def two_libraries():
+    _Stock.asked, _Archive.asked = [], []
+    return [_Stock(None), _Archive(None)]
+
+
+def test_the_query_writer_is_asked_what_the_archive_files_it_under():
+    parsed = visuals._parse_query_json(json.dumps([
+        {"index": 0, "query": "Elbe river hunger stone", "alt": "a",
+         "neutral": "n", "archive": "Hungerstein", "image_prompt": "p"},
+        {"index": 1, "query": "cracked dry earth"},
+    ]), 2)
+
+    assert parsed[0]["archive"] == "Hungerstein"
+    assert parsed[1]["archive"] == ""
+
+
+def test_the_archive_rule_does_not_quote_the_answer_it_was_written_for():
+    """A replay of the hunger stones topic must not be reading "Hungerstein"
+    back out of the prompt - the example is a different German stone."""
+    assert '"archive"' in visuals._QUERY_PROMPT_TEMPLATE
+    assert "Stolperstein" in visuals._QUERY_PROMPT_TEMPLATE
+    assert "Hungerstein" not in visuals._QUERY_PROMPT_TEMPLATE
+
+
+def test_the_archive_answer_reaches_the_beat_and_the_manifest(monkeypatch):
+    from google import genai
+
+    beats = visuals.segment_script("Hunger stones surface in drought.", 4.0)
+    payload = json.dumps([
+        {"index": b.index, "query": "Elbe river hunger stone", "alt": "a",
+         "neutral": "riverbed stones", "archive": "Hungerstein",
+         "image_prompt": "p"} for b in beats
+    ])
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return type("R", (), {"text": payload})()
+
+    class FakeClient:
+        def __init__(self, api_key=None, http_options=None):
+            self.models = FakeModels()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(genai, "Client", FakeClient)
+
+    visuals.llm_queries(beats, _HUNGER_TOPIC)
+
+    assert beats[0].archive_query == "Hungerstein"
+    assert beats[0].to_dict()["archive_query"] == "Hungerstein"
+
+
+def test_the_archive_is_asked_even_when_stock_has_filled_the_pool(
+        two_libraries):
+    pool = visuals._gather_candidates(two_libraries, _elbe_beat(),
+                                      _settings(assets_per_beat=2), [])
+
+    assert "Hungerstein" in _Archive.asked
+    assert "Hungerstein" not in _Stock.asked
+    archived = [c.provider_id for c, _, q in pool if q == "Hungerstein"]
+    assert archived == ["i0", "i1", "i2"]
+
+
+def test_a_re_search_does_not_ask_the_archive_again(two_libraries):
+    visuals._gather_candidates(two_libraries, _elbe_beat(),
+                               _settings(assets_per_beat=2), [],
+                               queries=("Ancient stone inscription",))
+
+    assert "Hungerstein" not in _Archive.asked
+
+
+def test_a_beat_that_names_nothing_leaves_the_archive_alone(two_libraries):
+    visuals._gather_candidates(two_libraries, _elbe_beat(archive=""),
+                               _settings(assets_per_beat=2), [])
+
+    assert "Hungerstein" not in _Archive.asked
+
+
+def test_archive_hits_are_shown_to_the_screen_however_low_they_rank():
+    stock = [(9.0, make_candidate(n), "Elbe river hunger stone")
+             for n in range(10)]
+    stills = [(2.4, _still(n, f"Hungerstein {n}"), "Hungerstein")
+              for n in range(3)]
+
+    head, tail = visuals._shortlist(stock + stills, _elbe_beat(), 6)
+
+    assert head == stock[:6] + stills[:visuals.ARCHIVE_SHORTLIST]
+    assert tail == stock[6:] + stills[visuals.ARCHIVE_SHORTLIST:]
+    plain, rest = visuals._shortlist(stock + stills, _elbe_beat(archive=""), 6)
+    assert plain == stock[:6] and rest == stock[6:] + stills
+
+
+def _screen_elbe(monkeypatch, plans, verdicts_by_key, opening_clip):
+    """Beat 4 behind an opening that has its own subject, so what moves on
+    beat 4 is this pass's doing and not `_open_on_the_subject`'s."""
+    plans[0] = [(9.0, opening_clip, "European hunger stone")]
+    verdicts_by_key.setdefault(opening_clip.key, (True, True))
+    monkeypatch.setattr(visuals, "llm_screen", _screen_by_key(verdicts_by_key))
+    notes = visuals._screen_beats(
+        plans, [_hunger_opening(), _elbe_beat()], _HUNGER_TOPIC,
+        [_query_aware_provider({})(session=None)],
+        _settings(relevance_mode="llm", relevance_floor=0.15,
+                  relevance_shortlist=1, assets_per_beat=1,
+                  reuse_cooldown=0, kinds=["video", "image"]),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+    return notes
+
+
+def test_the_photograph_of_the_thing_leads_a_beat_whose_footage_lacks_it(
+        monkeypatch):
+    """The 2026-09-30 reel's beat 4 - a snowy stream under "If you see me,
+    weep" - replayed with the stone found."""
+    stream = _described(80, "snowy-mountain-stream")
+    castle = _described(81, "meissen-castle-above-the-elbe")
+    stone = _still(7, "Hungerstein in Decin (07)")
+    plans = {4: [(9.5, stream, "Elbe river hunger stone"),
+                 (9.4, castle, "Elbe river hunger stone"),
+                 (2.4, stone, "Hungerstein")]}
+
+    notes = _screen_elbe(monkeypatch, plans, {stone.key: (True, True)},
+                         _still(9, "Hungerstein in Pirna"))
+
+    assert [row[1].key for row in plans[4]][:2] == [stone.key, stream.key]
+    assert any("archive query 'Hungerstein'" in n for n in notes[4])
+
+
+def test_stock_footage_of_the_subject_keeps_its_place(monkeypatch):
+    """A bison reel keeps its bison video ahead of a bison photograph."""
+    stones_on_video = _described(82, "hunger-stones-exposed-in-the-elbe")
+    stone = _still(7, "Hungerstein in Decin (07)")
+    plans = {4: [(9.5, stones_on_video, "Elbe river hunger stone"),
+                 (2.4, stone, "Hungerstein")]}
+
+    notes = _screen_elbe(monkeypatch, plans, {
+        stones_on_video.key: (True, True), stone.key: (True, True),
+    }, _still(9, "Hungerstein in Pirna"))
+
+    assert plans[4][0][1].key == stones_on_video.key
+    assert not any("archive query" in n for n in notes.get(4, []))
+
+
+@pytest.mark.parametrize("verdict", [(False, True), (True, False)],
+                         ids=["rejected", "not-the-subject"])
+def test_only_an_approved_photograph_of_the_subject_is_moved(monkeypatch,
+                                                              verdict):
+    stream = _described(80, "snowy-mountain-stream")
+    stone = _still(7, "Hungerstein in Decin (07)")
+    plans = {4: [(9.5, stream, "Elbe river hunger stone"),
+                 (2.4, stone, "Hungerstein")]}
+
+    _screen_elbe(monkeypatch, plans, {stone.key: verdict},
+                 _still(9, "Hungerstein in Pirna"))
+
+    assert plans[4][0][1].key == stream.key
+
+
+
+def test_beats_sharing_an_archive_query_are_dealt_different_photographs(
+        monkeypatch):
+    """The 2026-09-30 re-run: four beats asked for "Hungerstein", all four
+    were shown the same two photographs, and the first beat spent both."""
+    stones = [_still(n, f"Hungerstein {n}") for n in range(6)]
+
+    def plan(first_clip):
+        return ([(9.5, first_clip, "stone carving")]
+                + [(2.4, stone, "Hungerstein") for stone in stones])
+
+    carving = Beat(index=6, start=30.0, end=34.0, query="stone carving",
+                   text="While most of these carvings are ancient,",
+                   archive_query="Hungerstein", shots=2)
+    plans = {4: plan(_described(80, "snowy-mountain-stream")),
+             6: plan(_described(83, "chisel-on-marble"))}
+    shown = {}
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        shown.update({i: [c.key for c in cands]
+                      for i, cands in shortlists.items()})
+        return _screen_by_key({s.key: (True, True) for s in stones})(
+            shortlists, beats, topic, subject_keys, establishing)
+
+    plans[0] = [(9.0, _still(9, "Hungerstein in Pirna"), "European hunger stone")]
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    visuals._screen_beats(
+        plans, [_hunger_opening(), _elbe_beat(), carving], _HUNGER_TOPIC,
+        [_query_aware_provider({})(session=None)],
+        _settings(relevance_mode="llm", relevance_floor=0.15,
+                  relevance_shortlist=1, assets_per_beat=1,
+                  reuse_cooldown=0, kinds=["video", "image"]),
+        visuals.UsageLedger(), "run", visuals._RunState(), {}, [],
+    )
+
+    elbe = [k for k in shown[4] if k.startswith("archive:")]
+    later = [k for k in shown[6] if k.startswith("archive:")]
+    assert elbe == [stones[0].key, stones[1].key]
+    assert later == [stones[2].key, stones[3].key]
+    assert plans[4][0][1].key == stones[0].key
+    assert plans[6][0][1].key == stones[2].key
+
+
+
+def test_an_accented_archive_name_is_also_asked_without_its_accents():
+    """"Hungerstein Děčín" found 1 photograph and "Hungerstein Decin" 20."""
+    asked = []
+
+    class Commons(visuals.Provider):
+        name = "archive"
+        kinds = ("image",)
+        key_env = ()
+        archive = True
+
+        def search(self, query, kind, limit):
+            asked.append(query)
+            if query == "Hungerstein Decin":
+                return [_still(n, f"Hungerstein in Decin ({n})") for n in range(3)]
+            return []
+
+    pool = visuals._gather_candidates(
+        [Commons(None)], _elbe_beat(archive="Hungerstein Děčín"),
+        _settings(assets_per_beat=2), [])
+
+    assert asked[-2:] == ["Hungerstein Děčín", "Hungerstein Decin"]
+    # Filed under the query the beat wrote, which is what `_shortlist` reads.
+    assert {q for _, _, q in pool} == {"Hungerstein Děčín"}
+    assert len(pool) == 3
+
+
+def test_an_unaccented_archive_name_is_asked_once(two_libraries):
+    visuals._gather_candidates(two_libraries, _elbe_beat(),
+                               _settings(assets_per_beat=2), [])
+
+    assert _Archive.asked.count("Hungerstein") == 1
