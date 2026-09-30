@@ -70,7 +70,9 @@ from pipeline import script_gen, tagvolume  # noqa: E402
 #: used to exist only as a sentence in the log, which made the estimator's
 #: rejections the one part of the tag pipeline nobody could check or seed
 #: against. `python pipeline/tagvolume.py --worklist` reads this field.
-POST_VERSION = 4
+#: 5 added "claims" - what the fact-check cut from the copy. See
+#: `check_post_claims`.
+POST_VERSION = 5
 
 #: Written into the run directory. The `captions.*` files beside them are step
 #: 5's burned-in subtitles - deliberately a different word.
@@ -827,6 +829,110 @@ def llm_draft(script: str, *, topic: str, niche: str, count: int,
     except (ValueError, TypeError) as exc:
         return None, [f"Gemini returned an unusable caption ({exc}). Wrote the "
                       f"caption from keywords instead."]
+
+
+#: Findings that take a sentence out of the post. One kind wider than step 2's
+#: blocking pair, on purpose - see `check_post_claims`.
+POST_CLAIM_DROP = ("contradiction", "false", "unsupported")
+
+
+def check_post_claims(draft: Draft, *, topic: str,
+                      mode: str | None = None) -> tuple[dict, list[str]]:
+    """Fact-check what the caption says, and cut what fails. Never raises.
+
+    The body is asked for "the detail behind it, the number, the caveat" - so
+    it adds facts the narration never made, and until this pass none of them
+    were checked. The narration survived a Pro fact-check that refuses whole
+    topics, and the text posted beside it went out on one unchecked call.
+    That stayed theoretical until the hunger stones post of 2026-09-30, which
+    said "The oldest authenticated carving dates to 1417". The sources say the
+    reverse: the 1417 mark was worn off, and 1616 is the oldest that can
+    still be read.
+
+    Same checker as step 2 (`script_gen.check_claims`), same switch
+    (VERIFY_MODE), and a different remedy. A flagged sentence is dropped
+    rather than repaired or refused. A caption is optional in a way the
+    narration is not: losing one sentence of it costs nothing a viewer
+    misses, and a rewrite would be a fresh unchecked call.
+
+    That is also why `unsupported` drops here, though it only reports in
+    step 2. There it cannot block, because blocking on it would refuse most
+    interesting topics outright - see `script_gen._VERIFY_BLOCKING`. Here all
+    it costs is one sentence, and a specific claim the checker does not
+    believe is what the body is most likely to have invented.
+
+    Only the hook and the body are checked. The CTA is a question to the
+    reader, and the tags are not sentences.
+
+    Returns (report, warnings). The report goes into post.json as `claims`.
+    """
+    setting = str(mode or config.VERIFY_MODE or "off").strip().lower()
+    report = {"mode": setting, "checked": False, "dropped": [], "kept": []}
+    if setting != "llm":
+        return report, []
+
+    # Every sentence of the copy, tagged with where it came from, so a finding
+    # can be traced back to the one paragraph it has to come out of.
+    located: list[tuple[int, str]] = []          # (-1 for the hook, paragraph)
+    for sentence in split_sentences(draft.hook):
+        located.append((-1, sentence))
+    for number, paragraph in enumerate(draft.body):
+        for sentence in split_sentences(paragraph):
+            located.append((number, sentence))
+    if len(located) < 2:
+        report["checked"] = True
+        return report, []
+
+    checked = script_gen.check_claims(
+        topic, " ".join(sentence for _, sentence in located)
+    )
+    report["checked"] = checked["checked"]
+    warnings = [w.replace("The script was", "The caption was")
+                for w in checked["warnings"]]
+
+    doomed: set[int] = set()
+    for finding in checked["findings"]:
+        # The best match, not the first - "If you see me, then weep." sits
+        # inside a sentence about the 1616 inscription, and a finding about
+        # that sentence must not cost the post its hook.
+        at = script_gen.quoted_sentence(
+            finding["sentence"], [sentence for _, sentence in located])
+        if at is None:
+            continue
+        entry = {"sentence": located[at][1], "kind": finding["kind"],
+                 "problem": finding["problem"],
+                 "from": "hook" if located[at][0] < 0 else "body"}
+        if finding["kind"] not in POST_CLAIM_DROP:
+            report["kept"].append(entry)
+            continue
+        if at in doomed:
+            continue
+        doomed.add(at)
+        report["dropped"].append(entry)
+        warnings.append(
+            f"dropped a {finding['kind']} claim from the {entry['from']}: "
+            f"{entry['sentence']!r} - {finding['problem']}"
+        )
+    if not doomed:
+        return report, warnings
+
+    hook = " ".join(sentence for at, (where, sentence) in enumerate(located)
+                    if where < 0 and at not in doomed)
+    body = []
+    for number in range(len(draft.body)):
+        kept = [sentence for at, (where, sentence) in enumerate(located)
+                if where == number and at not in doomed]
+        if kept:
+            body.append(" ".join(kept))
+    if not hook and body:
+        # The hook is the only line shown before "... more", so an empty one
+        # would open the post on the credits. The next finished paragraph
+        # takes its place, and `fit_hook` holds it to the hook's limit.
+        hook = body.pop(0)
+        warnings.append("the whole hook was dropped; the first body paragraph "
+                        "now opens the caption")
+    draft.hook, draft.body = hook, body
+    return report, warnings
 
 
 def heuristic_draft(script: str, *, topic: str, niche: str,
@@ -1671,6 +1777,14 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
             "only reuse what the narration already said"
         )
 
+    # Before the hook is fitted, so a hook that loses a sentence here is still
+    # held to its limit below. A keyword draft is the narration's own lines,
+    # which step 2 already checked, so there is nothing new in it to check.
+    claims = {"mode": "off", "checked": False, "dropped": [], "kept": []}
+    if draft.source == "llm":
+        claims, claim_warnings = check_post_claims(draft, topic=resolved.topic)
+        warnings += claim_warnings
+
     # --- hold it to the platform's constraints -----------------------------
     hook, hook_warnings = fit_hook(draft.hook, config.POST_HOOK_MAX_CHARS)
     warnings += hook_warnings
@@ -1788,6 +1902,8 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
         # when there is no cover to describe.
         "alt_text": alt_text,
         "alt": alt_report,
+        # What the fact-check cut from the copy, and what it flagged but left.
+        "claims": claims,
         "attribution": {
             "mode": attribution_mode,
             "assets": credits.assets,

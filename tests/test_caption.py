@@ -56,6 +56,32 @@ def stub_draft(monkeypatch, draft: Draft) -> None:
                         lambda *args, **kwargs: (draft, []))
 
 
+@pytest.fixture(autouse=True)
+def _claim_check_off(monkeypatch):
+    """A stubbed draft is an llm draft, and an llm draft is fact-checked - by a
+    real Gemini call, unless this is off. The claim tests below turn it on and
+    stub the checker."""
+    monkeypatch.setattr(config, "VERIFY_MODE", "off")
+
+
+def stub_checker(monkeypatch, *findings, checked=True) -> list[str]:
+    """Answer the fact-check with fixed findings; returns what it was shown."""
+    shown: list[str] = []
+
+    def check(topic, text):
+        shown.append(text)
+        return {"findings": list(findings), "warnings": [], "checked": checked}
+
+    monkeypatch.setattr(config, "VERIFY_MODE", "llm")
+    monkeypatch.setattr(caption.script_gen, "check_claims", check)
+    return shown
+
+
+def finding(sentence: str, kind: str = "false",
+            problem: str = "that is not what happened") -> dict:
+    return {"sentence": sentence, "kind": kind, "problem": problem}
+
+
 # ---------------------------------------------------------------------------
 # The hook - the only part Instagram shows before "... more"
 # ---------------------------------------------------------------------------
@@ -1027,3 +1053,153 @@ def test_the_model_is_told_not_to_add_what_it_cannot_see():
                                   alt_depicts="medusa blue ocean")
     assert "Rewrite ONLY those words" in asking
     assert "do not guess" in asking
+
+
+# ---------------------------------------------------------------------------
+# The fact-check - the body adds facts the narration never made
+# ---------------------------------------------------------------------------
+
+HUNGER_BODY = [
+    "The most famous hunger stone sits in the Elbe near Decin. Dozens of "
+    "others dot the rivers of Central Europe.",
+    "The weep inscription from 1616 is the best known. The oldest "
+    "authenticated carving dates to 1417. Others list a litany of bad years.",
+]
+
+
+def test_a_false_sentence_is_cut_and_the_rest_of_its_paragraph_kept(
+        monkeypatch, tmp_path):
+    """The hunger stones post of 2026-09-30, which put a false date on the
+    oldest carving in the post and nowhere in the narration."""
+    stub_checker(monkeypatch, finding(
+        "The oldest authenticated carving dates to 1417.",
+        problem="1417 is no longer legible; 1616 is the oldest legible mark"))
+    stub_draft(monkeypatch, Draft(hook="A warning, carved in stone.",
+                                  body=list(HUNGER_BODY),
+                                  hashtags={"mid": ["drought"]}))
+
+    post = caption.generate_caption(SCRIPT, run_dir=tmp_path, write=False)
+
+    assert "1417" not in post["caption"]
+    assert post["body"][1] == ("The weep inscription from 1616 is the best "
+                               "known. Others list a litany of bad years.")
+    assert post["body"][0] == HUNGER_BODY[0]
+    assert [d["sentence"] for d in post["claims"]["dropped"]] == [
+        "The oldest authenticated carving dates to 1417."]
+    assert post["claims"]["dropped"][0]["from"] == "body"
+    assert any("dropped a false claim" in w and "1417" in w
+               for w in post["warnings"])
+
+
+def test_unsupported_is_cut_here_though_step_2_only_reports_it(monkeypatch):
+    stub_checker(monkeypatch, finding("Others list a litany of bad years.",
+                                      kind="unsupported"))
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    report, _ = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert "litany" not in " ".join(draft.body)
+    assert report["dropped"][0]["kind"] == "unsupported"
+
+
+def test_a_figurative_finding_is_recorded_and_the_sentence_kept(monkeypatch):
+    stub_checker(monkeypatch, finding("Others list a litany of bad years.",
+                                      kind="figurative"))
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    report, warnings = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert draft.body == HUNGER_BODY
+    assert report["dropped"] == []
+    assert report["kept"][0]["kind"] == "figurative"
+    assert warnings == []
+
+
+def test_a_finding_is_matched_to_its_own_sentence_not_one_inside_it(
+        monkeypatch):
+    """The overlap is measured against the shorter side, so a short line whose
+    words all appear in a long one scores a perfect match against a quote of
+    the long one. Only the best match may be cut."""
+    long_one = ("The most famous stone, in the Elbe, has an inscription "
+                "from 1616 that reads: if you see me, weep.")
+    stub_checker(monkeypatch, finding(long_one))
+    draft = Draft(hook="If you see me, weep.", body=[long_one + " It is old."])
+
+    caption.check_post_claims(draft, topic="hunger stones")
+
+    assert draft.hook == "If you see me, weep."
+    assert draft.body == ["It is old."]
+
+
+def test_a_hook_that_is_cut_whole_is_replaced_by_the_first_paragraph(
+        monkeypatch, tmp_path):
+    stub_checker(monkeypatch, finding("Hunger stones are 2000 years old."))
+    stub_draft(monkeypatch, Draft(hook="Hunger stones are 2000 years old.",
+                                  body=list(HUNGER_BODY),
+                                  hashtags={"mid": ["drought"]}))
+
+    post = caption.generate_caption(SCRIPT, run_dir=tmp_path, write=False)
+
+    assert post["hook"].startswith("The most famous hunger stone")
+    assert post["caption"].startswith("The most famous hunger stone")
+    assert "2000" not in post["caption"]
+    assert post["claims"]["dropped"][0]["from"] == "hook"
+    assert any("whole hook was dropped" in w for w in post["warnings"])
+
+
+def test_the_checker_is_shown_the_hook_and_body_but_not_the_cta(monkeypatch):
+    shown = stub_checker(monkeypatch)
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY),
+                  cta="Are there stones like this where you live?")
+
+    report, _ = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert shown and "A warning." in shown[0] and "1417" in shown[0]
+    assert "where you live" not in shown[0]
+    assert report["checked"] is True
+    assert draft.body == HUNGER_BODY
+
+
+def test_a_check_that_could_not_run_says_so_and_cuts_nothing(monkeypatch):
+    def unreachable(topic, text):
+        return {"findings": [], "checked": False,
+                "warnings": ["the claim check failed (boom). The script was "
+                             "not fact-checked."]}
+
+    monkeypatch.setattr(config, "VERIFY_MODE", "llm")
+    monkeypatch.setattr(caption.script_gen, "check_claims", unreachable)
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    report, warnings = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert report["checked"] is False
+    assert draft.body == HUNGER_BODY
+    assert any("The caption was not fact-checked" in w for w in warnings)
+
+
+def test_nothing_is_checked_with_verify_mode_off(monkeypatch, tmp_path):
+    def must_not_run(topic, text):
+        raise AssertionError("the checker must not be called with VERIFY_MODE=off")
+
+    monkeypatch.setattr(caption.script_gen, "check_claims", must_not_run)
+    stub_draft(monkeypatch, Draft(hook="A warning.", body=list(HUNGER_BODY),
+                                  hashtags={"mid": ["drought"]}))
+
+    post = caption.generate_caption(SCRIPT, run_dir=tmp_path, write=False)
+
+    assert post["claims"]["mode"] == "off"
+    assert "1417" in post["caption"]
+
+
+def test_a_keyword_caption_is_not_checked_again(monkeypatch, tmp_path):
+    """It is made of the narration's own lines, which step 2 already checked."""
+    def must_not_run(topic, text):
+        raise AssertionError("a heuristic draft has nothing new to check")
+
+    monkeypatch.setattr(config, "VERIFY_MODE", "llm")
+    monkeypatch.setattr(caption.script_gen, "check_claims", must_not_run)
+
+    post = caption.generate_caption(SCRIPT, run_dir=tmp_path, write=False,
+                                    mode="heuristic")
+
+    assert post["claims"]["checked"] is False

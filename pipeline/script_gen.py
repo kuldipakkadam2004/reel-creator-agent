@@ -2767,6 +2767,34 @@ def _finding_is_about(script: str, sentence: str) -> bool:
     return False
 
 
+def quoted_sentence(quoted: str, sentences: list[str]) -> int | None:
+    """Which of `sentences` a finding's quote is of, or None for none of them.
+
+    Public because step 6 cuts the sentences this checker flags out of the
+    caption, and has to agree with this module on what counts as a quote -
+    the same tolerance `_finding_is_about` applies.
+
+    The best match, not the first that clears the bar. `_overlap` measures
+    against the smaller side, so a short sentence whose few words all appear
+    in a long one scores 1.0 against a quote of the long one - exactly what
+    the long one scores. Ties go to the closer match on Jaccard, which does
+    not forgive the difference in length.
+    """
+    words = _content_words(quoted)
+    best, best_key = None, (0.0, 0.0)
+    for index, sentence in enumerate(sentences):
+        theirs = _content_words(sentence)
+        if not words or not theirs:
+            continue
+        key = (_overlap(words, theirs),
+               len(words & theirs) / len(words | theirs))
+        if key > best_key:
+            best, best_key = index, key
+    if best is None or best_key[0] < _VERIFY_QUOTE_MATCH:
+        return None
+    return best
+
+
 def check_claims(topic: str, script: str) -> dict:
     """Fact-check `script`. Never raises.
 
