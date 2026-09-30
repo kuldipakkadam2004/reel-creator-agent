@@ -123,6 +123,12 @@ MAX_DOWNLOAD_BYTES = 120 * 1024 * 1024
 #: One retry after a 429, then the provider is benched for the rest of the run.
 RATE_LIMIT_BACKOFF_SECONDS = 2.0
 
+#: ...unless a download's 429 names its own wait, in which case it is honoured
+#: this many times before the host is benched - but only a wait this short.
+#: See `_download_with_backoff`.
+DOWNLOAD_RATE_LIMIT_RETRIES = 3
+RETRY_AFTER_CAP_SECONDS = 15.0
+
 #: ...and after a transfer that broke off mid-body. Shorter than the rate-limit
 #: wait because nothing is asking us to back off: the file was being served and
 #: the connection dropped, so the second attempt is the cheap one to make.
@@ -246,10 +252,16 @@ class ProviderAuthError(ProviderError):
 
 
 class ProviderRateLimitError(ProviderError):
-    """The provider is rate limiting us. Benched for the run."""
+    """The provider is rate limiting us. Benched for the run.
 
-    def __init__(self, message: str, *, provider: str = ""):
+    `retry_after` is the wait the host itself asked for, in seconds, when its
+    429 said - see `_download_with_backoff` for what is done with it.
+    """
+
+    def __init__(self, message: str, *, provider: str = "",
+                 retry_after: float | None = None):
         super().__init__(message, provider=provider, fatal=True)
+        self.retry_after = retry_after
 
 
 class ProviderTransientError(ProviderError):
@@ -2504,8 +2516,13 @@ def download(session, url: str, destination: Path, *, provider: str) -> dict:
             # Providers hand back URLs on hosts with their own limits (Openverse
             # points at Wikimedia, for one). Marching through the next twenty
             # candidates only deepens the hole.
+            try:
+                retry_after = float(response.headers.get("Retry-After") or "")
+            except ValueError:       # absent, or an HTTP date - not a wait
+                retry_after = None
             raise ProviderRateLimitError(
-                f"{provider} rate limited the download: {url}", provider=provider
+                f"{provider} rate limited the download: {url}", provider=provider,
+                retry_after=retry_after,
             )
         if response.status_code >= 400:
             raise ProviderError(
@@ -3735,23 +3752,38 @@ def _download_with_backoff(session, candidate: Candidate, target: Path) -> dict:
     URL is good and something outside it went wrong. A 404, an HTML error page
     and an over-cap file all come back as a plain `ProviderError` and are not
     retried, because the second attempt would fetch the same bytes.
+
+    A 429 that names its own wait is given more patience than one that does
+    not: up to DOWNLOAD_RATE_LIMIT_RETRIES tries, each after the wait it asked
+    for. That is Wikimedia, where the archive query's photographs live. It
+    answers "Retry-After: 10", and measured on 2026-09-30 it lets the same
+    thumbnail through on one try and refuses it on eight in a row. A single
+    two-second retry lost every archive photograph on the hunger stones
+    re-run. A wait longer than RETRY_AFTER_CAP_SECONDS is not polled early,
+    against the host's own instruction - it is taken as a refusal.
     """
-    for attempt in (0, 1):
+    limited = broken = 0
+    while True:
         try:
             return download(
                 session, candidate.download_url, target, provider=candidate.provider
             )
-        except ProviderRateLimitError:
-            if attempt == 0:
+        except ProviderRateLimitError as exc:
+            limited += 1
+            asked = exc.retry_after
+            if asked is None:
+                if limited > 1:
+                    raise
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
-                continue
-            raise
+            elif limited > DOWNLOAD_RATE_LIMIT_RETRIES or asked > RETRY_AFTER_CAP_SECONDS:
+                raise
+            else:
+                time.sleep(asked + 1.0)
         except ProviderTransientError:
-            if attempt == 0:
-                time.sleep(TRANSIENT_BACKOFF_SECONDS)
-                continue
-            raise
-    raise AssertionError("unreachable")
+            broken += 1
+            if broken > 1:
+                raise
+            time.sleep(TRANSIENT_BACKOFF_SECONDS)
 
 
 def _acquire(

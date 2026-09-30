@@ -4210,3 +4210,85 @@ def test_an_unaccented_archive_name_is_asked_once(two_libraries):
                                _settings(assets_per_beat=2), [])
 
     assert _Archive.asked.count("Hungerstein") == 1
+
+
+# ---------------------------------------------------------------------------
+# A 429 that says when to come back
+#
+# Wikimedia, where the archive query's photographs live, answers
+# "Retry-After: 10" and then lets the same file through a try or two later.
+# ---------------------------------------------------------------------------
+
+def _answers(*responses):
+    """A session serving `responses` in order, the last one forever."""
+    served = list(responses)
+
+    def next_response(url):
+        return served.pop(0) if len(served) > 1 else served[0]
+
+    return FakeSession(default=next_response)
+
+
+def _limited(retry_after=None):
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return FakeResponse(429, body=b"Too Many Requests", headers=headers)
+
+
+def _photo():
+    return FakeResponse(200, body=b"\xff\xd8jpeg",
+                        headers={"Content-Type": "image/jpeg"})
+
+
+def test_a_named_wait_is_honoured_and_the_file_still_arrives(tmp_path,
+                                                            monkeypatch):
+    slept = []
+    monkeypatch.setattr(visuals.time, "sleep", slept.append)
+    session = _answers(_limited("10"), _limited("10"), _photo())
+
+    result = visuals._download_with_backoff(
+        session, _still(1, "Hungerstein in Radebeul (5)"), tmp_path / "a.jpg")
+
+    assert result["content_type"] == "image/jpeg"
+    assert slept == [11.0, 11.0]
+    assert len(session.download_calls) == 3
+
+
+def test_a_named_wait_is_honoured_only_so_many_times(tmp_path, monkeypatch):
+    monkeypatch.setattr(visuals.time, "sleep", lambda _: None)
+    session = _answers(_limited("10"))
+
+    with pytest.raises(visuals.ProviderRateLimitError) as caught:
+        visuals._download_with_backoff(
+            session, _still(1, "Hungerstein in Decin (07)"), tmp_path / "a.jpg")
+
+    assert caught.value.retry_after == 10.0
+    assert len(session.download_calls) == 1 + visuals.DOWNLOAD_RATE_LIMIT_RETRIES
+
+
+def test_a_long_wait_is_a_refusal_not_something_to_poll(tmp_path, monkeypatch):
+    slept = []
+    monkeypatch.setattr(visuals.time, "sleep", slept.append)
+    session = _answers(_limited("3600"), _photo())
+
+    with pytest.raises(visuals.ProviderRateLimitError):
+        visuals._download_with_backoff(
+            session, _still(1, "Hungerstein in Decin (07)"), tmp_path / "a.jpg")
+
+    assert slept == []
+    assert len(session.download_calls) == 1
+
+
+def test_a_429_with_no_wait_named_still_gets_its_one_retry(tmp_path,
+                                                            monkeypatch):
+    slept = []
+    monkeypatch.setattr(visuals.time, "sleep", slept.append)
+    session = _answers(_limited(), _limited(), _photo())
+
+    with pytest.raises(visuals.ProviderRateLimitError) as caught:
+        visuals._download_with_backoff(
+            session, _still(1, "Hungerstein in Decin (07)"), tmp_path / "a.jpg")
+
+    assert caught.value.retry_after is None
+    assert slept == [visuals.RATE_LIMIT_BACKOFF_SECONDS]
+    assert len(session.download_calls) == 2
+
