@@ -204,6 +204,15 @@ def steps(tmp_path, monkeypatch):
     # Step 9's ledger, for the same reason as every other path here: a run made
     # by the suite must not land in the ledger a real account is measured by.
     monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "performance.json")
+    # ...and the report the read writes from it. These are derived from the
+    # real OUTPUT_DIR when config is imported, so moving OUTPUT_DIR above does
+    # not move them. Until 2026-10-01 every run of the suite replaced the real
+    # output/report.txt, report.json and reports/<today>.txt with a report of
+    # this empty ledger: "REELS : 0 known". The reports dated 09-29 and 09-30
+    # were both the suite's, and nothing said so.
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_FILE", tmp_path / "report.txt")
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_JSON", tmp_path / "report.json")
+    monkeypatch.setattr(config, "PERFORMANCE_REPORT_DIR", tmp_path / "reports")
     monkeypatch.setattr(config, "PERFORMANCE_EXPLORE", "off")
     # Off by default here for the same reason: with a PERFORMANCE_PROVIDER set
     # in a developer's own .env this would put the suite on the network and
