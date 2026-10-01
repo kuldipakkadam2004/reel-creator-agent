@@ -3011,3 +3011,117 @@ def test_refresh_outputs_writes_nothing_when_it_is_switched_off(paths, tmp_path,
 
     assert perform.refresh_outputs() == []
     assert not (tmp_path / "r.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# The daily read's log
+#
+# The read task runs `perform.py --fetch` under pythonw.exe, which has no
+# console. On 2026-10-01 it failed at 12:19 with exit 1, and nothing it
+# printed had gone anywhere that could say why.
+# ---------------------------------------------------------------------------
+
+def _reading(monkeypatch, *, recorded: int = 1, warnings=(), boom=None):
+    """`--fetch` with the provider stubbed, and the report too: the report
+    paths are fixed in config, and `paths` does not move them."""
+    def fetch(ledger=None, **kwargs):
+        if boom is not None:
+            raise boom
+        return recorded, list(warnings)
+
+    monkeypatch.setattr(perform, "fetch", fetch)
+    monkeypatch.setattr(perform, "refresh_outputs", lambda **kwargs: [])
+
+
+def _read_logs(paths) -> list[Path]:
+    return sorted((paths / "out" / "logs" / "read").glob("*.log"))
+
+
+def test_the_daily_read_keeps_a_log_of_what_it_said(paths, monkeypatch):
+    _reading(monkeypatch, recorded=2, warnings=["r1: no usable numbers"])
+
+    assert perform.main(["--fetch"]) == 0
+
+    [log] = _read_logs(paths)
+    text = log.read_text(encoding="utf-8")
+    assert "perform.py --fetch" in text.splitlines()[0]
+    assert "recorded 2 reel(s)" in text
+    assert "warning: r1: no usable numbers" in text
+    assert text.splitlines()[-1] == "EXIT    : 0"
+
+
+def test_a_read_that_fails_says_why_in_its_log(paths, monkeypatch):
+    _reading(monkeypatch,
+             boom=perform.PerformanceError("instagram: token expired"))
+
+    assert perform.main(["--fetch"]) == 1
+
+    text = _read_logs(paths)[0].read_text(encoding="utf-8")
+    assert "error: instagram: token expired" in text
+    assert text.splitlines()[-1] == "EXIT    : 1"
+
+
+def test_a_read_that_crashes_leaves_its_traceback_in_the_log(paths, monkeypatch):
+    """Left to the interpreter, the traceback is printed after the transcript
+    has closed - into a stderr that pythonw.exe does not have. The exit code
+    stays the 1 an uncaught exception would have given the scheduler."""
+    _reading(monkeypatch, boom=KeyError("reach"))
+
+    assert perform.main(["--fetch"]) == 1
+
+    text = _read_logs(paths)[0].read_text(encoding="utf-8")
+    assert "Traceback (most recent call last)" in text
+    assert "KeyError: 'reach'" in text
+    assert text.splitlines()[-1].startswith("EXIT    : 1 - crashed")
+
+
+def test_a_read_with_no_console_still_logs(paths, monkeypatch):
+    """What Task Scheduler hands pythonw.exe: no stdout and no stderr."""
+    _reading(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+
+    assert perform.main(["--fetch"]) == 0
+
+    assert "recorded 1 reel(s)" in _read_logs(paths)[0].read_text(encoding="utf-8")
+
+
+def test_only_the_read_keeps_a_log(paths):
+    assert perform.main(["--report"]) == 0
+
+    assert _read_logs(paths) == []
+
+
+def test_a_read_log_is_never_taken_for_a_reel_s_own_log(paths, monkeypatch):
+    """`recover_log` scans output/logs/*.log for an old reel's id, newest name
+    first, and a read names reel ids. Beside the run logs, "read-..." would
+    sort ahead of every one of them."""
+    _reading(monkeypatch, warnings=["old-reel-1a2b3c: no usable numbers"])
+    perform.main(["--fetch"])
+
+    # Found the way `status --read` finds it, wherever that is, so this
+    # fails on the collision itself and not on where the file went.
+    log = perform.newest_read_log()
+    assert "old-reel-1a2b3c" in log.read_text(encoding="utf-8")
+    assert perform.recover_log("old-reel-1a2b3c", {}) is None
+
+
+def test_old_read_logs_are_pruned_by_the_read(paths, monkeypatch):
+    """A read runs every day and a reel only when somebody makes one, so the
+    read cannot rely on step 8 to clear its folder."""
+    import os
+    import time
+
+    _reading(monkeypatch)
+    monkeypatch.setattr(config, "RUN_LOG_KEEP_DAYS", 30)
+    folder = paths / "out" / "logs" / "read"
+    folder.mkdir(parents=True)
+    old = folder / "2026-08-01-120000.log"
+    old.write_text("EXIT    : 0\n", encoding="utf-8")
+    ancient = time.time() - 40 * 86400
+    os.utime(old, (ancient, ancient))
+
+    perform.main(["--fetch"])
+
+    assert not old.exists()
+    assert len(_read_logs(paths)) == 1

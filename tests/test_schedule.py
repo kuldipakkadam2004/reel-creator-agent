@@ -485,3 +485,67 @@ def test_crontab_line_for_the_read_job():
     line = schedule.crontab_line(job="read")
     assert "perform.py --fetch" in line
     assert "run.py" not in line
+
+
+# ---------------------------------------------------------------------------
+# A failed read, explained where it is looked at
+# ---------------------------------------------------------------------------
+
+def _read_log(tmp_path, monkeypatch, *lines: str) -> Path:
+    monkeypatch.setattr(config, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "performance.json")
+    log = tmp_path / "logs" / "read" / "2026-10-01-121945.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return log
+
+
+def test_a_failed_read_shows_the_end_of_its_log(schtasks, monkeypatch, tmp_path,
+                                                 capsys):
+    log = _read_log(tmp_path, monkeypatch,
+                    "READ    : 2026-10-01 12:19:45  perform.py --fetch",
+                    "error: instagram: could not reach graph.facebook.com",
+                    "EXIT    : 1")
+    schtasks.replies.append(FakeCompleted(0, (
+        b"Status:        Ready\r\nLast Result:   1\r\n"
+    )))
+
+    schedule.main(["status", "--read"])
+
+    out = capsys.readouterr().out
+    assert "the read failed - the newest read log is below" in out
+    assert f"LOG     : {log}" in out
+    assert "could not reach graph.facebook.com" in out
+
+
+def test_a_read_that_worked_names_its_log_and_leaves_it_shut(schtasks, monkeypatch,
+                                                            tmp_path, capsys):
+    log = _read_log(tmp_path, monkeypatch,
+                    "READ    : 2026-10-01 16:09:13  perform.py --fetch",
+                    "recorded 1 reel(s) from PERFORMANCE_PROVIDER.",
+                    "EXIT    : 0")
+    schtasks.replies.append(FakeCompleted(0, (
+        b"Status:        Ready\r\nLast Result:   0\r\n"
+    )))
+
+    schedule.main(["status", "--read"])
+
+    out = capsys.readouterr().out
+    assert f"LOG     : {log}" in out
+    assert "recorded 1 reel(s)" not in out
+
+
+def test_a_failed_read_with_no_log_yet_still_says_it_failed(schtasks, monkeypatch,
+                                                            tmp_path, capsys):
+    """Every read before 2026-10-01 left none."""
+    monkeypatch.setattr(config, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "performance.json")
+    schtasks.replies.append(FakeCompleted(0, (
+        b"Status:        Ready\r\nLast Result:   1\r\n"
+    )))
+
+    schedule.main(["status", "--read"])
+
+    out = capsys.readouterr().out
+    assert "(the read failed)" in out
+    assert "LOG     :" not in out

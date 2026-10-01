@@ -59,6 +59,7 @@ import json
 import random
 import statistics
 import sys
+import traceback
 from datetime import date, datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
@@ -70,6 +71,7 @@ if __package__ in (None, ""):
 import config  # noqa: E402
 from pipeline import script_gen  # noqa: E402
 from pipeline import visuals  # noqa: E402
+from pipeline.transcript import Transcript, _attach_console, prune_logs  # noqa: E402
 
 #: Bumped when the shape of a features row changes. Old rows are kept and read
 #: as best they can be - a ledger that discarded its history on an upgrade
@@ -3519,7 +3521,73 @@ def refresh_outputs(*, metric: str = "",
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The daily read's transcript
+# ---------------------------------------------------------------------------
+
+#: The read task's logs get a folder of their own under output/logs/. See
+#: `read_log_path`.
+READ_LOG_DIRNAME = "read"
+
+
+def read_log_path(when: datetime | None = None) -> Path:
+    """Where a read's transcript goes: output/logs/read/<date>-<time>.log.
+
+    Under output/logs/, so it is found where every other log is and kept as
+    long as they are. In a folder of its own, because `recover_log` finds an
+    old reel's log by scanning output/logs/*.log for the reel's id, newest name
+    first - and a read names reel ids too, and "read-..." would sort ahead of
+    every dated run log.
+
+    Built from `config.LOGS_DIR` when called rather than fixed in config, so
+    whatever moves LOGS_DIR moves this with it. The report paths are fixed in
+    config, and the test suite overwrote the real report for two days because
+    moving OUTPUT_DIR did not move them.
+    """
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d-%H%M%S")
+    return config.LOGS_DIR / READ_LOG_DIRNAME / f"{stamp}.log"
+
+
+def newest_read_log() -> Path | None:
+    """The latest read's transcript, scheduled or by hand, or None."""
+    try:
+        logs = sorted(read_log_path().parent.glob("*.log"))
+    except OSError:
+        return None
+    return logs[-1] if logs else None
+
+
+def _read_with_a_log(args: argparse.Namespace) -> int:
+    """`--fetch`, with everything it prints copied into a log file.
+
+    The read task runs this under pythonw.exe, which gives it no console, so
+    until 2026-10-01 nothing it printed went anywhere. That day it failed at
+    12:19 with exit 1, the same task run again at 16:09 succeeded, and nothing
+    was left to say what had gone wrong. Every line now lands in
+    `read_log_path`, with the outcome on the last one.
+
+    A crash is caught here, not left to the interpreter. The interpreter
+    prints its traceback after the transcript has closed, to a stderr that
+    under pythonw does not exist. It still exits 1, which is what an uncaught
+    exception exits with, so the scheduler sees the same thing it always did.
+    """
+    path = read_log_path()
+    prune_logs(directory=path.parent)
+    with Transcript(path):
+        print(f"READ    : {datetime.now():%Y-%m-%d %H:%M:%S}  "
+              f"perform.py --fetch")
+        try:
+            code = _run(args)
+        except Exception:  # noqa: BLE001 - recorded, then exit 1 as before
+            traceback.print_exc()
+            print("EXIT    : 1 - crashed, the traceback above is why")
+            return 1
+        print(f"EXIT    : {code}")
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
+    _attach_console()
     parser = argparse.ArgumentParser(
         description="Record how a reel did, and read back what that says "
                     "about how they are being made (step 9).",
@@ -3586,7 +3654,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true",
                         help="print the report, or the entry, as JSON")
     args = parser.parse_args(argv)
+    if args.fetch:
+        return _read_with_a_log(args)
+    return _run(args)
 
+
+def _run(args: argparse.Namespace) -> int:
+    """Everything `main` does once the arguments are read."""
     ledger = PerformanceLedger()
 
     # Before anything is read or written: reels made before this step existed

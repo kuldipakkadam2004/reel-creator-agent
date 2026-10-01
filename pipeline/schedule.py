@@ -478,6 +478,25 @@ def _print_read_state() -> None:
     print("  python pipeline/perform.py --report what they add up to")
 
 
+#: Lines of a failed read's log shown under `status --read`. The reason is at
+#: the end - the "error:" line, or the traceback, then the EXIT line.
+LOG_TAIL_LINES = 12
+
+
+def _print_log_tail(path: Path, lines: int = LOG_TAIL_LINES) -> None:
+    """The end of a log, which is where a failure says what it was."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"could not read {path}: {exc}")
+        return
+    tail = [line for line in text.splitlines() if line.strip()][-lines:]
+    print(f"the end of {path.name}:")
+    for line in tail:
+        print(f"  {line}")
+    print(RULE)
+
+
 def _print_status(name: str, job: str = "reel") -> None:
     flag = " --read" if job == "read" else ""
     fields = query(name)
@@ -493,22 +512,30 @@ def _print_status(name: str, job: str = "reel") -> None:
     print(f"STATE   : {fields.get('scheduled task state') or fields.get('status', '?')}")
     print(f"NEXT    : {fields.get('next run time', '?')}")
     print(f"LAST    : {fields.get('last run time', '?')}")
-    # Exit 1 means different things to the two jobs, and pointing somebody at
-    # output/logs/ after a failed *read* sends them to a directory the read
-    # task never writes to. It leaves no transcript at all - under pythonw.exe
-    # its stdout goes nowhere - so what it did is read out of the ledger below.
+    # Exit 1 means different things to the two jobs. A failed reel run is
+    # explained in the newest output/logs/<stamp>.log. A failed read is
+    # explained in its own transcript under output/logs/read/, which it has
+    # kept since 2026-10-01 - before that it left nothing at all, because
+    # under pythonw.exe its stdout went nowhere.
     meaning = dict(_LAST_RESULT)
+    log = perform.newest_read_log() if job == "read" else None
     if job == "read":
-        meaning["1"] = ("the read failed - run `python pipeline/perform.py "
-                        "--fetch` by hand to see why")
+        # "the newest", not "its": a read run by hand since then writes a
+        # newer one. The file is named for when it ran, to set against LAST.
+        meaning["1"] = ("the read failed - the newest read log is below"
+                        if log else "the read failed")
     print(f"RESULT  : {result}"
           + (f"  ({meaning[result]})" if result in meaning else ""))
     print(f"RUNS    : {fields.get('task to run', '?')}")
+    if log:
+        print(f"LOG     : {log}")
     print(RULE)
 
     # The OS knows whether the process started. Only the ledger knows whether a
     # reel came out of it, which is the question actually being asked.
     if job == "read":
+        if result == "1" and log:
+            _print_log_tail(log)
         _print_read_state()
         return
 
@@ -609,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
             print("It runs in the background - watch it with:")
             if job == "read":
                 print("  python pipeline/perform.py")
+                print(f"  the newest file in {perform.read_log_path().parent}")
             else:
                 print(f"  python pipeline/run.py --status")
                 print(f"  the newest file in {config.LOGS_DIR}")
