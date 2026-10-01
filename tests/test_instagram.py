@@ -68,6 +68,13 @@ def credentials(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "INSTAGRAM_API_HOST", "")
     monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "performance.json")
     monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path / "out")
+    # The token clock too. Its path is fixed from the real OUTPUT_DIR when
+    # config is imported, so moving OUTPUT_DIR above does not move it. Until
+    # 2026-10-01 every fetch test wrote "token-abc"'s hash into the real
+    # output/token-age.json. The next real read then took the real token for
+    # a new one and restarted its sixty days, so the expiry warning could
+    # never come due.
+    monkeypatch.setattr(config, "INSTAGRAM_TOKEN_STATE", tmp_path / "token-age.json")
     monkeypatch.setenv("INSTAGRAM_ACCESS_TOKEN", "token-abc")
     monkeypatch.setenv("INSTAGRAM_USER_ID", "17800000000000000")
     return tmp_path
