@@ -1739,6 +1739,122 @@ def test_phrase_json_ignores_an_index_off_the_end():
 
 
 # ---------------------------------------------------------------------------
+# A headline that names nothing to explain
+# ---------------------------------------------------------------------------
+
+def test_the_explains_verdict_is_read_tolerantly():
+    entries = topics._parse_phrase_entries(json.dumps([
+        {"index": 0, "topic": "a b c", "explains": False},
+        {"index": 1, "topic": "d e f", "explains": "yes"},
+        {"index": 2, "topic": "g h i", "explains": "maybe"},
+        {"index": 3, "topic": "j k l"},
+    ]), 4)
+    assert [entries[i]["explains"] for i in range(4)] == [False, True, None, None]
+
+
+def test_the_phrase_pass_records_whether_a_headline_explains_anything(monkeypatch):
+    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **kw: json.dumps([
+        {"index": 0, "topic": "what makes a river spot a favorite place",
+         "explains": False},
+        {"index": 1, "topic": "why the ocean is salty", "explains": True},
+    ]))
+    board = [candidate("my favorite place at this river",
+                       title="My favorite place at this river"),
+             candidate("the ocean is salty because of rain",
+                       title="TIL the ocean is salty because of rain")]
+    topics.polish_phrases(board, mode="llm")
+    assert [c.explains for c in board] == [False, True]
+
+
+def test_a_drifted_rewrite_still_carries_the_verdict_on_its_headline(monkeypatch):
+    """The verdict is about the headline. Throwing the rewrite away does not
+    make an empty headline worth a reel."""
+    monkeypatch.setattr(script_gen, "call_gemini", lambda *a, **kw: json.dumps([
+        {"index": 0, "topic": "the best pasta recipes in Rome", "explains": False},
+    ]))
+    board = [candidate("sunset over the bay", title="Sunset over the bay last night")]
+    topics.polish_phrases(board, mode="llm")
+    assert board[0].explains is False
+
+
+def _caption_gemini(empty_headlines):
+    """The phrase pass, answering False for the headlines named."""
+    def call(prompt, **kwargs):
+        lines = _numbered(prompt)
+        if "Rewrite each headline" in prompt:
+            return json.dumps([
+                {"index": index, "topic": line,
+                 "explains": line not in empty_headlines}
+                for index, line in enumerate(lines)
+            ])
+        return json.dumps([{"index": i, "footage": 3} for i, _ in enumerate(lines)])
+    return call
+
+
+def test_a_caption_with_nothing_to_explain_never_reaches_the_board(
+        offline, monkeypatch):
+    """The 2026-10-05 board: a photo caption, rewritten into a question, beat
+    every backlog line and made a reel with no fact in it."""
+    caption = "My favorite place at this river"
+    monkeypatch.setattr(script_gen, "call_gemini", _caption_gemini({caption}))
+    install_source(monkeypatch, "reddit", [
+        candidate(caption, external_id="cap", rate=900, age_hours=2),
+        candidate("how a river delta builds new land", external_id="fact",
+                  rate=100, age_hours=2),
+    ])
+
+    board = topics.find_topics("", sources=("reddit",), sourceability="off",
+                               phrases="llm")
+
+    shown = [row["topic"] for row in board["candidates"]]
+    assert shown == ["how a river delta builds new land"]
+    dropped = [row for row in board["rejected"] if row["key"] == "reddit:cap"]
+    assert dropped and "nothing to explain" in dropped[0]["reason"]
+    assert dropped[0]["explains"] is False
+
+
+def test_no_verdict_keeps_the_candidate(offline, monkeypatch):
+    """A pass that answered nothing about a headline has not said it is empty."""
+    monkeypatch.setattr(script_gen, "call_gemini", _fake_gemini())
+    install_source(monkeypatch, "reddit", [
+        candidate("My favorite place at this river", external_id="cap",
+                  rate=900, age_hours=2),
+    ])
+    board = topics.find_topics("", sources=("reddit",), sourceability="off",
+                               phrases="llm")
+    assert [row["key"] for row in board["candidates"]] == ["reddit:cap"]
+
+
+def test_the_gate_can_be_switched_off(offline, monkeypatch):
+    caption = "My favorite place at this river"
+    monkeypatch.setattr(config, "TOPIC_REQUIRE_EXPLAINABLE", False)
+    monkeypatch.setattr(script_gen, "call_gemini", _caption_gemini({caption}))
+    install_source(monkeypatch, "reddit", [
+        candidate(caption, external_id="cap", rate=900, age_hours=2),
+    ])
+    board = topics.find_topics("", sources=("reddit",), sourceability="off",
+                               phrases="llm")
+    assert [row["key"] for row in board["candidates"]] == ["reddit:cap"]
+
+
+def test_a_straggler_with_nothing_to_explain_is_dropped_too(offline, monkeypatch):
+    """A winner that missed the shortlist is polished late, and checked then."""
+    caption = "Sunset over the bay last night"
+    monkeypatch.setattr(config, "TOPIC_PROBE_LIMIT", 1)
+    monkeypatch.setattr(config, "TOPIC_CANDIDATES", 2)
+    monkeypatch.setattr(script_gen, "call_gemini", _caption_gemini({caption}))
+    install_source(monkeypatch, "reddit", [
+        candidate("how a canyon is carved", external_id="t1",
+                  rate=900, age_hours=2),
+        candidate(caption, external_id="t2", rate=300, age_hours=2),
+    ])
+    board = topics.find_topics("", sources=("reddit",), sourceability="off",
+                               phrases="llm")
+    assert [row["key"] for row in board["candidates"]] == ["reddit:t1"]
+    assert any(row["key"] == "reddit:t2" for row in board["rejected"])
+
+
+# ---------------------------------------------------------------------------
 # find_topics
 # ---------------------------------------------------------------------------
 

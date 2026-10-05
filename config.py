@@ -421,6 +421,24 @@ TOPIC_PROBE_LIMIT = get_env_int("TOPIC_PROBE_LIMIT", 16)
 #:   heuristic - strip the forum furniture (TIL, ELI5, [OC]) locally, no call
 TOPIC_PHRASE_MODE = get_env("TOPIC_PHRASE_MODE", "llm")
 
+#: Drop a candidate whose headline names nothing a video could explain - a
+#: caption pointing at a photo, the poster's own story, a matter of taste, a
+#: "what is this?" - instead of letting the rewrite turn it into a question.
+#: The phrase pass answers it alongside the rewrite, so this needs
+#: TOPIC_PHRASE_MODE=llm and costs no extra call.
+#:
+#: The rewrite was the hole. On 2026-10-05 r/geology's "My favorite place at
+#: this river", a photo caption, came back as "what makes a river spot a
+#: favorite place", earned the explainer-shape points for that wording and
+#: beat every backlog line 4.38 to 1.80. The reel it made had no fact in it.
+#: Measured on that board's 47 headlines plus 13 written controls, two runs
+#: with identical verdicts: every caption, taste and identify-this control
+#: failed, every TIL and backlog line passed, and so did "Spotted Rocks in
+#: Yosemite" and the glacial-till post, which name something with a cause.
+#: Of the 29 reels posted to that date it would have stopped one, "Frozen
+#: with fear" (reach 54).
+TOPIC_REQUIRE_EXPLAINABLE = get_env_bool("TOPIC_REQUIRE_EXPLAINABLE", True)
+
 #: Topics scouted in the last N boards are scored down so the same candidate
 #: does not head every board; one already made into a reel is dropped. 0
 #: disables the ledger.
@@ -2393,6 +2411,11 @@ def _report() -> None:
          if TOPIC_SOURCEABILITY == "probe"
          else "off (the board may hold topics step 4 cannot shoot)"),
         ("TOPIC_PHRASE_MODE", TOPIC_PHRASE_MODE),
+        ("TOPIC_EXPLAINABLE",
+         "required - a headline naming nothing to explain is dropped"
+         if TOPIC_REQUIRE_EXPLAINABLE and TOPIC_PHRASE_MODE == "llm"
+         else "not checked" + ("" if TOPIC_REQUIRE_EXPLAINABLE
+                               else " (TOPIC_REQUIRE_EXPLAINABLE is off)")),
         ("GEMINI_MODEL", GEMINI_MODEL),
         ("GEMINI_TIMEOUT", f"{GEMINI_TIMEOUT_SECONDS:g}s per call, then retried"),
         ("SCRIPT_LENGTH", f"{SCRIPT_DEFAULT_SECONDS}s default, step 0 suggests "

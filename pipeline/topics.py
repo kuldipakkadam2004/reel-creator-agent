@@ -501,9 +501,10 @@ def sourceability_rung(rating: int) -> float:
 PHRASE_TEMPERATURE = 0.3
 PHRASE_MAX_TOKENS = 1024
 #: Output budget per headline, used when the batch is bigger than the fixed
-#: floor above covers. One {"index": 0, "topic": "..."} object runs about 25
-#: tokens; 48 leaves room for a long subject without risking a truncated array.
-PHRASE_TOKENS_PER_PHRASE = 48
+#: floor above covers. One {"index": 0, "topic": "...", "explains": true}
+#: object runs about 31 tokens; 56 leaves room for a long subject without
+#: risking a truncated array.
+PHRASE_TOKENS_PER_PHRASE = 56
 PHRASE_THINKING_BUDGET = 0
 
 #: How much of a rewrite has to have come from the original before it counts
@@ -670,6 +671,11 @@ class Candidate:
     #: `polish_phrases` for every candidate it is handed, rewritten or not:
     #: after that pass the headline standing *is* the final wording.
     provisional: bool = False
+    #: Whether the headline names anything a video could explain, as the
+    #: phrase pass judged it. None when nothing asked - the pass is off, it
+    #: failed, or this candidate never reached it - and None is kept, never
+    #: dropped. See TOPIC_REQUIRE_EXPLAINABLE.
+    explains: bool | None = None
     #: How long the reel about this should be, and the parts that decided it.
     #: Filled in after the phrase pass, because the phrasing is what says
     #: whether this is a mechanism or a fact.
@@ -698,6 +704,7 @@ class Candidate:
             "score": self.score,
             "components": self.components,
             "sourceability": self.sourceability,
+            "explains": self.explains,
             "duration": self.duration,
             "duration_components": self.duration_components,
             "notes": list(self.notes),
@@ -2976,7 +2983,8 @@ You always return valid JSON and nothing else."""
 
 
 _PHRASE_PROMPT_TEMPLATE = """\
-Rewrite each headline below as a video topic.
+Rewrite each headline below as a video topic, and say whether it gives a video \
+anything to explain.
 
 Rules:
 - Keep the subject of the original. Do not invent a different one, and do not \
@@ -2988,15 +2996,45 @@ ocean is salty" becomes "why the ocean is salty".
 - 4 to 10 words. Lower case except for names. No trailing punctuation.
 - Do not reorder them, do not score them, do not leave any out.
 
+"explains" is a separate question, about the headline as written and not \
+about your rewrite. Any headline can be turned into a question, so whether \
+your topic reads as one is not the test. Ask whether the headline names \
+something specific a video could explain: a fact, a finding, an event, a \
+phenomenon, a process, or a particular creature, rock, landform or place \
+with something about it that has a cause. It counts even when the post \
+around it is personal or is a caption on a photo - "striped cliffs on the \
+Oregon coast" names cliffs with stripes in them, and "my lecturer hates the \
+word moraine" names a moraine.
+
+Answer false when the headline names nothing a video could explain: a \
+caption that points at a picture instead of naming anything in it ("my \
+favourite spot on this river", "sunset at the lake last night", "look what \
+I found on my hike"), the poster's own story or achievement ("my first time \
+seeing the ocean"), an opinion or a matter of taste, a request to identify \
+something it does not name ("what is this rock?"), or a meme. Give it a \
+topic all the same.
+
 Headlines:
 {headlines}
 
 Return ONLY a JSON array, {count} objects long, in the same order:
-[{{"index": 0, "topic": "..."}}]"""
+[{{"index": 0, "topic": "...", "explains": true}}]"""
 
 
 def _parse_phrase_json(raw: str, expected: int) -> dict[int, str]:
     """Read the model's rewrites, tolerantly. Missing entries are simply absent."""
+    return {index: entry["topic"]
+            for index, entry in _parse_phrase_entries(raw, expected).items()
+            if entry["topic"]}
+
+
+def _parse_phrase_entries(raw: str, expected: int) -> dict[int, dict]:
+    """Read each entry as {"topic": str, "explains": bool | None}.
+
+    `explains` is None where the model left it out or answered with something
+    that is not a yes or a no, and None keeps the candidate: a verdict that
+    was never given must not drop a topic.
+    """
     text = (raw or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
@@ -3010,7 +3048,7 @@ def _parse_phrase_json(raw: str, expected: int) -> dict[int, str]:
     if not isinstance(data, list):
         raise ValueError("model output was not a JSON array")
 
-    out: dict[int, str] = {}
+    out: dict[int, dict] = {}
     for position, entry in enumerate(data):
         if isinstance(entry, str):
             entry = {"index": position, "topic": entry}
@@ -3020,9 +3058,17 @@ def _parse_phrase_json(raw: str, expected: int) -> dict[int, str]:
             index = int(entry.get("index", position))
         except (TypeError, ValueError):
             index = position
+        if not 0 <= index < expected:
+            continue
         topic = " ".join(str(entry.get("topic") or "").split()).strip(" .!?,;:")
-        if topic and 0 <= index < expected:
-            out[index] = topic
+        explains = entry.get("explains")
+        if isinstance(explains, str):
+            explains = {"true": True, "yes": True,
+                        "false": False, "no": False}.get(explains.strip().lower())
+        if not isinstance(explains, bool):
+            explains = None
+        if topic or explains is not None:
+            out[index] = {"topic": topic, "explains": explains}
     return out
 
 
@@ -3094,7 +3140,7 @@ def polish_phrases(candidates: list[Candidate], *, mode: str | None = None) -> l
             thinking_budget=PHRASE_THINKING_BUDGET,
             json_mode=True,
         )
-        rewritten = _parse_phrase_json(raw, len(candidates))
+        entries = _parse_phrase_entries(raw, len(candidates))
     except (script_gen.ScriptGenerationError, config.MissingConfigError,
             ValueError) as exc:
         for candidate in candidates:
@@ -3107,7 +3153,12 @@ def polish_phrases(candidates: list[Candidate], *, mode: str | None = None) -> l
     for index, candidate in enumerate(candidates):
         # Whatever the model returned for it, this candidate has had its go.
         candidate.provisional = False
-        topic = rewritten.get(index)
+        entry = entries.get(index) or {}
+        # Recorded before the drift check, and whether or not the rewrite is
+        # kept: it is a verdict on the headline, which a discarded rewrite
+        # does not change.
+        candidate.explains = entry.get("explains")
+        topic = entry.get("topic")
         if not topic:
             continue
         if not _phrase_is_faithful(candidate.title or candidate.topic, topic):
@@ -3126,6 +3177,31 @@ def polish_phrases(candidates: list[Candidate], *, mode: str | None = None) -> l
             f"original and were discarded"
         )
     return warnings
+
+
+def _drop_unexplainable(candidates: list[Candidate],
+                        rejected: list[dict]) -> set[int]:
+    """Move the candidates the phrase pass called empty to `rejected`, and
+    return their `id()`s so the caller can take them off its own lists.
+
+    By identity because `Candidate` is a dataclass, and `==` would compare
+    every field. Only an explicit False drops a candidate. None means no
+    verdict: the pass is off or failed, or never reached this one. None keeps
+    the candidate, for the reason the niche pass falls back rather than
+    guessing - a wrong drop silently removes a topic that could have been made.
+    """
+    if not config.TOPIC_REQUIRE_EXPLAINABLE:
+        return set()
+    gone: set[int] = set()
+    for candidate in candidates:
+        if candidate.explains is False:
+            rejected.append({
+                **candidate.as_dict(),
+                "reason": "names nothing to explain - a caption or a post, "
+                          "not a fact",
+            })
+            gone.add(id(candidate))
+    return gone
 
 
 # ---------------------------------------------------------------------------
@@ -3388,6 +3464,15 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
     shortlist = scored[:max(wanted, config.TOPIC_PROBE_LIMIT)]
     warnings.extend(polish_phrases(shortlist, mode=phrases))
 
+    # Straight after the rewrite and before anything scores it, because the
+    # rewrite is what hides the problem: it turns "My favorite place at this
+    # river" into "what makes a river spot a favorite place", which then earns
+    # the explainer-shape points that a caption could never have earned. See
+    # TOPIC_REQUIRE_EXPLAINABLE.
+    gone = _drop_unexplainable(shortlist, rejected)
+    shortlist = [c for c in shortlist if id(c) not in gone]
+    scored = [c for c in scored if id(c) not in gone]
+
     # Re-scored, because the wording moved under the score. This is the point
     # at which the form components are charged, and it is deliberately before
     # the probe: `apply_sourceability` and `apply_measured` add to
@@ -3488,6 +3573,11 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
     # away on one.
     stragglers = [candidate for candidate in board if candidate.provisional]
     warnings.extend(polish_phrases(stragglers, mode=phrases))
+    # The same check as after 2c. A straggler that fails it leaves the board a
+    # row short rather than pulling up another, which would arrive unpolished
+    # and unchecked in its turn.
+    gone = _drop_unexplainable(stragglers, rejected)
+    board = [c for c in board if id(c) not in gone]
 
     # --- 5. decide how long each one should be -----------------------------
     # After the phrase pass and not before. The rewrite is what turns "TIL that
