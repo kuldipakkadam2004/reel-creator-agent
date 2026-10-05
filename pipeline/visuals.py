@@ -166,6 +166,17 @@ SCREEN_MODEL_TEMPERATURE = 0.0
 SCREEN_MODEL_MAX_TOKENS = 4096
 SCREEN_THINKING_BUDGET = 0
 
+#: Longest edge, in pixels, of a still shown to the screener. Gemini bills an
+#: image no wider and no taller than 384 as a single 258-token tile, and at
+#: that size a hornbill is plainly not a kingfisher. See VISUAL_SCREEN_PICTURES.
+SCREEN_PICTURE_EDGE = 384
+#: Seconds to wait for one still. One that does not arrive is screened on its
+#: words alone, which is how every clip was screened before.
+SCREEN_PICTURE_TIMEOUT = 10.0
+#: Stills fetched at once. A shortlist pass asks for forty or so across three
+#: or four hosts, and one at a time would add half a minute to step 4.
+SCREEN_PICTURE_WORKERS = 8
+
 #: Words that appear in a stock URL slug without describing the footage.
 _SLUG_CHROME = frozenset({
     "video", "videos", "photo", "photos", "clip", "clips", "footage", "stock",
@@ -1269,6 +1280,13 @@ class PixabayProvider(Provider):
             if not best:
                 continue
             url, width, height = best
+            # Each stream size carries its own still. The small one is plenty
+            # for the screener, which shrinks it again before sending it.
+            still = next((
+                (streams.get(quality) or {}).get("thumbnail")
+                for quality in ("small", "tiny", "medium", "large")
+                if (streams.get(quality) or {}).get("thumbnail")
+            ), "")
             out.append(Candidate(
                 provider=self.name,
                 provider_id=str(item.get("id")),
@@ -1281,6 +1299,7 @@ class PixabayProvider(Provider):
                 license=self.LICENSE,
                 title=(item.get("tags") or "").strip(),
                 duration=float(item.get("duration") or 0) or None,
+                preview_url=still or "",
             ))
         return out
 
@@ -2075,6 +2094,78 @@ at all.
 - "subj" is answered exactly as above, against the topic."""
 
 
+#: Appended to the prompt when stills came with the candidates. The rules
+#: above are written for a model reading words, and one of them says so; this
+#: tells it what changes when it can also see.
+_SCREEN_PICTURE_RULES = """\
+
+Most candidates also come with a still from the clip, shown above and \
+labelled "Beat B clip I" to match the list. The still is the evidence and \
+the words are the library's claim about it, and libraries tag clips \
+wrongly: a clip tagged "kingfisher" that shows a hornbill is a hornbill, \
+and a clip tagged "mud" that shows a beach from the air is a beach. Where \
+the still and the words disagree about what the clip shows, believe the \
+still, for "ok" and for "subj" alike.
+
+- Judge what is in the still - which animal, which place, which thing - and \
+still ignore framing, colour and quality, which are judged later on the \
+finished video.
+- A still is one frame of a moving clip. Do not reject a clip for what the \
+still leaves out of frame; reject it for what the still shows that the \
+line rules out, or for showing a different subject from the one the line \
+is about.
+- A candidate with no still is judged on its words, as before."""
+
+
+def _screen_picture(url: str) -> bytes | None:
+    """One candidate's still, shrunk to a single image tile. None on any failure.
+
+    Never raises: a still is an improvement to the screen, not a condition of
+    it, so a dead link, a refused request or a file Pillow cannot read all
+    leave the candidate to be judged on its words.
+    """
+    if not url:
+        return None
+    try:
+        import io
+
+        import requests
+        from PIL import Image
+
+        response = requests.get(url, timeout=SCREEN_PICTURE_TIMEOUT,
+                                headers={"User-Agent": USER_AGENT})
+        response.raise_for_status()
+        with Image.open(io.BytesIO(response.content)) as image:
+            still = image.convert("RGB")
+            still.thumbnail((SCREEN_PICTURE_EDGE, SCREEN_PICTURE_EDGE))
+            out = io.BytesIO()
+            still.save(out, format="JPEG", quality=80)
+            return out.getvalue()
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+
+
+def _screen_pictures(
+    shortlists: dict[int, list[Candidate]],
+) -> dict[tuple[int, int], bytes]:
+    """The stills for every candidate that has one, keyed (beat, position)."""
+    if not config.VISUAL_SCREEN_PICTURES:
+        return {}
+    wanted = {
+        (beat_index, position): candidate.preview_url
+        for beat_index, candidates in shortlists.items()
+        for position, candidate in enumerate(candidates)
+        if candidate.preview_url
+    }
+    if not wanted:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=SCREEN_PICTURE_WORKERS) as pool:
+        fetched = dict(zip(wanted, pool.map(_screen_picture, wanted.values())))
+    return {slot: data for slot, data in fetched.items() if data}
+
+
 def _parse_screen_json(
     raw: str,
 ) -> tuple[dict[int, dict[int, tuple[bool, str]]], dict[int, dict[int, bool]]]:
@@ -2151,20 +2242,13 @@ def llm_screen(
     rather than a flag per beat because the two questions cannot share a
     prompt: one of them ends "a loose match beats a blank screen" and the
     other has to say the opposite.
+
+    Each candidate with a `preview_url` is shown as a still beside its words
+    when VISUAL_SCREEN_PICTURES is on - see `_SCREEN_PICTURE_RULES`.
     """
     by_index = {b.index: b for b in beats}
-    listing: list[str] = []
-    for beat_index in sorted(shortlists):
-        beat = by_index.get(beat_index)
-        if beat is None:
-            continue
-        listing.append(f'Beat {beat_index} narration: "{beat.text}"')
-        listing.append(f'Beat {beat_index} was searched for: "{beat.query}"')
-        for position, candidate in enumerate(shortlists[beat_index]):
-            described = describe_candidate(candidate) or "(no description given)"
-            listing.append(f"  {position}. {described}")
-        listing.append("")
-    if not listing:
+    order = [index for index in sorted(shortlists) if index in by_index]
+    if not order:
         return {}, []
 
     try:
@@ -2172,12 +2256,29 @@ def llm_screen(
     except config.MissingConfigError as exc:
         return {}, [f"relevance_mode=llm but {exc} Used the lexical check instead."]
 
+    pictures = _screen_pictures({index: shortlists[index] for index in order})
+    listing: list[str] = []
+    for beat_index in order:
+        beat = by_index[beat_index]
+        listing.append(f'Beat {beat_index} narration: "{beat.text}"')
+        listing.append(f'Beat {beat_index} was searched for: "{beat.query}"')
+        for position, candidate in enumerate(shortlists[beat_index]):
+            described = describe_candidate(candidate) or "(no description given)"
+            still = ("  [still attached]" if (beat_index, position) in pictures
+                     else "  [no still]" if pictures else "")
+            listing.append(f"  {position}. {described}{still}")
+        listing.append("")
+
     rendered = "\n".join(listing).strip()
     prompt = _SCREEN_PROMPT_TEMPLATE.format(
         topic=topic or "(not given)", beats=rendered
     )
     if establishing:
         prompt += "\n" + _SCREEN_ESTABLISHING_RULES
+    contents: str | list = prompt
+    # A call with pictures in it waits as long as step 5b's does, for the
+    # reason `client_http_options` gives: reading the images takes time.
+    timeout = config.LOOK_TIMEOUT_SECONDS if pictures else None
     try:
         from google import genai
         from google.genai import types
@@ -2196,13 +2297,23 @@ def llm_screen(
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=SCREEN_THINKING_BUDGET
             )
+        if pictures:
+            # Labelled and interleaved, as `call_gemini` does it, so a verdict
+            # cannot be read back against the wrong still; the question last.
+            parts: list = []
+            for (beat_index, position), data in sorted(pictures.items()):
+                parts.append(f"Beat {beat_index} clip {position}:")
+                parts.append(types.Part.from_bytes(data=data, mime_type="image/jpeg"))
+            parts.append(prompt + "\n" + _SCREEN_PICTURE_RULES)
+            contents = parts
         client = genai.Client(
-            api_key=api_key, http_options=script_gen.client_http_options()
+            api_key=api_key, http_options=script_gen.client_http_options(timeout)
         )
         response = script_gen.generate_content(
             client,
+            timeout=timeout,
             model=config.GEMINI_MODEL,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(**kwargs),
         )
         script_gen.USAGE.record(

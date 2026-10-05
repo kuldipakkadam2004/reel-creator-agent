@@ -16,6 +16,7 @@ import io
 import json
 import re
 import sys
+from dataclasses import replace as dataclass_replace
 from hashlib import sha1
 from pathlib import Path
 
@@ -656,6 +657,117 @@ def test_llm_screen_without_a_key_warns_and_defers_to_lexical(monkeypatch):
     )
     assert verdicts == {}
     assert warnings and "lexical" in warnings[0]
+
+
+# --- the screener sees a still, not only the words ---------------------------
+
+def _screen_capturing(monkeypatch, verdicts_json):
+    """Stand in for the SDK and keep what `llm_screen` sent it."""
+    from google import genai
+
+    sent: dict = {}
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            sent.update(kwargs)
+            return type("R", (), {"text": verdicts_json,
+                                  "usage_metadata": None})()
+
+    class FakeClient:
+        def __init__(self, api_key=None, http_options=None):
+            sent["http_options"] = http_options
+            self.models = FakeModels()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    return sent
+
+
+def _with_still(index: int, slug: str, title: str = "") -> Candidate:
+    return dataclass_replace(_described(index, slug, title),
+                             preview_url=f"https://stills.test/{index}.jpg")
+
+
+KINGFISHER = Beat(
+    index=3, start=0.0, end=3.0, query="kingfisher flying over river",
+    text="It's the kingfisher that flashes past,",
+)
+
+
+def test_the_screener_is_shown_each_still_under_its_own_label(monkeypatch):
+    monkeypatch.setattr(config, "VISUAL_SCREEN_PICTURES", True)
+    monkeypatch.setattr(visuals, "_screen_picture",
+                        lambda url: b"jpeg:" + url.encode() if "/0." in url else None)
+    sent = _screen_capturing(monkeypatch, json.dumps([
+        {"beat": 3, "verdicts": [{"i": 0, "ok": False, "subj": False,
+                                  "why": "shows a hornbill"},
+                                 {"i": 1, "ok": True, "subj": False}]},
+    ]))
+
+    verdicts, warnings = visuals.llm_screen(
+        {3: [_with_still(0, "bird", "bird, kingfisher, trees"),
+             _with_still(1, "kingfisher-perched")]},
+        [KINGFISHER], "what makes a river spot a favorite place",
+    )
+
+    assert warnings == []
+    assert verdicts[3][0] == (False, "shows a hornbill")
+    contents = sent["contents"]
+    assert isinstance(contents, list)
+    # The label, then its picture, and the question last.
+    assert contents[0] == "Beat 3 clip 0:"
+    assert getattr(contents[1], "inline_data", None) is not None
+    assert contents[1].inline_data.data == b"jpeg:https://stills.test/0.jpg"
+    question = contents[-1]
+    assert "believe the still" in question
+    assert "0. " in question and "[still attached]" in question
+    assert "[no still]" in question          # clip 1's still did not arrive
+    assert sent["http_options"].timeout == int(config.LOOK_TIMEOUT_SECONDS * 1000)
+
+
+def test_with_pictures_off_the_screener_reads_words_alone(monkeypatch):
+    monkeypatch.setattr(config, "VISUAL_SCREEN_PICTURES", False)
+
+    def no_fetch(url):
+        raise AssertionError("fetched a still with pictures off")
+
+    monkeypatch.setattr(visuals, "_screen_picture", no_fetch)
+    sent = _screen_capturing(monkeypatch, json.dumps([
+        {"beat": 3, "verdicts": [{"i": 0, "ok": True, "subj": False}]},
+    ]))
+    visuals.llm_screen({3: [_with_still(0, "kingfisher")]}, [KINGFISHER], "rivers")
+
+    assert isinstance(sent["contents"], str)
+    assert "believe the still" not in sent["contents"]
+    assert "[no still]" not in sent["contents"]
+
+
+def test_a_still_is_shrunk_to_one_image_tile(monkeypatch):
+    import requests
+
+    class Response:
+        content = jpeg_bytes(1080, 1920)
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(requests, "get", lambda url, **kw: Response())
+    from PIL import Image
+
+    data = visuals._screen_picture("https://stills.test/big.jpg")
+    with Image.open(io.BytesIO(data)) as image:
+        assert max(image.size) <= visuals.SCREEN_PICTURE_EDGE
+
+
+def test_a_still_that_will_not_arrive_is_simply_absent(monkeypatch):
+    import requests
+
+    def refuse(url, **kwargs):
+        raise requests.ConnectionError("no route")
+
+    monkeypatch.setattr(requests, "get", refuse)
+    assert visuals._screen_picture("https://stills.test/x.jpg") is None
+    assert visuals._screen_picture("") is None
 
 
 def test_the_screen_draws_the_line_at_a_different_culture_not_a_different_century():
@@ -2178,6 +2290,23 @@ def test_pixabay_videos_take_the_largest_stream():
     provider = visuals.PixabayProvider(FakeSession())
     [candidate] = provider._videos(payload)
     assert candidate.download_url == "l.mp4" and candidate.height == 1920
+
+
+def test_pixabay_videos_carry_a_still_for_the_screener():
+    """The only provider kind that had none - and the one that tagged a
+    hornbill "kingfisher" on 2026-10-05."""
+    payload = {"hits": [{
+        "id": 214669, "duration": 20, "pageURL": "p", "user": "Cy",
+        "tags": "bird, kingfisher, trees",
+        "videos": {
+            "large": {"url": "l.mp4", "width": 1080, "height": 1920,
+                      "thumbnail": "https://cdn.test/214669_large.jpg"},
+            "small": {"url": "s.mp4", "width": 540, "height": 960,
+                      "thumbnail": "https://cdn.test/214669_small.jpg"},
+        },
+    }]}
+    [candidate] = visuals.PixabayProvider(FakeSession())._videos(payload)
+    assert candidate.preview_url == "https://cdn.test/214669_small.jpg"
 
 
 def test_openverse_carries_the_licence_into_the_attribution():

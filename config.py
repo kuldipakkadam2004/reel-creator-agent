@@ -982,6 +982,21 @@ VISUAL_RELEVANCE_FLOOR = get_env_float("VISUAL_RELEVANCE_FLOOR", 0.15)
 #: for a run that keeps warning it placed unscreened clips.
 VISUAL_RELEVANCE_SHORTLIST = get_env_int("VISUAL_RELEVANCE_SHORTLIST", 6)
 
+#: Show the `llm` screener a still of each candidate as well as the library's
+#: words for it, and have it believe the still where the two disagree.
+#:
+#: The words are a claim, and libraries get them wrong in a way no prompt
+#: reading them can catch. On 2026-10-05 Pixabay's "bird, kingfisher, trees"
+#: was a great hornbill, its "heron, stork, great egret" was some other grey
+#: bird, and its "mud, dirt, earth" was a beach from the air. The screener
+#: approved all three, correctly on the words, and step 5b found them only
+#: after the encode, when nothing could change. The bison that were sheep
+#: (2026-09-17) were the same failure. The stills come from the providers'
+#: own thumbnail URLs, shrunk to one image tile each, so nothing is
+#: downloaded at full size and a run adds about 258 input tokens per clip
+#: screened. A still that fails to arrive is screened on its words, as before.
+VISUAL_SCREEN_PICTURES = get_env_bool("VISUAL_SCREEN_PICTURES", True)
+
 #: How many beats may fall back to the neutral shot before the rest are made to
 #: take their chances with unjudged footage instead. Off by default, because
 #: the one time it was measured it made the reel worse.
@@ -2432,6 +2447,8 @@ def _report() -> None:
             if VISUAL_MAX_PER_CREATOR else ", any number per creator")),
         ("VISUAL_RELEVANCE",
          f"{VISUAL_RELEVANCE_MODE}, top {VISUAL_RELEVANCE_SHORTLIST} per beat"
+         + (", judged on a still as well as the words"
+            if VISUAL_RELEVANCE_MODE == "llm" and VISUAL_SCREEN_PICTURES else "")
          + (f", lexical floor {VISUAL_RELEVANCE_FLOOR}"
             if VISUAL_RELEVANCE_MODE != "off" else "")),
         ("VISUAL_MIN_RESOLUTION",
