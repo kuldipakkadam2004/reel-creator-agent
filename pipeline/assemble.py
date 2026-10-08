@@ -1847,7 +1847,15 @@ def _shot_chain(shot: Shot, label_in: str, label_out: str) -> str:
             f"fps={fps}",
         ]
 
-    steps += ["setsar=1", "format=yuv420p", "setpts=PTS-STARTPTS",
+    # Every segment reaches concat as limited range, converted rather than
+    # relabelled. A JPEG still is full range, and ffmpeg 7.1 crashed outright
+    # (exit 3221225477, an access violation) when a full-range still followed
+    # a limited-range clip - the forest-fire reel, 2026-10-07. A relabel alone
+    # stops the crash too, but ships the still's 0-255 levels as 16-235: black
+    # crushed and highlights clipped. Limited-range and untagged clips pass
+    # through this untouched.
+    steps += ["setsar=1", "scale=out_range=tv", "format=yuv420p",
+              "setrange=tv", "setpts=PTS-STARTPTS",
               f"trim=duration={shot.duration:.3f}", "setpts=PTS-STARTPTS"]
 
     if config.TRANSITION == "dip" and config.TRANSITION_SECONDS > 0:

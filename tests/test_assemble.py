@@ -768,6 +768,16 @@ def test_every_shot_is_cropped_to_the_configured_frame():
     assert "setsar=1" in chain
 
 
+def test_a_still_reaches_concat_converted_to_limited_range():
+    """A full-range JPEG after a limited-range clip crashed ffmpeg 7.1's concat."""
+    chain = assemble._shot_chain(
+        shot(kind="image", path=Path("/nowhere/x.jpg"), motion="push",
+             motion_zoom=1.12), "0:v", "v0")
+    steps = chain.split(",")
+    # converted before it is labelled - a bare setrange would ship 0-255 as 16-235
+    assert steps.index("scale=out_range=tv") < steps.index("setrange=tv")
+
+
 def test_the_graph_concatenates_every_shot_and_maps_the_audio():
     shots = [shot(index=i, start=i * 3.0) for i in range(4)]
     graph, stage = assemble.build_filter_graph(
