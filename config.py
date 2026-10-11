@@ -823,6 +823,17 @@ VIDEO_FPS = get_env_int("VIDEO_FPS", 30)
 VISUAL_PROVIDERS_DEFAULT = "pexels,pixabay,openverse"
 VISUAL_PROVIDERS = get_env_list("VISUAL_PROVIDERS", VISUAL_PROVIDERS_DEFAULT)
 
+#: How Wikimedia can reach whoever runs this - a URL or an email - sent in the
+#: User-Agent on downloads from *.wikimedia.org and nowhere else. Openverse's
+#: Commons photographs live there, and Wikimedia's User-Agent policy asks for
+#: contact details. It means it: measured 2026-10-11, interleaved on five
+#: Commons files, a User-Agent carrying a contact URL got 10 of 10 through and
+#: the bare "reel-creator-agent/0.1 (visual sourcing)" got 4 of 10, both of
+#: those on files the other had just warmed the cache for. Thumbnail versus
+#: original made no difference. Empty sends the bare one, and the archive
+#: stills keep losing to a 429 the way the hunger stones and gorilla reels did.
+WIKIMEDIA_CONTACT = get_env("WIKIMEDIA_CONTACT", "")
+
 #: STOCK_API_KEY was the step-1 placeholder; still honoured as the Pexels key so
 #: an .env written before the provider was chosen keeps working.
 STOCK_API_KEY = get_env("STOCK_API_KEY")

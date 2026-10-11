@@ -104,7 +104,8 @@ class FakeSession:
         self.calls = []
 
     def get(self, url, params=None, headers=None, timeout=None, stream=False):
-        self.calls.append({"url": url, "params": params, "stream": stream})
+        self.calls.append({"url": url, "params": params, "stream": stream,
+                           "headers": headers})
         for fragment, response in self.routes.items():
             if fragment in url:
                 return response(url) if callable(response) else response
@@ -3161,6 +3162,83 @@ def test_download_rate_limit_stops_that_host_for_the_run(sandbox, monkeypatch):
 
     # one attempt plus one backoff retry, then the host is left alone
     assert len(session.download_calls) == 2
+
+
+# Wikimedia's User-Agent policy asks for contact details. Measured 2026-10-11 on
+# five Commons files: with a contact URL, 10 of 10 downloads came through. With
+# the bare UA it was 4 of 10, and all four were on files the cache had just
+# served. Asking for a thumbnail instead of the original changed nothing.
+
+_COMMONS_URL = "https://upload.wikimedia.org/wikipedia/commons/3/3b/Alicella.jpg"
+
+
+def _jpeg_session():
+    return FakeSession(default=FakeResponse(
+        200, body=b"jpeg-bytes", headers={"Content-Type": "image/jpeg"}
+    ))
+
+
+def test_a_wikimedia_download_names_the_contact(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WIKIMEDIA_CONTACT", "https://example.org/reels")
+    session = _jpeg_session()
+
+    visuals.download(session, _COMMONS_URL, tmp_path / "a.jpg", provider="openverse")
+
+    assert session.calls[0]["headers"] == {
+        "User-Agent": "reel-creator-agent/0.1 (https://example.org/reels)"
+    }
+
+
+def test_the_contact_goes_to_wikimedia_and_nowhere_else(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WIKIMEDIA_CONTACT", "https://example.org/reels")
+    session = _jpeg_session()
+
+    visuals.download(session, "https://images.pexels.com/a.jpg",
+                     tmp_path / "a.jpg", provider="pexels")
+    # a name that merely ends in the same letters is not Wikimedia
+    visuals.download(session, "https://notwikimedia.org/b.jpg",
+                     tmp_path / "b.jpg", provider="stub")
+
+    assert [call["headers"] for call in session.calls] == [None, None]
+
+
+def test_without_a_contact_wikimedia_gets_the_session_user_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WIKIMEDIA_CONTACT", "")
+    session = _jpeg_session()
+
+    visuals.download(session, _COMMONS_URL, tmp_path / "a.jpg", provider="openverse")
+
+    assert session.calls[0]["headers"] is None
+
+
+def _commons_catalog():
+    return [dataclass_replace(
+        make_candidate(i),
+        download_url=f"https://upload.wikimedia.org/wikipedia/commons/a/ab/{i}.mp4",
+    ) for i in range(3)]
+
+
+def test_a_wikimedia_rate_limit_says_what_would_fix_it(sandbox, monkeypatch):
+    monkeypatch.setattr(visuals.time, "sleep", lambda _: None)
+    monkeypatch.setattr(config, "WIKIMEDIA_CONTACT", "")
+    StubProvider.catalog = _commons_catalog()
+    sandbox.default = FakeResponse(429, body=b"slow down")
+
+    with pytest.raises(visuals.NoAssetsError, match="set WIKIMEDIA_CONTACT"):
+        run_visuals()
+
+
+def test_the_fix_is_not_suggested_once_it_is_in_place(sandbox, monkeypatch):
+    monkeypatch.setattr(visuals.time, "sleep", lambda _: None)
+    monkeypatch.setattr(config, "WIKIMEDIA_CONTACT", "https://example.org/reels")
+    StubProvider.catalog = _commons_catalog()
+    sandbox.default = FakeResponse(429, body=b"slow down")
+
+    with pytest.raises(visuals.NoAssetsError) as caught:
+        run_visuals()
+
+    assert "upload.wikimedia.org is rate limiting" in str(caught.value)
+    assert "WIKIMEDIA_CONTACT" not in str(caught.value)
 
 
 def test_a_beat_cannot_burn_unlimited_downloads(sandbox, monkeypatch):

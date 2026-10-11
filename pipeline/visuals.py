@@ -153,6 +153,11 @@ NASA_ASSET_LOOKUPS = 8
 #: Sent on every request. Openverse asks for a real UA; the rest tolerate it.
 USER_AGENT = "reel-creator-agent/0.1 (visual sourcing)"
 
+#: Hosts whose User-Agent policy wants contact details - see
+#: config.WIKIMEDIA_CONTACT. Matched on the hostname's tail, so it covers
+#: upload.wikimedia.org, where Openverse's Commons links point.
+_CONTACT_HOSTS = ("wikimedia.org",)
+
 #: Gemini settings for query writing. Low temperature: these are labels, not
 #: prose, and run-to-run churn would defeat the download cache.
 QUERY_MODEL_TEMPERATURE = 0.35
@@ -2616,7 +2621,8 @@ def download(session, url: str, destination: Path, *, provider: str) -> dict:
     partial = destination.with_name(destination.name + ".part")
 
     try:
-        response = session.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+        response = session.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True,
+                               headers=_download_headers(url))
     except requests.exceptions.RequestException as exc:
         raise ProviderTransientError(
             f"{provider} download failed: {type(exc).__name__}: {exc}", provider=provider
@@ -3856,6 +3862,24 @@ def _download_host(url: str) -> str:
     return urlsplit(url).netloc.lower()
 
 
+def _wants_contact(host: str) -> bool:
+    """True for a host that refuses a User-Agent naming no contact."""
+    return any(host == tail or host.endswith("." + tail) for tail in _CONTACT_HOSTS)
+
+
+def _download_headers(url: str) -> dict | None:
+    """Per-request headers for one download, or None for the session's own.
+
+    Only Wikimedia hosts get the contact, and only when one is configured:
+    whoever runs this decides whether their URL or address leaves the machine,
+    and the stock providers have never asked for it.
+    """
+    contact = (config.WIKIMEDIA_CONTACT or "").strip()
+    if not contact or not _wants_contact(_download_host(url)):
+        return None
+    return {"User-Agent": f"{USER_AGENT.split(' ', 1)[0]} ({contact})"}
+
+
 def _download_with_backoff(session, candidate: Candidate, target: Path) -> dict:
     """One download, retried once after a rate limit or a broken stream.
 
@@ -3956,9 +3980,13 @@ def _acquire(
             except ProviderRateLimitError as exc:
                 host = _download_host(candidate.download_url)
                 state.rate_limited.add(host)
+                hint = ""
+                if _wants_contact(host) and not (config.WIKIMEDIA_CONTACT or "").strip():
+                    hint = (" - set WIKIMEDIA_CONTACT in .env to a URL or email; "
+                            "Wikimedia refuses a User-Agent with no contact")
                 warnings.append(
                     f"{host} is rate limiting downloads - stopped fetching from "
-                    f"it for the rest of this run ({exc})"
+                    f"it for the rest of this run ({exc}){hint}"
                 )
                 continue
             except ProviderError as exc:
