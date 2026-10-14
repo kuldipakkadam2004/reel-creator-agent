@@ -2368,6 +2368,116 @@ def test_no_ratio_is_printed_against_no_followers(capsys):
     assert "x that" not in printed
 
 
+# ---------------------------------------------------------------------------
+# The profile's own day, standing in for follows Instagram will not give per reel
+# ---------------------------------------------------------------------------
+
+def test_a_read_that_brought_only_the_token_keeps_the_count(tmp_path):
+    """It used to replace the block, and the follower count went with it."""
+    ledger = perform.PerformanceLedger(tmp_path / "p.json")
+    ledger.set_audience({"followers": 7, "username": "reels"})
+    ledger.set_audience({"token": {"days_left": 20}})
+
+    assert ledger.audience["followers"] == 7
+    assert ledger.audience["token"] == {"days_left": 20}
+
+
+def test_days_are_added_to_the_series_rather_than_replacing_it(tmp_path):
+    ledger = perform.PerformanceLedger(tmp_path / "p.json")
+    ledger.set_audience({"followers": 4,
+                         "daily": {"2026-10-01": {"followers": 4}}})
+    ledger.set_audience({"daily": {"2026-10-01": {"profile_visits": 1},
+                                   "2026-10-02": {"profile_visits": 0}}})
+    ledger.save()
+
+    daily = perform.PerformanceLedger(tmp_path / "p.json").audience["daily"]
+    assert daily["2026-10-01"] == {"followers": 4, "profile_visits": 1}
+    assert daily["2026-10-02"] == {"profile_visits": 0}
+
+
+def _day_ledger(monkeypatch, *, follows=None):
+    """Six reels posted a day apart, and the account's visits on those days.
+
+    Own accounts as the live account has them: the FOLLOWED line prints only
+    beside REACHED and ACTED, which need them."""
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 3)
+    ledger = perform.PerformanceLedger()
+    for day in range(6):
+        ledger.register(_features(f"r{day}", day=day))
+        numbers = {"reach": 100 * (day + 1), "watch_through": 0.5}
+        if follows is not None:
+            numbers.update(follows=follows, profile_visits=0)
+        ledger.record(f"r{day}", numbers)
+        ledger.reels[f"r{day}"]["posted_at"] = f"2026-10-0{day + 1}T17:00:00+0000"
+    ledger.set_audience({"followers": 7, "username": "reels", "daily": {
+        "2026-10-01": {"profile_visits": 1, "followers": 4},
+        "2026-10-02": {"profile_visits": 0},
+        "2026-10-03": {"profile_visits": 2},
+        "2026-10-04": {"followers": 7},
+    }})
+    return ledger
+
+
+def test_the_visits_are_read_against_the_reach_of_the_same_days(paths,
+                                                                monkeypatch):
+    data = perform.report(ledger=_day_ledger(monkeypatch), min_samples=3)
+    days = data["profile_days"]
+
+    assert days["days"] == 3
+    assert days["since"] == "2026-10-01"
+    assert days["visits"] == 3
+    # Reels posted on the three days that carry a visit count: 100+200+300.
+    assert days["reach"] == 600
+    assert days["followers"] == [("2026-10-01", 4), ("2026-10-04", 7)]
+    assert [row["day"] for row in days["listed"]][:2] == ["2026-10-04",
+                                                         "2026-10-03"]
+    assert days["listed"][1]["reels"] == [{"topic": "topic r2", "reach": 300}]
+
+
+def test_with_daily_visits_the_empty_per_reel_table_gives_way(paths, monkeypatch,
+                                                              capsys):
+    data = perform.report(ledger=_day_ledger(monkeypatch), min_samples=3)
+
+    assert not any("nothing fetched" in warning for warning in data["warnings"])
+    perform._print_report(data)
+    printed = capsys.readouterr().out
+
+    assert "FOLLOWED AFTER" not in printed
+    assert "PROFILE VISITS" in printed
+    assert "does not report follows or profile visits per reel" in printed
+    assert "3 profile visit(s) against 600 reach" in printed
+    assert "1 per 200" in printed
+    assert "followers 4 on 2026-10-01 -> 7 on 2026-10-04" in printed
+
+
+def test_a_reel_with_a_follows_reading_brings_the_table_back(paths, monkeypatch,
+                                                             capsys):
+    """Typed in off the app's own reel insights, it is still a per-reel number."""
+    data = perform.report(ledger=_day_ledger(monkeypatch, follows=1),
+                          min_samples=3)
+    perform._print_report(data)
+    printed = capsys.readouterr().out
+
+    assert "FOLLOWED AFTER" in printed
+    assert "PROFILE VISITS" in printed
+    assert "does not report follows" not in printed
+
+
+def test_without_daily_visits_the_report_is_as_it_was(paths, capsys):
+    ledger = perform.PerformanceLedger()
+    for day in range(6):
+        ledger.register(_features(f"r{day}", day=day))
+        ledger.record(f"r{day}", {"reach": 200, "watch_through": 0.5})
+
+    data = perform.report(ledger=ledger, min_samples=3)
+    perform._print_report(data)
+    printed = capsys.readouterr().out
+
+    assert data["profile_days"] == {}
+    assert "FOLLOWED AFTER" in printed
+    assert "PROFILE VISITS" not in printed
+
+
 
 # ---------------------------------------------------------------------------
 # The operator's own accounts are not an audience

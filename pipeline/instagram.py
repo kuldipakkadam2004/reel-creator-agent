@@ -271,6 +271,73 @@ def audience(session=None) -> dict:
     return out if len(out) > 1 else {}
 
 
+#: Asked of the account's own insights, one day at a time. Meta will not say
+#: per reel who went on to the profile - every media read from 2026-10-08 to
+#: 2026-10-13 refused `follows` and `profile_visits`, 51 of 51 - but the
+#: account answers for the profile as a whole, and that is the only reading
+#: there is of the step between watching a reel and following the account.
+#:
+#: `follows_and_unfollows` and `follower_count` were asked too on 2026-10-14
+#: and came back empty at 7 followers; Meta serves them from 100.
+ACCOUNT_DAILY_METRICS = {"profile_views": "profile_visits"}
+
+#: How far back a first read fills in. Meta keeps about thirty days of account
+#: insights, and every read after the first asks only for the days it lacks.
+ACCOUNT_DAILY_DAYS = 28
+
+
+def account_days(session=None, *, have=(), today: date | None = None,
+                 days: int | None = None) -> dict:
+    """Profile visits per UTC day, for the finished days not already held.
+
+    One request per day. Asked for a range the API sums it into one total,
+    and asked for a series it answers with nothing - both tried 2026-10-14.
+    Today is never asked: it has not finished, and a part-day stored once
+    would never be asked for again.
+
+    Returns {"YYYY-MM-DD": {"profile_visits": n}}. A day that came back
+    without a number is left out rather than stored as nought, and the first
+    refusal ends the loop - a token that cannot have one day cannot have the
+    rest, and asking twenty-seven more times only spends the rate limit.
+    """
+    require_credentials()
+    session = session or _session()
+    today = today or datetime.now(timezone.utc).date()
+    span = ACCOUNT_DAILY_DAYS if days is None else days
+    held = set(have)
+    out: dict[str, dict] = {}
+    for back in range(span, 0, -1):
+        day = today - timedelta(days=back)
+        if day.isoformat() in held:
+            continue
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        try:
+            body = _get(session, f"{config.INSTAGRAM_USER_ID}/insights", {
+                "metric": ",".join(ACCOUNT_DAILY_METRICS),
+                "period": "day",
+                "metric_type": "total_value",
+                "since": int(start.timestamp()),
+                "until": int((start + timedelta(days=1)).timestamp()),
+            })
+        except InstagramAuthError:
+            raise
+        except InstagramError:
+            break
+        values = {}
+        for entry in body.get("data") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = ACCOUNT_DAILY_METRICS.get(entry.get("name"))
+            total = entry.get("total_value")
+            value = total.get("value") if isinstance(total, dict) else None
+            if (name and isinstance(value, (int, float))
+                    and not isinstance(value, bool)):
+                values[name] = int(value)
+        if values:
+            out[day.isoformat()] = values
+    return out
+
+
 def media(session=None, *, limit: int | None = None) -> list[dict]:
     """Recent posts, newest first, as the API describes them."""
     require_credentials()
@@ -666,6 +733,12 @@ def fetch(run_ids, features_by_run: dict) -> dict:
     aged = token_age()
     if aged:
         account["token"] = aged
+    # The count as it stood at this read, kept by day. The account block holds
+    # only the latest figure, so until 2026-10-14 the one history of it was the
+    # AUDIENCE line in each day's report.
+    if "followers" in account:
+        today = datetime.now(timezone.utc).date().isoformat()
+        account["daily"] = {today: {"followers": account["followers"]}}
     ledger.set_audience(account)
     out: dict[str, dict] = {}
 
@@ -777,6 +850,15 @@ def fetch(run_ids, features_by_run: dict) -> dict:
         if found["posted_at"]:
             record["posted_at"] = found["posted_at"]
         out[run_id] = metrics
+
+    # After the reels and not before: they are what the read is for, and the
+    # first read here asks for four weeks of days, one request each.
+    daily = ledger.audience.get("daily") or {}
+    days = account_days(session, have=[
+        day for day, values in daily.items()
+        if isinstance(values, dict) and "profile_visits" in values])
+    if days:
+        ledger.set_audience({"daily": days})
 
     ledger.save()
     return out

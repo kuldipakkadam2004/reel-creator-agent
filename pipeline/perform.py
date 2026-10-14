@@ -717,10 +717,24 @@ class PerformanceLedger:
 
         A provider that could not read the follower count must not erase a
         figure an earlier read did get: not knowing today is not evidence
-        that yesterday was wrong.
+        that yesterday was wrong. So what is said is laid over what was held
+        rather than replacing it - a read that got only the token used to
+        wipe the count - and `daily` is laid over day by day, because each
+        read adds a day or two to a series it does not carry whole.
         """
-        if audience:
-            self._data["account"] = dict(audience)
+        if not audience:
+            return
+        held = self.audience
+        merged = {**held, **audience}
+        days = {day: dict(values)
+                for day, values in (held.get("daily") or {}).items()
+                if isinstance(values, dict)}
+        for day, values in (audience.get("daily") or {}).items():
+            if isinstance(values, dict):
+                days[day] = {**days.get(day, {}), **values}
+        if days:
+            merged["daily"] = days
+        self._data["account"] = merged
 
     def entry(self, run_id: str) -> dict:
         entry = self.reels.get(run_id)
@@ -2021,6 +2035,56 @@ def real_engagement(rows: list[dict], own: int | None = None) -> dict:
     return out
 
 
+def profile_days(audience: dict, rows: list[dict], *, shown: int = 14) -> dict:
+    """Profile visits and followers by day, beside the reels posted that day.
+
+    The account-wide stand-in for FOLLOWED AFTER, which Instagram leaves empty:
+    it will not say per reel who went on to the profile, only how many went
+    each day. So nothing here is credited to a reel. The reels are listed
+    beside their day because a visit usually comes off a reel being shown,
+    and on this account a reel is shown inside its first day or so.
+
+    `visits` and `reach` are summed over the same days, so the rate compares
+    like with like - except that a visit on the first day may have come from
+    a reel posted before it. Over four weeks that edge is a day's worth.
+
+    Empty when no day carries a visit count: the report then falls back to the
+    per-reel table, which is the one a hand-typed ledger fills.
+    """
+    daily = {day: values for day, values in (audience.get("daily") or {}).items()
+             if isinstance(values, dict)}
+    visited = sorted(day for day, values in daily.items()
+                     if isinstance(values.get("profile_visits"), int))
+    if not visited:
+        return {}
+
+    posted_on: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("status") != "posted":
+            continue
+        reach = (row.get("metrics") or {}).get("reach")
+        posted_on.setdefault(str(row.get("posted_at") or "")[:10], []).append({
+            "topic": (row.get("features") or {}).get("topic") or "",
+            "reach": int(reach) if isinstance(reach, (int, float)) else None,
+        })
+
+    followers = [(day, values["followers"]) for day, values in sorted(daily.items())
+                 if isinstance(values.get("followers"), int)]
+    return {
+        "days": len(visited),
+        "since": visited[0],
+        "visits": sum(daily[day]["profile_visits"] for day in visited),
+        "reach": sum(reel["reach"] or 0 for day in visited
+                     for reel in posted_on.get(day, [])),
+        "followers": [followers[0], followers[-1]] if followers else [],
+        "listed": [{"day": day,
+                    "visits": daily[day].get("profile_visits"),
+                    "followers": daily[day].get("followers"),
+                    "reels": posted_on.get(day, [])}
+                   for day in sorted(daily, reverse=True)[:shown]],
+    }
+
+
 def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
            span: int | None = None, min_samples: int | None = None,
            window_hours: int | None = None,
@@ -2242,7 +2306,11 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
     # is the one worth shouting about, because it looks exactly like nobody
     # following and is instead nobody asking.
     read_follow = [row for row in fresh if won_a_follow(row) is not None]
-    if fresh and not read_follow:
+    by_day = profile_days(ledger.audience, rows)
+    # With the account's own daily visits on file, the never-read state is
+    # settled and said on the FOLLOWED line; the warning is for a ledger
+    # that has neither.
+    if fresh and not read_follow and not by_day:
         warnings.append(
             f"no reel has a follows or profile_visits reading on it, so "
             f"FOLLOWED AFTER is empty - that is a metric nothing fetched, not "
@@ -2319,6 +2387,8 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
         "performance": performance,
         "saved": saved,
         "followed": followed,
+        "followed_read": bool(read_follow),
+        "profile_days": by_day,
         "ever_saved": len(ever_kept),
         "ratios": scores,
         "warnings": warnings,
@@ -3217,7 +3287,14 @@ def _print_audience(audience: dict, reach_median, own: int = 0,
     # this is what they did about the account - and because it has a third
     # state those metrics do not: never asked for. A zero here and a blank
     # here lead to opposite decisions.
-    if not real.get("follow_reels"):
+    daily = audience.get("daily") or {}
+    if not real.get("follow_reels") and any(
+            isinstance(values, dict) and "profile_visits" in values
+            for values in daily.values()):
+        print("FOLLOWED: Instagram does not report follows or profile visits "
+              "per reel - the profile's own daily visits are under PROFILE "
+              "VISITS")
+    elif not real.get("follow_reels"):
         print("FOLLOWED: not read on any reel - "
               "python pipeline/instagram.py --fetch now asks for follows and "
               "profile_visits; this stays blank if your token serves them "
@@ -3233,6 +3310,48 @@ def _print_audience(audience: dict, reach_median, own: int = 0,
     print(f"          {own} own account(s) are taken out first "
           f"(PERFORMANCE_OWN_ACCOUNTS); a reel that did not clear that "
           f"reached nobody, so nothing it carries is counted")
+
+
+def _print_profile_days(days: dict) -> None:
+    """The profile's own visits by day, with the reels that went out that day.
+
+    Printed where FOLLOWED AFTER stood, as the account-wide reading of the
+    same stage. The heading says the visits are not the listed reels' own,
+    because a day's row reads as though they were unless it is told not to.
+    """
+    listed = days.get("listed") or []
+    if not listed:
+        return
+    print(RULE)
+    print("PROFILE VISITS  (the whole account per UTC day; not credited to any "
+          "reel)")
+    print(f"  {'day':<10} {'visits':>6} {'followers':>9}  posted that day")
+    for row in listed:
+        visits = row.get("visits")
+        followers = row.get("followers")
+        lead = (f"  {row['day']:<10} {visits if visits is not None else '-':>6} "
+                f"{followers if followers is not None else '-':>9}  ")
+        reels = row.get("reels") or []
+        if not reels:
+            print(lead.rstrip())
+        for index, reel in enumerate(reels):
+            reach = reel.get("reach")
+            print(f"{lead if index == 0 else ' ' * len(lead)}"
+                  f"{(reel.get('topic') or '')[:36]:<36} "
+                  f"{reach if reach is not None else '-':>6}")
+
+    visits = days.get("visits") or 0
+    reach = days.get("reach") or 0
+    line = (f"  {days.get('days')} day(s) since {days.get('since')}: "
+            f"{visits} profile visit(s) against {reach} reach on the reels "
+            f"posted in them")
+    if visits and reach:
+        line += f" - 1 per {reach / visits:.0f}"
+    print(line)
+    followers = days.get("followers") or []
+    if len(followers) == 2 and followers[0][0] != followers[1][0]:
+        (first_day, first), (last_day, last) = followers
+        print(f"  followers {first} on {first_day} -> {last} on {last_day}")
 
 
 def _print_report(data: dict) -> None:
@@ -3274,9 +3393,15 @@ def _print_report(data: dict) -> None:
     # Printed last because it is the last thing that happens, and the only
     # outcome here that survives the reel. Everything above it is attention
     # paid once; a follower is attention that comes back.
-    _print_table(
-        "FOLLOWED AFTER  (1.00 = every reel won a follow or a profile visit)",
-        data.get("followed") or [], unit="", min_samples=data["min_samples"])
+    #
+    # Instagram leaves the per-reel table empty for good, so once the
+    # account's own daily visits are on file they print in its place. The
+    # table comes back the moment any reel carries a reading, typed or read.
+    if data.get("followed_read") or not data.get("profile_days"):
+        _print_table(
+            "FOLLOWED AFTER  (1.00 = every reel won a follow or a profile visit)",
+            data.get("followed") or [], unit="", min_samples=data["min_samples"])
+    _print_profile_days(data.get("profile_days") or {})
 
     print(RULE)
     if data["warnings"]:

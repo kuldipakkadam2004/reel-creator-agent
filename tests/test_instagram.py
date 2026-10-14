@@ -725,6 +725,97 @@ def test_an_account_with_no_posts_asks_for_no_insights(credentials, tmp_path,
     assert not any("insights" in url for url, _ in session.asked)
 
 
+# ---------------------------------------------------------------------------
+# The profile's own day - what stands in for follows Meta will not give per reel
+# ---------------------------------------------------------------------------
+
+def _visits_by_day(counts: dict):
+    """An account insights endpoint answering one UTC day per request."""
+    def answer(params):
+        day = datetime.fromtimestamp(int(params["since"]), timezone.utc)
+        value = counts.get(day.date().isoformat())
+        if value is None:
+            return {"data": []}
+        return {"data": [{"name": "profile_views", "period": "day",
+                          "total_value": {"value": value}}]}
+    return answer
+
+
+def test_profile_visits_are_read_one_finished_day_at_a_time(credentials):
+    session = FakeSession({"/insights": _visits_by_day(
+        {"2026-10-11": 0, "2026-10-12": 3, "2026-10-13": 4, "2026-10-14": 9})})
+
+    days = instagram.account_days(session, today=date(2026, 10, 14), days=3)
+
+    assert days == {"2026-10-11": {"profile_visits": 0},
+                    "2026-10-12": {"profile_visits": 3},
+                    "2026-10-13": {"profile_visits": 4}}
+    # Today has not finished, so it is never asked.
+    assert len(session.asked) == 3
+    assert all(params["metric_type"] == "total_value"
+               for _, params in session.asked)
+
+
+def test_a_day_already_held_is_not_asked_for_again(credentials):
+    session = FakeSession({"/insights": _visits_by_day({"2026-10-13": 4})})
+
+    days = instagram.account_days(session, today=date(2026, 10, 14), days=3,
+                                  have=["2026-10-11", "2026-10-12"])
+
+    assert days == {"2026-10-13": {"profile_visits": 4}}
+    assert len(session.asked) == 1
+
+
+def test_a_day_with_no_number_is_left_out_rather_than_read_as_nought(credentials):
+    session = FakeSession({"/insights": _visits_by_day({"2026-10-13": 4})})
+
+    days = instagram.account_days(session, today=date(2026, 10, 14), days=2)
+
+    assert "2026-10-12" not in days
+
+
+def test_one_refused_day_ends_the_account_read(credentials):
+    """A token that cannot have one day cannot have the other twenty-seven."""
+    session = FakeSession({"/insights": {"error": {
+        "message": "(#100) Invalid metric", "code": 100}}})
+
+    assert instagram.account_days(session, today=date(2026, 10, 14)) == {}
+    assert len(session.asked) == 1
+
+
+def test_fetch_keeps_the_follower_count_and_the_visits_by_day(credentials,
+                                                              tmp_path,
+                                                              monkeypatch):
+    made = datetime(2026, 8, 24, 17, 0, tzinfo=timezone.utc)
+    features = _features(tmp_path, made=made, caption="Snailfish live deep.")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    visits = _visits_by_day({yesterday.isoformat(): 4})
+
+    def insights(params):
+        # The account asks with a day; a reel asks without one.
+        if "since" in params:
+            return visits(params)
+        return {"data": [_insight("reach", 900)]}
+
+    session = FakeSession({"/insights": insights,
+                           "/media": {"data": [_post(
+                               "1792", "Snailfish live deep.",
+                               made + timedelta(hours=18))]},
+                           "17800000000000000": {
+                               "id": "17800000000000000",
+                               "username": "reels", "followers_count": 7}})
+    monkeypatch.setattr(instagram, "_session", lambda: session)
+    monkeypatch.setattr(instagram, "ACCOUNT_DAILY_DAYS", 2)
+
+    instagram.fetch(["ocean-1a2b3c"], {"ocean-1a2b3c": features})
+
+    daily = perform.PerformanceLedger().audience["daily"]
+    today = datetime.now(timezone.utc).date().isoformat()
+    assert daily[today] == {"followers": 7}
+    assert daily[yesterday.isoformat()] == {"profile_visits": 4}
+    assert perform.PerformanceLedger().entry("ocean-1a2b3c")["media_id"] == "1792"
+
+
 def test_the_provider_plugs_into_step_9(credentials, tmp_path, monkeypatch):
     """The contract perform.fetch expects, exercised through perform."""
     made = datetime(2026, 8, 24, 17, 0, tzinfo=timezone.utc)
