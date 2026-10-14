@@ -908,6 +908,16 @@ def test_a_trim_never_cuts_a_word_in_half():
     assert not text.replace(".", "").endswith("jellyf")
 
 
+def test_a_trim_never_ends_the_description_on_a_connector():
+    """The flood-boulder cover of 2026-10-14 shipped "... prayer flags in the."."""
+    text = alt_for(make_cover(
+        depicts="a river with rocks and prayer flags in the background",
+        hook_card_text="This rock shouldn't be here"))
+
+    assert text == ('A river with rocks and prayer flags. '
+                    'Text on the image: "This rock shouldn\'t be here".')
+
+
 def test_a_headline_too_long_for_the_field_is_cut_inside_its_quotes():
     """Trimming the sentence instead says there are words without saying which."""
     text = alt_for(make_cover(hook_card_text="word " * 40, depicts="blue ocean"))

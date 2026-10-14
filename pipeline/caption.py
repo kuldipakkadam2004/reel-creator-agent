@@ -1343,12 +1343,19 @@ def _sentence_case(text: str) -> str:
 
 
 def _fit_alt(text: str, limit: int) -> str:
-    """Trim alt text to the limit at a word boundary, ending in a full stop."""
+    """Trim alt text to the limit at a word boundary, ending in a full stop.
+
+    A word boundary is not enough on its own. The flood-boulder cover of
+    2026-10-14 was "a river with rocks and prayer flags in the background",
+    and a cut at 50 characters dropped "background" and shipped "... prayer
+    flags in the." - so the connector the cut left behind goes too.
+    """
     text = " ".join(str(text or "").split())
     if limit <= 0 or len(text) <= limit:
         return text
     cut = text[:limit].rstrip()
     trimmed = _ALT_TRIM_RE.sub("", cut) or cut
+    trimmed = _undangle(trimmed) or trimmed
     return trimmed.rstrip(" ,;:") + "."
 
 
