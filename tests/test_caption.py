@@ -1077,7 +1077,7 @@ HUNGER_BODY = [
 ]
 
 
-def test_a_false_sentence_is_cut_and_the_rest_of_its_paragraph_kept(
+def test_a_false_sentence_is_cut_and_what_led_up_to_it_kept(
         monkeypatch, tmp_path):
     """The hunger stones post of 2026-09-30, which put a false date on the
     oldest carving in the post and nowhere in the narration."""
@@ -1091,8 +1091,7 @@ def test_a_false_sentence_is_cut_and_the_rest_of_its_paragraph_kept(
     post = caption.generate_caption(SCRIPT, run_dir=tmp_path, write=False)
 
     assert "1417" not in post["caption"]
-    assert post["body"][1] == ("The weep inscription from 1616 is the best "
-                               "known. Others list a litany of bad years.")
+    assert post["body"][1] == "The weep inscription from 1616 is the best known."
     assert post["body"][0] == HUNGER_BODY[0]
     assert [d["sentence"] for d in post["claims"]["dropped"]] == [
         "The oldest authenticated carving dates to 1417."]
@@ -1133,12 +1132,49 @@ def test_a_finding_is_matched_to_its_own_sentence_not_one_inside_it(
     long_one = ("The most famous stone, in the Elbe, has an inscription "
                 "from 1616 that reads: if you see me, weep.")
     stub_checker(monkeypatch, finding(long_one))
-    draft = Draft(hook="If you see me, weep.", body=[long_one + " It is old."])
+    draft = Draft(hook="If you see me, weep.", body=["It is old. " + long_one])
 
     caption.check_post_claims(draft, topic="hunger stones")
 
     assert draft.hook == "If you see me, weep."
     assert draft.body == ["It is old."]
+
+
+def test_what_follows_a_cut_sentence_in_its_paragraph_goes_with_it(
+        monkeypatch):
+    """The turkey post of 2026-10-13: the chromosome line was rightly cut, and
+    "If it doubles itself" was left with nothing for "it" to mean."""
+    stub_checker(monkeypatch, finding(
+        "An unfertilized egg has one chromosome, either a Z or a W.",
+        problem="it has one sex chromosome, not one chromosome"))
+    draft = Draft(hook="She needs no father.", body=[
+        "Turkeys can do this in captivity.",
+        "An unfertilized egg has one chromosome, either a Z or a W. If it "
+        "doubles itself, a WW combination isn't viable. A ZZ one is.",
+        "Every chick is male.",
+    ])
+
+    report, warnings = caption.check_post_claims(draft, topic="turkeys")
+
+    assert draft.body == ["Turkeys can do this in captivity.",
+                          "Every chick is male."]
+    assert [o["sentence"] for o in report["orphaned"]] == [
+        "If it doubles itself, a WW combination isn't viable.", "A ZZ one is."]
+    assert len(report["dropped"]) == 1
+    assert any("followed a cut sentence" in w and "If it doubles" in w
+               for w in warnings)
+
+
+def test_a_cut_in_the_hook_takes_the_rest_of_the_hook_with_it(monkeypatch):
+    stub_checker(monkeypatch, finding("Hunger stones are 2000 years old."))
+    draft = Draft(hook="Hunger stones are 2000 years old. They still warn us.",
+                  body=list(HUNGER_BODY))
+
+    report, _ = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert draft.hook == HUNGER_BODY[0]
+    assert report["orphaned"] == [{"sentence": "They still warn us.",
+                                   "from": "hook"}]
 
 
 def test_a_hook_that_is_cut_whole_is_replaced_by_the_first_paragraph(

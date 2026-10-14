@@ -867,7 +867,8 @@ def check_post_claims(draft: Draft, *, topic: str,
     Returns (report, warnings). The report goes into post.json as `claims`.
     """
     setting = str(mode or config.VERIFY_MODE or "off").strip().lower()
-    report = {"mode": setting, "checked": False, "dropped": [], "kept": []}
+    report = {"mode": setting, "checked": False, "dropped": [], "kept": [],
+              "orphaned": []}
     if setting != "llm":
         return report, []
 
@@ -915,6 +916,30 @@ def check_post_claims(draft: Draft, *, topic: str,
         )
     if not doomed:
         return report, warnings
+
+    # What follows a cut sentence in its own paragraph goes with it. Those are
+    # the sentences that can lean on it - "If it doubles itself" after the
+    # chromosome line, "It also helps them spot predators" after the reindeer
+    # one - and the checker passes them, because each is fine read on its own.
+    # Three shipped captions lost the subject of a sentence this way
+    # (2026-10-04, and 2026-10-13 twice). What comes before a cut is kept: a
+    # paragraph builds forward, so its earlier sentences do not need a later
+    # one to make sense.
+    orphaned: set[int] = set()
+    for at in sorted(doomed):
+        where = located[at][0]
+        for later in range(at + 1, len(located)):
+            if located[later][0] != where:
+                break
+            if later not in doomed:
+                orphaned.add(later)
+    for at in sorted(orphaned):
+        where, sentence = located[at]
+        report["orphaned"].append(
+            {"sentence": sentence, "from": "hook" if where < 0 else "body"})
+        warnings.append(f"also dropped {sentence!r}, which followed a cut "
+                        f"sentence in its paragraph and may have leaned on it")
+    doomed |= orphaned
 
     hook = " ".join(sentence for at, (where, sentence) in enumerate(located)
                     if where < 0 and at not in doomed)
@@ -1787,7 +1812,8 @@ def generate_caption(source, *, run_dir=None, run_id: str | None = None,
     # Before the hook is fitted, so a hook that loses a sentence here is still
     # held to its limit below. A keyword draft is the narration's own lines,
     # which step 2 already checked, so there is nothing new in it to check.
-    claims = {"mode": "off", "checked": False, "dropped": [], "kept": []}
+    claims = {"mode": "off", "checked": False, "dropped": [], "kept": [],
+              "orphaned": []}
     if draft.source == "llm":
         claims, claim_warnings = check_post_claims(draft, topic=resolved.topic)
         warnings += claim_warnings
