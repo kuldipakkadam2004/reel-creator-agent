@@ -864,6 +864,9 @@ def check_post_claims(draft: Draft, *, topic: str,
     Only the hook and the body are checked. The CTA is a question to the
     reader, and the tags are not sentences.
 
+    The check runs POST_CLAIM_SAMPLES times, searching the web first when
+    POST_CLAIM_GROUNDED is on, and what any run flags is cut.
+
     Returns (report, warnings). The report goes into post.json as `claims`.
     """
     setting = str(mode or config.VERIFY_MODE or "off").strip().lower()
@@ -884,15 +887,37 @@ def check_post_claims(draft: Draft, *, topic: str,
         report["checked"] = True
         return report, []
 
-    checked = script_gen.check_claims(
-        topic, " ".join(sentence for _, sentence in located)
-    )
-    report["checked"] = checked["checked"]
-    warnings = [w.replace("The script was", "The caption was")
-                for w in checked["warnings"]]
+    # Run more than once, and cut what any run flags. The checker disagrees
+    # with itself from one sample to the next, and a false alarm here costs a
+    # sentence rather than a topic - see POST_CLAIM_SAMPLES. One after another,
+    # not on threads: `script_gen.USAGE` counts every call into the run's cost
+    # line, and it has no lock.
+    samples = max(1, int(config.POST_CLAIM_SAMPLES or 1))
+    grounded = bool(config.POST_CLAIM_GROUNDED)
+    text = " ".join(sentence for _, sentence in located)
+    findings: list[dict] = []
+    warnings: list[str] = []
+    failed: list[str] = []
+    for _ in range(samples):
+        checked = script_gen.check_claims(topic, text, grounded=grounded)
+        findings += checked["findings"]
+        for warning in checked["warnings"]:
+            warning = warning.replace("The script was", "The caption was")
+            if not checked["checked"]:
+                failed.append(warning)
+            elif warning not in warnings:
+                warnings.append(warning)
+    report.update(checked=len(failed) < samples, samples=samples,
+                  grounded=grounded, runs_failed=len(failed))
+    if failed and len(failed) == samples:
+        warnings += list(dict.fromkeys(failed))
+    elif failed:
+        warnings.append(f"{len(failed)} of {samples} claim-check runs failed "
+                        f"({failed[0]}); the caption was checked by the rest")
 
     doomed: set[int] = set()
-    for finding in checked["findings"]:
+    kept: dict[int, dict] = {}
+    for finding in findings:
         # The best match, not the first - "If you see me, then weep." sits
         # inside a sentence about the 1616 inscription, and a finding about
         # that sentence must not cost the post its hook.
@@ -904,7 +929,7 @@ def check_post_claims(draft: Draft, *, topic: str,
                  "problem": finding["problem"],
                  "from": "hook" if located[at][0] < 0 else "body"}
         if finding["kind"] not in POST_CLAIM_DROP:
-            report["kept"].append(entry)
+            kept.setdefault(at, entry)
             continue
         if at in doomed:
             continue
@@ -914,6 +939,9 @@ def check_post_claims(draft: Draft, *, topic: str,
             f"dropped a {finding['kind']} claim from the {entry['from']}: "
             f"{entry['sentence']!r} - {finding['problem']}"
         )
+    # One run calling a line figurative does not keep it when another run
+    # called it false: the union is the point.
+    report["kept"] = [entry for at, entry in kept.items() if at not in doomed]
     if not doomed:
         return report, warnings
 

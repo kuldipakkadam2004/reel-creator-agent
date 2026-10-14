@@ -730,6 +730,34 @@ VERIFY_REPAIR_ROUNDS = get_env_int("VERIFY_REPAIR_ROUNDS", 2)
 #: doubled.
 VERIFY_REPAIR_MAX_ROUNDS = get_env_int("VERIFY_REPAIR_MAX_ROUNDS", 5)
 
+#: How many times step 6 runs the claim check over the caption. A sentence any
+#: run flags is dropped.
+#:
+#: The check is a sampled call, and it disagrees with itself: replayed twice on
+#: the same 8 narrations on 2026-10-14, the verdicts differed on 7. So one run
+#: catches what that one run happened to notice. A union buys the catches of
+#: both. In step 2 that would also buy more refused topics. Here a false alarm
+#: costs one caption sentence, which is why only the caption gets it. Measured
+#: on 13 captions holding 4 known-bad lines and 4 known-true ones. A single run
+#: is shown as the range over its two samples:
+#:
+#:                              bad lines caught   true lines dropped
+#:      1 plain run (before)         1-2                  1-2
+#:      2 plain runs                  2                    3
+#:      1 grounded run               1-2                  0-1
+#:      2 grounded runs               2                    1
+#:
+#: The one true line the grounded union dropped was cut beside a false line
+#: about the same chromosomes. No setting caught the bee post's "the hive
+#: votes" or "insects have a fourth cone". This narrows the gap, and the
+#: caption still wants a read before posting.
+POST_CLAIM_SAMPLES = get_env_int("POST_CLAIM_SAMPLES", 2)
+
+#: Let step 6's claim check search the web before it judges a sentence. It is
+#: the column that lost fewer true lines above, so the default is on. Step 2's
+#: check stays unsearched, because nothing there was measured with it.
+POST_CLAIM_GROUNDED = get_env_bool("POST_CLAIM_GROUNDED", True)
+
 # Step 3 — text-to-speech
 ELEVENLABS_API_KEY = get_env("ELEVENLABS_API_KEY")
 ELEVENLABS_MODEL = get_env("ELEVENLABS_MODEL", "eleven_multilingual_v2")

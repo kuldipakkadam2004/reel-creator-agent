@@ -68,7 +68,7 @@ def stub_checker(monkeypatch, *findings, checked=True) -> list[str]:
     """Answer the fact-check with fixed findings; returns what it was shown."""
     shown: list[str] = []
 
-    def check(topic, text):
+    def check(topic, text, **kwargs):
         shown.append(text)
         return {"findings": list(findings), "warnings": [], "checked": checked}
 
@@ -1207,7 +1207,7 @@ def test_the_checker_is_shown_the_hook_and_body_but_not_the_cta(monkeypatch):
 
 
 def test_a_check_that_could_not_run_says_so_and_cuts_nothing(monkeypatch):
-    def unreachable(topic, text):
+    def unreachable(topic, text, **kwargs):
         return {"findings": [], "checked": False,
                 "warnings": ["the claim check failed (boom). The script was "
                              "not fact-checked."]}
@@ -1223,8 +1223,104 @@ def test_a_check_that_could_not_run_says_so_and_cuts_nothing(monkeypatch):
     assert any("The caption was not fact-checked" in w for w in warnings)
 
 
+def runs_answering(monkeypatch, *answers) -> list[dict]:
+    """A checker that gives each run its own answer; returns how it was asked."""
+    asked: list[dict] = []
+    queue = list(answers)
+
+    def check(topic, text, **kwargs):
+        asked.append(kwargs)
+        return queue.pop(0)
+
+    monkeypatch.setattr(config, "VERIFY_MODE", "llm")
+    monkeypatch.setattr(caption.script_gen, "check_claims", check)
+    return asked
+
+
+def answer(*findings, checked=True, warnings=()) -> dict:
+    return {"findings": list(findings), "checked": checked,
+            "warnings": list(warnings)}
+
+
+def test_a_line_any_run_flags_is_cut(monkeypatch):
+    """The checker disagrees with itself between samples, so each run catches
+    what that run happened to notice. Replayed 2026-10-14, the floods hook was
+    flagged by one of two runs and the turkey line by both."""
+    monkeypatch.setattr(config, "POST_CLAIM_SAMPLES", 2)
+    runs_answering(monkeypatch,
+                   answer(finding("Others list a litany of bad years.")),
+                   answer(finding("Dozens of others dot the rivers of "
+                                  "Central Europe.")))
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    report, _ = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert sorted(d["sentence"] for d in report["dropped"]) == [
+        "Dozens of others dot the rivers of Central Europe.",
+        "Others list a litany of bad years."]
+    assert report["samples"] == 2
+
+
+def test_a_line_two_runs_flag_is_cut_and_reported_once(monkeypatch):
+    monkeypatch.setattr(config, "POST_CLAIM_SAMPLES", 2)
+    line = finding("Others list a litany of bad years.")
+    runs_answering(monkeypatch, answer(line), answer(line))
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    report, warnings = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert len(report["dropped"]) == 1
+    assert sum("dropped a false claim" in w for w in warnings) == 1
+
+
+def test_figurative_in_one_run_does_not_save_a_line_another_calls_false(
+        monkeypatch):
+    monkeypatch.setattr(config, "POST_CLAIM_SAMPLES", 2)
+    runs_answering(monkeypatch,
+                   answer(finding("Others list a litany of bad years.",
+                                  kind="figurative")),
+                   answer(finding("Others list a litany of bad years.")))
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    report, _ = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert "litany" not in " ".join(draft.body)
+    assert report["kept"] == []
+
+
+def test_one_failed_run_still_leaves_the_caption_checked(monkeypatch):
+    monkeypatch.setattr(config, "POST_CLAIM_SAMPLES", 2)
+    runs_answering(monkeypatch,
+                   answer(checked=False, warnings=[
+                       "the claim check failed (boom). The script was not "
+                       "fact-checked."]),
+                   answer(finding("Others list a litany of bad years.")))
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    report, warnings = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert report["checked"] is True and report["runs_failed"] == 1
+    assert "litany" not in " ".join(draft.body)
+    assert any("1 of 2 claim-check runs failed" in w for w in warnings)
+    assert not any("not fact-checked" in w and "runs failed" not in w
+                   for w in warnings)
+
+
+def test_the_check_searches_unless_told_not_to(monkeypatch):
+    monkeypatch.setattr(config, "POST_CLAIM_SAMPLES", 1)
+    asked = runs_answering(monkeypatch, answer(), answer())
+    draft = Draft(hook="A warning.", body=list(HUNGER_BODY))
+
+    caption.check_post_claims(draft, topic="hunger stones")
+    monkeypatch.setattr(config, "POST_CLAIM_GROUNDED", False)
+    report, _ = caption.check_post_claims(draft, topic="hunger stones")
+
+    assert [a["grounded"] for a in asked] == [True, False]
+    assert report["grounded"] is False and report["samples"] == 1
+
+
 def test_nothing_is_checked_with_verify_mode_off(monkeypatch, tmp_path):
-    def must_not_run(topic, text):
+    def must_not_run(topic, text, **kwargs):
         raise AssertionError("the checker must not be called with VERIFY_MODE=off")
 
     monkeypatch.setattr(caption.script_gen, "check_claims", must_not_run)
@@ -1239,7 +1335,7 @@ def test_nothing_is_checked_with_verify_mode_off(monkeypatch, tmp_path):
 
 def test_a_keyword_caption_is_not_checked_again(monkeypatch, tmp_path):
     """It is made of the narration's own lines, which step 2 already checked."""
-    def must_not_run(topic, text):
+    def must_not_run(topic, text, **kwargs):
         raise AssertionError("a heuristic draft has nothing new to check")
 
     monkeypatch.setattr(config, "VERIFY_MODE", "llm")

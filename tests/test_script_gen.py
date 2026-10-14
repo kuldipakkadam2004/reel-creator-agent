@@ -1189,6 +1189,44 @@ def test_only_findings_the_prompt_asked_for_are_kept():
     assert [f["sentence"] for f in parsed] == ["A real one."]
 
 
+def test_an_array_with_prose_and_a_citation_around_it_still_parses():
+    """A searching call cannot ask for a JSON mime type, so its reply can
+    carry text beside the array - a first-"[" to last-"]" slice is not JSON."""
+    raw = ('Checked against two sources [1].\n'
+           '[{"sentence": "A real one.", "kind": "false", "problem": "wrong"}]\n'
+           'See [2] for the depth figure.')
+    assert [f["sentence"] for f in script_gen._parse_verify_json(raw)] == [
+        "A real one."]
+
+
+def test_a_grounded_check_searches_and_asks_for_json_in_words(monkeypatch):
+    calls = []
+
+    def gemini(prompt, **kwargs):
+        calls.append((prompt, kwargs))
+        return "[]"
+
+    monkeypatch.setattr(script_gen, "call_gemini", gemini)
+    script_gen.check_claims("glaciers", GLACIER, grounded=True)
+    script_gen.check_claims("glaciers", GLACIER)
+
+    (searched, searched_kw), (plain, plain_kw) = calls
+    assert searched_kw["search"] is True and searched_kw["json_mode"] is False
+    assert "Use Google Search" in searched
+    assert plain_kw["search"] is False and plain_kw["json_mode"] is True
+    assert "Google Search" not in plain, "step 2's prompt is unchanged"
+
+
+def test_a_searching_call_carries_the_tool_and_no_json_mime_type():
+    built = script_gen._build_generation_config(
+        "gemini-2.5-pro", system_instruction="check", temperature=0.2,
+        max_output_tokens=100, thinking_budget=None, json_mode=True,
+        search=True)
+
+    assert built.tools and built.tools[0].google_search is not None
+    assert built.response_mime_type is None
+
+
 # ---------------------------------------------------------------------------
 # Saving - the .txt/.json pair step 3 and step 6 expect
 # ---------------------------------------------------------------------------

@@ -414,7 +414,8 @@ def is_pro_model(model: str | None = None) -> bool:
 
 def _build_generation_config(model: str, *, system_instruction: str,
                              temperature: float, max_output_tokens: int,
-                             thinking_budget: int | None, json_mode: bool):
+                             thinking_budget: int | None, json_mode: bool,
+                             search: bool = False):
     """Assemble GenerateContentConfig, adapting to the model family."""
     from google.genai import types
 
@@ -424,7 +425,11 @@ def _build_generation_config(model: str, *, system_instruction: str,
         "temperature": temperature,
         "max_output_tokens": max_output_tokens + (PRO_THINKING_HEADROOM if pro else 0),
     }
-    if json_mode:
+    if search:
+        # The 2.5 models refuse a search tool alongside a JSON mime type, so a
+        # searching call asks for JSON in its prompt and is parsed leniently.
+        kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+    elif json_mode:
         kwargs["response_mime_type"] = "application/json"
     # Only 2.5 flash / flash-lite accept a zero thinking budget; pro rejects it.
     if thinking_budget is not None and not pro:
@@ -548,6 +553,7 @@ def call_gemini(prompt: str, *, system_instruction: str,
                 json_mode: bool = False,
                 images: list[tuple[str, bytes]] | None = None,
                 timeout: float | None = None,
+                search: bool = False,
                 model: str | None = None,
                 api_key: str | None = None) -> str:
     """One Gemini call, and the only place the SDK is spoken to.
@@ -572,6 +578,8 @@ def call_gemini(prompt: str, *, system_instruction: str,
             which is the only step that passes any.
         timeout: seconds to wait on this call, defaulting to
             GEMINI_TIMEOUT_SECONDS. See `client_http_options`.
+        search: let the model run Google searches before it answers. Not
+            combinable with json_mode on 2.5, which then does not apply.
         model / api_key: default to config.GEMINI_MODEL and the .env key.
 
     Raises:
@@ -612,6 +620,7 @@ def call_gemini(prompt: str, *, system_instruction: str,
                     max_output_tokens=max_output_tokens,
                     thinking_budget=thinking_budget,
                     json_mode=json_mode,
+                    search=search,
                 ),
             )
         except Exception as exc:  # API errors, network errors, SDK issues
@@ -2656,8 +2665,18 @@ turn of phrase that is wrong only when read literally.
 - "problem": one sentence saying what is wrong. Name the other sentence if \
 this is a contradiction.
 
-Return ONLY a JSON array, empty if the script is sound:
+{search}Return ONLY a JSON array, empty if the script is sound:
 [{{"sentence": "...", "kind": "...", "problem": "..."}}]"""
+
+
+#: Added to the check when it may search. The claims worth a search are the
+#: ones a model is confidently wrong about from memory: how many, where, and
+#: whether something was seen in the wild or only in a flock.
+_VERIFY_SEARCH_RULE = (
+    "Use Google Search to check each specific factual claim - who, where, how "
+    "many, how often, in the wild or only in captivity - before you judge "
+    "it.\n\n"
+)
 
 
 _VERIFY_FIX_SYSTEM_INSTRUCTION = """\
@@ -2718,6 +2737,27 @@ def _numbered_sentences(script: str) -> str:
                       for i, s in enumerate(split_sentences(script), start=1))
 
 
+def _first_json_array(text: str):
+    """The first JSON array of objects in `text`, wherever it starts.
+
+    The fallback for a reply that is not only the array. A searching call
+    cannot ask for a JSON mime type, and its reply can carry prose or a
+    bracketed citation beside the array. One of 8 grounded replies replayed on
+    2026-10-14 did, and the first-"[" to last-"]" slice of it was not JSON.
+    """
+    decoder = json.JSONDecoder()
+    for at, char in enumerate(text):
+        if char != "[":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text, at)
+        except ValueError:
+            continue
+        if isinstance(data, list) and all(isinstance(x, dict) for x in data):
+            return data
+    return None
+
+
 def _parse_verify_json(raw: str) -> list[dict]:
     """Read the model's JSON array of findings, tolerantly."""
     text = (raw or "").strip()
@@ -2729,7 +2769,12 @@ def _parse_verify_json(raw: str) -> list[dict]:
     if start == -1 or end == -1 or end < start:
         raise ValueError(f"no JSON array in model output: {text[:200]!r}")
 
-    data = json.loads(text[start:end + 1])
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError:
+        data = _first_json_array(text)
+        if data is None:
+            raise
     if not isinstance(data, list):
         raise ValueError("model output was not a JSON array")
 
@@ -2795,7 +2840,7 @@ def quoted_sentence(quoted: str, sentences: list[str]) -> int | None:
     return best
 
 
-def check_claims(topic: str, script: str) -> dict:
+def check_claims(topic: str, script: str, *, grounded: bool = False) -> dict:
     """Fact-check `script`. Never raises.
 
     Returns {"findings": [...], "warnings": [...], "checked": bool}. Every
@@ -2804,6 +2849,9 @@ def check_claims(topic: str, script: str) -> dict:
     nobody could check is exactly where the pipeline stood before this pass was
     written. `checked` is what separates the two states an empty finding list
     can mean - nothing was wrong, or nothing was asked.
+
+    `grounded` lets the checker search the web before it judges. Step 6 asks
+    for it and step 2 does not - see POST_CLAIM_GROUNDED for why.
     """
     sentences = split_sentences(script)
     if len(sentences) < 2:
@@ -2812,13 +2860,15 @@ def check_claims(topic: str, script: str) -> dict:
     prompt = _VERIFY_PROMPT_TEMPLATE.format(
         topic=topic or "(not given)",
         numbered=_numbered_sentences(script),
+        search=_VERIFY_SEARCH_RULE if grounded else "",
     )
     try:
         raw = call_gemini(
             prompt,
             system_instruction=_VERIFY_SYSTEM_INSTRUCTION,
             temperature=VERIFY_TEMPERATURE,
-            json_mode=True,
+            json_mode=not grounded,
+            search=grounded,
         )
         found = _parse_verify_json(raw)
     except (ScriptGenerationError, config.MissingConfigError, ValueError) as exc:
