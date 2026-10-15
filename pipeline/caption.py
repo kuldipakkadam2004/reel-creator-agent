@@ -980,8 +980,22 @@ def check_post_claims(draft: Draft, *, topic: str,
     if not hook and body:
         # The hook is the only line shown before "... more", so an empty one
         # would open the post on the credits. The next finished paragraph
-        # takes its place, and `fit_hook` holds it to the hook's limit.
-        hook = body.pop(0)
+        # takes its place - but only as many of its sentences as fit the
+        # hook's limit, and the rest stays in the body. `fit_hook` cuts a long
+        # hook at a sentence and throws the remainder away, which is right for
+        # a line written as a hook and wrong for a paragraph that was not. The
+        # ice post of 2026-10-15 lost the sentences that explained the
+        # lattice that way, and kept "This also explains why lakes freeze"
+        # with nothing left for "this" to point at.
+        sentences = split_sentences(body.pop(0))
+        taken = sentences[:1]
+        for sentence in sentences[1:]:
+            if len(" ".join(taken + [sentence])) > config.POST_HOOK_MAX_CHARS:
+                break
+            taken.append(sentence)
+        hook = " ".join(taken)
+        if sentences[len(taken):]:
+            body.insert(0, " ".join(sentences[len(taken):]))
         warnings.append("the whole hook was dropped; the first body paragraph "
                         "now opens the caption")
     draft.hook, draft.body = hook, body

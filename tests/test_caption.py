@@ -1165,6 +1165,31 @@ def test_what_follows_a_cut_sentence_in_its_paragraph_goes_with_it(
                for w in warnings)
 
 
+def test_a_paragraph_promoted_to_hook_keeps_what_does_not_fit_in_the_body(
+        monkeypatch, tmp_path):
+    """The ice post of 2026-10-15: the promoted paragraph was 207 characters,
+    `fit_hook` kept the first two sentences, and the explanation went with the
+    rest - leaving "This also explains why lakes freeze" explaining nothing."""
+    stub_checker(monkeypatch, finding(
+        "That 9% expansion is the only thing stopping the oceans freezing."))
+    first = ("It's all down to hydrogen bonds. In liquid water, molecules "
+             "tumble past each other. In ice they lock into an open hexagonal "
+             "lattice that holds them further apart.")
+    stub_draft(monkeypatch, Draft(
+        hook="That 9% expansion is the only thing stopping the oceans freezing.",
+        body=[first, "This also explains why lakes freeze from the top down."],
+        hashtags={"mid": ["ice"]}))
+
+    post = caption.generate_caption(SCRIPT, run_dir=tmp_path, write=False)
+
+    assert post["hook"] == ("It's all down to hydrogen bonds. In liquid "
+                            "water, molecules tumble past each other.")
+    assert post["body"][0] == ("In ice they lock into an open hexagonal "
+                               "lattice that holds them further apart.")
+    assert "hexagonal lattice" in post["caption"]
+    assert len(post["hook"]) <= config.POST_HOOK_MAX_CHARS
+
+
 def test_a_cut_in_the_hook_takes_the_rest_of_the_hook_with_it(monkeypatch):
     stub_checker(monkeypatch, finding("Hunger stones are 2000 years old."))
     draft = Draft(hook="Hunger stones are 2000 years old. They still warn us.",
