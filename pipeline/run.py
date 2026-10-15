@@ -598,6 +598,7 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
                 # make is worse than no preview.
                 phrases="heuristic" if no_phrases else None,
                 niche_match="terms" if no_phrases else None,
+                repeats="terms" if no_phrases else None,
                 # A board trial is the one arm that changes what gets made
                 # rather than how it is made, so it is spent here, before a
                 # candidate exists to apply anything to.

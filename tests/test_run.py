@@ -630,6 +630,7 @@ def test_a_real_run_leaves_step_0_on_its_configured_mode(steps):
     kwargs = steps.seen["find_topics_kwargs"]
     assert kwargs["phrases"] is None
     assert kwargs["niche_match"] is None
+    assert kwargs["repeats"] is None
 
 
 def test_no_phrases_asks_step_0_for_its_free_mode(steps):
@@ -637,6 +638,7 @@ def test_no_phrases_asks_step_0_for_its_free_mode(steps):
     kwargs = steps.seen["find_topics_kwargs"]
     assert kwargs["phrases"] == "heuristic"
     assert kwargs["niche_match"] == "terms"
+    assert kwargs["repeats"] == "terms", "the repeat check is a call too"
 
 
 def test_no_phrases_says_the_choice_is_not_the_real_one(steps, capsys):

@@ -439,6 +439,21 @@ TOPIC_PHRASE_MODE = get_env("TOPIC_PHRASE_MODE", "llm")
 #: with fear" (reach 54).
 TOPIC_REQUIRE_EXPLAINABLE = get_env_bool("TOPIC_REQUIRE_EXPLAINABLE", True)
 
+#: Drop a candidate that tells the story of a reel already made.
+#:   llm   - made reels sharing a word with a shortlisted topic are listed
+#:           under it, and one Gemini call says which, if any, it repeats
+#:   terms - a repeat is REPEAT_MIN_SHARED_TERMS shared words, with no call.
+#:           The free mode, and what `--no-phrases` uses
+#:   off   - only the ledger's own check, which is by source post
+#:
+#: The ledger keys on the source's post id, so a story reposted under a new id
+#: is new to it. The flood-boulder video was made three times this way, on
+#: 2026-09-16, 09-24 and 10-14. See `topics.find_repeats` for the replay over
+#: the whole ledger. In terms mode, the same replay also dropped four pairs
+#: that only looked alike, such as a chameleon changing colour against
+#: leaves changing colour.
+TOPIC_REPEAT_CHECK = get_env("TOPIC_REPEAT_CHECK", "llm")
+
 #: Topics scouted in the last N boards are scored down so the same candidate
 #: does not head every board; one already made into a reel is dropped. 0
 #: disables the ledger.

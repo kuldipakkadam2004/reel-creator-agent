@@ -1879,6 +1879,10 @@ def offline(monkeypatch, tmp_path):
     # which most of these tests are about - from running at all. Tests for the
     # llm mode stub `call_gemini` and switch this back.
     monkeypatch.setattr(config, "TOPIC_SOURCEABILITY", "probe")
+    # The fourth, and the same treatment. It only calls when the ledger holds a
+    # made reel sharing a word with a candidate, but a test that marks one used
+    # should not find out the hard way.
+    monkeypatch.setattr(config, "TOPIC_REPEAT_CHECK", "terms")
     monkeypatch.setattr(config, "TOPIC_SUBREDDITS", ("todayilearned",))
     return tmp_path
 
@@ -2986,3 +2990,141 @@ def test_one_feed_is_still_the_whole_list():
     groups = _groups(NINE, 1)
     assert len(groups) == 1
     assert list(groups[0]) == NINE
+
+
+# ---------------------------------------------------------------------------
+# Repeats - a new post telling the story of a reel already made
+# ---------------------------------------------------------------------------
+
+MADE = ["how a flash flood can move a giant boulder",      # M0, the newest
+        "why the deep ocean is dark",                       # M1
+        "how Nepal floodwaters moved a large boulder"]      # M2
+NICHE = {"ocean", "earth", "science", "nature"}
+
+
+def _answering(answers, asked=None):
+    """A `call_gemini` that gives a fixed repeat verdict and keeps the prompt."""
+    def call(prompt, **kwargs):
+        if asked is not None:
+            asked.append(prompt)
+        return json.dumps(answers)
+    return call
+
+
+def test_a_retold_story_is_caught_though_the_words_differ(monkeypatch):
+    """The flood-boulder video, made on 09-16, 09-24 and again on 10-14."""
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        _answering([{"index": 0, "repeats": "M0"}]))
+    found, warnings = topics.find_repeats(
+        [candidate("how floods can carry massive boulders")], MADE,
+        niche_terms=NICHE, mode="llm")
+
+    assert found == {0: 0}
+    assert warnings == []
+
+
+def test_only_made_reels_sharing_a_word_are_shown_under_a_topic(monkeypatch):
+    asked = []
+    monkeypatch.setattr(script_gen, "call_gemini", _answering([], asked))
+    topics.find_repeats([candidate("how floods can carry massive boulders")],
+                        MADE, niche_terms=NICHE, mode="llm")
+
+    assert "M0: how a flash flood can move a giant boulder" in asked[0]
+    assert "M2: how Nepal floodwaters moved a large boulder" in asked[0]
+    assert "deep ocean is dark" not in asked[0]
+
+
+def test_the_accounts_own_subject_words_do_not_make_a_match(monkeypatch):
+    """"ocean" is in half of what an ocean-science account makes."""
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("nothing shares a distinctive word, so no call")
+
+    monkeypatch.setattr(script_gen, "call_gemini", must_not_run)
+    found, _ = topics.find_repeats([candidate("why the ocean is salty")],
+                                   MADE, niche_terms=NICHE, mode="llm")
+    assert found == {}
+
+
+def test_a_label_not_listed_under_the_topic_is_ignored(monkeypatch):
+    """M1 shares no word with the topic, so a verdict naming it is a label
+    lifted from somewhere else and must not drop the candidate."""
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        _answering([{"index": 0, "repeats": "M1"}]))
+    found, _ = topics.find_repeats(
+        [candidate("how floods can carry massive boulders")], MADE,
+        niche_terms=NICHE, mode="llm")
+    assert found == {}
+
+
+def test_a_verdict_naming_two_reels_still_counts(monkeypatch):
+    """Replayed on the ledger, the 10-14 topic came back as "M25, M32"."""
+    monkeypatch.setattr(script_gen, "call_gemini",
+                        _answering([{"index": 0, "repeats": "M2, M0"}]))
+    found, _ = topics.find_repeats(
+        [candidate("how floods can carry massive boulders")], MADE,
+        niche_terms=NICHE, mode="llm")
+    assert found == {0: 2}
+
+
+def test_a_failed_repeat_check_falls_back_to_shared_words(monkeypatch):
+    def boom(*args, **kwargs):
+        raise script_gen.ScriptGenerationError("503")
+
+    monkeypatch.setattr(script_gen, "call_gemini", boom)
+    found, warnings = topics.find_repeats(
+        [candidate("how floods can carry massive boulders"),
+         candidate("why boulders crack in the desert")], MADE,
+        niche_terms=NICHE, mode="llm")
+
+    assert found == {0: 0}, "flood and boulder are two words; boulder alone is one"
+    assert any("repeat check failed" in w for w in warnings)
+
+
+def test_terms_mode_makes_no_call(monkeypatch):
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("terms mode is the free one")
+
+    monkeypatch.setattr(script_gen, "call_gemini", must_not_run)
+    found, _ = topics.find_repeats(
+        [candidate("how floods can carry massive boulders")], MADE,
+        niche_terms=NICHE, mode="terms")
+    assert found == {0: 0}
+
+
+def test_off_checks_nothing(monkeypatch):
+    found, warnings = topics.find_repeats(
+        [candidate("how floods can carry massive boulders")], MADE,
+        niche_terms=NICHE, mode="off")
+    assert (found, warnings) == ({}, [])
+
+
+def test_made_topics_come_newest_first(ledger):
+    ledger.mark_used("redditrss:a", "how Nepal floodwaters moved a large boulder")
+    ledger._data["topics"]["redditrss:a"]["used_at"] = "2026-09-16T05:32:12+00:00"
+    ledger.mark_used("redditrss:b", "how a flash flood can move a giant boulder")
+    ledger._data["topics"]["redditrss:b"]["used_at"] = "2026-09-24T15:16:38+00:00"
+    ledger.record_board([candidate("why the sky is blue")])      # shown, not made
+
+    assert ledger.made_topics() == ["how a flash flood can move a giant boulder",
+                                    "how Nepal floodwaters moved a large boulder"]
+
+
+def test_a_board_drops_a_repost_of_a_story_already_made(offline, monkeypatch):
+    """A new post id, so the ledger's own check lets it through."""
+    usage = topics.TopicLedger(config.TOPIC_USAGE_FILE)
+    usage.mark_used("redditrss:1vze24q", "how a flash flood can move a giant boulder")
+    usage.save()
+    install_source(monkeypatch, "reddit", [
+        candidate("how floods can carry massive boulders", external_id="1x3tp92",
+                  rate=300, age_hours=2),
+        candidate("why the ocean is salty", external_id="t2",
+                  rate=100, age_hours=2),
+    ])
+
+    board = topics.find_topics("ocean science", sources=("reddit",),
+                               sourceability="off")
+
+    shown = [row["topic"] for row in board["candidates"]]
+    assert shown == ["why the ocean is salty"]
+    assert any("repeats a reel already made" in row["reason"]
+               and "flash flood" in row["reason"] for row in board["rejected"])

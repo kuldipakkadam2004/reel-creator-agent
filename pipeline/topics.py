@@ -2755,6 +2755,16 @@ class TopicLedger:
             entry["source"] = candidate.source
         self._prune()
 
+    def made_topics(self) -> list[str]:
+        """Every topic made into a reel, newest first, as it was worded then."""
+        made = [
+            (str(entry.get("used_at") or ""), str(entry.get("topic")))
+            for entry in self._data["topics"].values()
+            if isinstance(entry, dict) and entry.get("used") and entry.get("topic")
+        ]
+        made.sort(reverse=True)
+        return list(dict.fromkeys(topic for _, topic in made))
+
     def mark_used(self, key: str, topic: str = "") -> None:
         entry = self._data["topics"].setdefault(key, {"boards": 0})
         entry["used"] = True
@@ -3205,6 +3215,188 @@ def _drop_unexplainable(candidates: list[Candidate],
 
 
 # ---------------------------------------------------------------------------
+# Repeats - a new post telling the story of a reel already made
+# ---------------------------------------------------------------------------
+
+#: Zero: the check is a yes-or-no reading of two short lists, and the replay it
+#: was measured on ran at zero.
+REPEAT_TEMPERATURE = 0.0
+
+#: Most made reels listed under one candidate, newest first. A prompt that
+#: grows with the history is a prompt that gets slower and vaguer every week.
+REPEAT_MAX_RELATED = 8
+
+#: Shared words for the free rule to call a repeat, when the model is not asked.
+REPEAT_MIN_SHARED_TERMS = 2
+
+_REPEAT_SYSTEM_INSTRUCTION = """\
+You decide whether a proposed video topic repeats a video this account has \
+already made.
+
+You always return valid JSON and nothing else."""
+
+
+_REPEAT_PROMPT_TEMPLATE = """\
+Below are proposed topics for short explainer videos. Under each are videos \
+this account has already made that share a word with it.
+
+{candidates}
+
+For each proposed topic, say which of the videos listed under it it repeats, \
+by its label, or null.
+
+A topic repeats a made video when someone who watched that video would feel \
+they were watching it again: the same subject and the same explanation, even \
+worded differently, set somewhere else, or prompted by a different news story. \
+"why the Dead Sea is so salty" repeats "how the Dead Sea got its salt".
+
+It is not a repeat when only the subject is shared and the question is a \
+different one ("why volcanoes erupt" and "what grows on a volcano's slopes"), \
+or only the phenomenon is shared and the subject is a different one ("how \
+octopuses change colour" and "why autumn leaves change colour").
+
+Return ONLY a JSON array, one object per proposed topic, in the same order:
+[{{"index": 0, "repeats": "M3"}}, {{"index": 1, "repeats": null}}]"""
+
+_MADE_LABEL_RE = re.compile(r"\bM(\d+)\b")
+
+
+def _distinctive_terms(text: str, niche_terms) -> set[str]:
+    """A topic's content words, less the account's own subject words.
+
+    On an ocean-science account "ocean" is in half of everything made, and
+    a word every topic shares says nothing about which story one is.
+    """
+    return {word for word in _terms(text)
+            if not any(_same_word(word, niche) for niche in niche_terms)}
+
+
+def _shared_terms(one: set[str], other: set[str]) -> int:
+    return sum(1 for word in one if any(_same_word(word, w) for w in other))
+
+
+def find_repeats(candidates: list[Candidate], made: list[str], *,
+                 niche_terms=(), mode: str | None = None,
+                 ) -> tuple[dict[int, int], list[str]]:
+    """Which candidates tell the story of a reel already made. Never raises.
+
+    Returns ({candidate index: index into `made`}, warnings).
+
+    The ledger stops a *post* being made twice, keyed on the source's own id.
+    It cannot stop a story being made twice. r/geology reposts the same video
+    of a flood carrying a boulder under a new id each time, and the pipeline
+    made it on 2026-09-16, 09-24 and 10-14: three reels with one script shape,
+    reach 1,081, then 133, then not posted. Word overlap cannot settle this on
+    its own. "floods carry massive boulders" against "a flash flood can move a
+    giant boulder" shares two words out of four, and so does "a chameleon
+    changes colour" against "leaves change colour", which is not a repeat. So
+    shared words only choose which made reels to show, and the model judges.
+
+    Replayed 2026-10-14 over the topic ledger, 262 topics against the 52 made,
+    each judged only against reels made before it, twice: every boulder repeat
+    was flagged, plus the reposted cat species, a celebrity post about the
+    gorilla reel's story, and tsunami deposits at a second site. "Nepal glacier
+    collapse" against the Nepal boulder reel was flagged once in two runs.
+    Nothing else among the 132 topics that shared a word with an earlier reel
+    was flagged.
+
+    `mode` "terms" skips the model and calls it a repeat at
+    REPEAT_MIN_SHARED_TERMS shared words. Measured on the same ledger, that
+    also catches chameleon against leaves and three other pairs that are not
+    repeats, so it is only the free mode and the fallback.
+    """
+    setting = (mode or config.TOPIC_REPEAT_CHECK or "llm").strip().lower()
+    if setting not in ("llm", "terms") or not candidates or not made:
+        return {}, []
+
+    made_terms = [_distinctive_terms(topic, niche_terms) for topic in made]
+    related: dict[int, list[int]] = {}
+    for index, candidate in enumerate(candidates):
+        mine = _distinctive_terms(candidate.topic or candidate.title, niche_terms)
+        hits = [number for number, terms in enumerate(made_terms)
+                if _shared_terms(mine, terms)]
+        if hits:
+            related[index] = hits[:REPEAT_MAX_RELATED]
+    if not related:
+        return {}, []
+
+    def by_terms() -> dict[int, int]:
+        found = {}
+        for index, hits in related.items():
+            candidate = candidates[index]
+            mine = _distinctive_terms(candidate.topic or candidate.title,
+                                      niche_terms)
+            best = max(hits, key=lambda n: _shared_terms(mine, made_terms[n]))
+            if _shared_terms(mine, made_terms[best]) >= REPEAT_MIN_SHARED_TERMS:
+                found[index] = best
+        return found
+
+    if setting == "terms":
+        return by_terms(), []
+
+    asked = list(related)
+    blocks = []
+    for position, index in enumerate(asked):
+        candidate = candidates[index]
+        lines = [f"{position}. {candidate.topic or candidate.title}"]
+        lines += [f"   M{number}: {made[number]}" for number in related[index]]
+        blocks.append("\n".join(lines))
+    try:
+        raw = script_gen.call_gemini(
+            _REPEAT_PROMPT_TEMPLATE.format(candidates="\n\n".join(blocks)),
+            system_instruction=_REPEAT_SYSTEM_INSTRUCTION,
+            temperature=REPEAT_TEMPERATURE,
+            json_mode=True,
+        )
+        answers = script_gen._first_json_array(raw or "")
+        if answers is None:
+            raise ValueError(f"no JSON array in model output: {raw[:200]!r}")
+    except (script_gen.ScriptGenerationError, config.MissingConfigError,
+            ValueError) as exc:
+        return by_terms(), [f"the repeat check failed ({exc}). Fell back to "
+                            f"{REPEAT_MIN_SHARED_TERMS} shared words, which "
+                            f"also drops some topics that only look alike."]
+
+    found: dict[int, int] = {}
+    for answer in answers:
+        try:
+            position = int(answer.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= position < len(asked):
+            continue
+        index = asked[position]
+        # A label, a list of labels, or "M25, M32" - and only a reel that was
+        # listed under this topic counts, so a label lifted from the line
+        # above cannot drop the wrong one.
+        named = [int(n) for n in _MADE_LABEL_RE.findall(str(answer.get("repeats")))]
+        listed = [n for n in named if n in related[index]]
+        if listed:
+            found[index] = listed[0]
+    return found, []
+
+
+def _drop_repeats(candidates: list[Candidate], ledger: "TopicLedger",
+                  rejected: list[dict], *, niche_terms=(),
+                  mode: str | None = None) -> tuple[set[int], list[str]]:
+    """Move the candidates that repeat a made reel to `rejected`.
+
+    Returns their `id()`s, as `_drop_unexplainable` does, and any warnings.
+    """
+    made = ledger.made_topics()
+    found, warnings = find_repeats(candidates, made, niche_terms=niche_terms,
+                                   mode=mode)
+    gone: set[int] = set()
+    for index, number in found.items():
+        candidate = candidates[index]
+        rejected.append({**candidate.as_dict(),
+                         "reason": f"repeats a reel already made: "
+                                   f"{made[number]!r}"})
+        gone.add(id(candidate))
+    return gone, warnings
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -3254,6 +3446,7 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
                 phrases: str | None = None, niche_mode: str | None = None,
                 niche_match: str | None = None, subreddits=None, keywords=None,
                 curiosity: bool | None = None,
+                repeats: str | None = None,
                 ledger: TopicLedger | None = None) -> dict:
     """Scout topic candidates and return a ranked board.
 
@@ -3272,6 +3465,8 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
         subreddits / keywords: override the reddit and youtube inputs.
         curiosity: False stops the curiosity component being charged, which is
             the "off" arm of the `curiosity` trial. See `score_candidate`.
+        repeats: "llm", "terms" or "off" - how a candidate retelling a reel
+            already made is caught. Defaults to config.TOPIC_REPEAT_CHECK.
         ledger: an open TopicLedger, for a caller running several boards.
 
     Returns:
@@ -3473,6 +3668,18 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
     shortlist = [c for c in shortlist if id(c) not in gone]
     scored = [c for c in scored if id(c) not in gone]
 
+    # Also on the settled wording, and for a reason of its own: the ledger
+    # stops the same post being made twice, and this stops the same story.
+    # The niche words are left out of the comparison even when the niche gate
+    # is off, because they are shared by everything the account has made.
+    repeat_terms = niche_terms or niche_vocabulary(
+        niche, keywords or config.TOPIC_KEYWORDS)
+    gone, notes = _drop_repeats(shortlist, ledger, rejected,
+                                niche_terms=repeat_terms, mode=repeats)
+    warnings.extend(notes)
+    shortlist = [c for c in shortlist if id(c) not in gone]
+    scored = [c for c in scored if id(c) not in gone]
+
     # Re-scored, because the wording moved under the score. This is the point
     # at which the form components are charged, and it is deliberately before
     # the probe: `apply_sourceability` and `apply_measured` add to
@@ -3577,6 +3784,11 @@ def find_topics(niche: str | None = None, *, sources=None, limit: int | None = N
     # row short rather than pulling up another, which would arrive unpolished
     # and unchecked in its turn.
     gone = _drop_unexplainable(stragglers, rejected)
+    board = [c for c in board if id(c) not in gone]
+    stragglers = [c for c in stragglers if id(c) not in gone]
+    gone, notes = _drop_repeats(stragglers, ledger, rejected,
+                                niche_terms=repeat_terms, mode=repeats)
+    warnings.extend(notes)
     board = [c for c in board if id(c) not in gone]
 
     # --- 5. decide how long each one should be -----------------------------
@@ -3912,6 +4124,7 @@ def main(argv: list[str] | None = None) -> int:
                 # or it is a free mode that quietly is not one.
                 niche_match=(args.niche_match
                              or ("terms" if args.no_phrases else None)),
+                repeats="terms" if args.no_phrases else None,
                 subreddits=args.subreddits,
                 keywords=args.keywords,
                 curiosity=False if args.no_curiosity else None,
