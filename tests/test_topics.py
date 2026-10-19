@@ -3128,3 +3128,13 @@ def test_a_board_drops_a_repost_of_a_story_already_made(offline, monkeypatch):
     assert shown == ["why the ocean is salty"]
     assert any("repeats a reel already made" in row["reason"]
                and "flash flood" in row["reason"] for row in board["rejected"])
+
+
+def test_the_footage_probe_does_not_ask_an_archive_only_library(monkeypatch):
+    """Step 4 asks Commons a beat's archive name and nothing else, so finding
+    a topic's keywords there says nothing about whether stock can shoot it."""
+    monkeypatch.setattr(config, "VISUAL_PROVIDERS", ("wikimedia", "openverse"))
+
+    names = [provider.name for provider in topics._ready_providers(None, [])]
+
+    assert names == ["openverse"]

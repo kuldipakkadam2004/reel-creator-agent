@@ -2328,6 +2328,127 @@ def test_openverse_has_no_video_endpoint():
 
 
 # ---------------------------------------------------------------------------
+# Wikimedia Commons, searched directly for the archive query
+# ---------------------------------------------------------------------------
+
+def _commons_page(index, title, width, height, *, mime="image/jpeg",
+                  licence="CC BY-SA 4.0",
+                  categories="Migmatite|Self-published work|Outcrops in Ontario",
+                  artist='<a href="//commons.wikimedia.org/wiki/User:P199">P199</a>'):
+    """One page of a `generator=search` reply, the way Commons writes it -
+    `?utm_` tails on the URLs and HTML in the metadata included."""
+    stem = title.replace(" ", "_")
+    return {
+        "index": index, "title": f"File:{title}",
+        "imageinfo": [{
+            "width": width, "height": height, "mime": mime,
+            "url": f"https://upload.wikimedia.org/wikipedia/commons/a/ab/{stem}"
+                   "?utm_source=commons.wikimedia.org&utm_content=original",
+            "thumburl": "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/ab/"
+                        f"{stem}/330px-{stem}?utm_source=commons.wikimedia.org",
+            "descriptionurl": f"https://commons.wikimedia.org/wiki/File:{stem}",
+            "extmetadata": {
+                "LicenseShortName": {"value": licence},
+                "Artist": {"value": artist},
+                "Categories": {"value": categories},
+            },
+        }],
+    }
+
+
+def _commons_session(*pages):
+    return FakeSession(routes={"commons.wikimedia.org/w/api.php": FakeResponse(
+        200, payload={"query": {"pages": list(pages)}})})
+
+
+def test_commons_is_searched_for_photographs_tall_enough_to_crop(monkeypatch):
+    monkeypatch.setattr(config, "WIKIMEDIA_CONTACT", "https://example.test/contact")
+    session = _commons_session(
+        _commons_page(2, "Migmatite Outcrop in Nashua.jpg", 6345, 4230),
+        _commons_page(1, "Metamorphic rock Georgian Bay.jpg", 2592, 1944),
+    )
+
+    found = visuals.WikimediaProvider(session).search("Migmatite", "image", 15)
+
+    [call] = session.calls
+    asked = call["params"]["gsrsearch"]
+    assert asked.startswith("Migmatite filetype:bitmap")
+    assert f"fileh:>{config.VISUAL_MIN_HEIGHT - 1}" in asked
+    assert call["headers"]["User-Agent"].endswith("(https://example.test/contact)")
+    # Commons' own relevance order, not the order the pages arrived in.
+    assert [c.title for c in found] == ["Metamorphic rock Georgian Bay",
+                                        "Migmatite Outcrop in Nashua"]
+    small, large = found
+    assert small.download_url == ("https://upload.wikimedia.org/wikipedia/commons/"
+                                  "a/ab/Metamorphic_rock_Georgian_Bay.jpg")
+    assert (small.width, small.height) == (2592, 1944)
+    # Wider than a frame can use: the largest thumbnail Commons serves instead.
+    assert large.download_url.endswith(
+        "/thumb/a/ab/Migmatite_Outcrop_in_Nashua.jpg/3840px-Migmatite_Outcrop_in_Nashua.jpg")
+    assert (large.width, large.height) == (3840, 2560)
+    assert small.preview_url.endswith("/330px-Metamorphic_rock_Georgian_Bay.jpg")
+
+
+def test_a_commons_photograph_carries_its_credit_and_its_subject(monkeypatch):
+    [found] = visuals.WikimediaProvider(_commons_session(
+        _commons_page(1, "Metamorphic rock Georgian Bay.jpg", 2592, 1944),
+    )).search("Migmatite", "image", 15)
+
+    assert found.key == "wikimedia:Metamorphic rock Georgian Bay.jpg"
+    assert found.creator == "P199" and found.license == "CC BY-SA 4.0"
+    assert found.attribution == (
+        '"Metamorphic rock Georgian Bay" by P199 via wikimedia (CC BY-SA 4.0) - '
+        "https://commons.wikimedia.org/wiki/File:Metamorphic_rock_Georgian_Bay.jpg")
+    # Its title never says migmatite; the category it is filed under does,
+    # and how a file got onto Commons is not what it shows.
+    assert found.description == "Migmatite, Outcrops in Ontario"
+    assert "migmatite" in visuals.describe_candidate(found)
+    assert "self-published" not in visuals.describe_candidate(found)
+
+
+def test_commons_skips_what_a_caption_cannot_credit_or_a_frame_cannot_show():
+    found = visuals.WikimediaProvider(_commons_session(
+        _commons_page(1, "Only GFDL.jpg", 3000, 2000, licence="GFDL"),
+        _commons_page(2, "A scan.tif", 3000, 2000, mime="image/tiff"),
+        _commons_page(3, "A plate.jpg", 3000, 2000, licence="Public domain"),
+        _commons_page(4, "A drawing.png", 3000, 2000, mime="image/png",
+                      licence="CC0"),
+    )).search("x", "image", 15)
+
+    assert [c.title for c in found] == ["A plate", "A drawing"]
+
+
+def test_commons_is_keyless_and_only_ever_asked_the_archive_query():
+    assert visuals.WikimediaProvider.is_configured()
+    assert visuals.WikimediaProvider.archive and visuals.WikimediaProvider.archive_only
+    assert visuals.WikimediaProvider.attribution_required is True
+    assert visuals._PROVIDERS["wikimedia"] is visuals.WikimediaProvider
+    assert visuals.WikimediaProvider(FakeSession()).search("x", "video", 5) == []
+
+
+def test_the_screener_fetches_a_commons_still_with_the_contact(monkeypatch):
+    """thumb.wikimedia.org throttles a User-Agent that names no contact, and a
+    still that does not arrive leaves the clip judged on its words alone."""
+    import requests
+
+    monkeypatch.setattr(config, "WIKIMEDIA_CONTACT", "https://example.test/contact")
+    sent = {}
+
+    def fake_get(url, timeout=None, headers=None):
+        sent[url] = headers
+        raise requests.exceptions.ConnectionError("offline")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    commons = "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/ab/x.jpg/330px-x.jpg"
+    stock = "https://images.pexels.com/videos/1/pictures/preview-0.jpg"
+
+    assert visuals._screen_picture(commons) is None
+    assert visuals._screen_picture(stock) is None
+    assert sent[commons]["User-Agent"].endswith("(https://example.test/contact)")
+    assert sent[stock] == {"User-Agent": visuals.USER_AGENT}
+
+
+# ---------------------------------------------------------------------------
 # YouTube (Creative Commons only)
 # ---------------------------------------------------------------------------
 
@@ -2644,7 +2765,9 @@ def test_the_new_providers_are_opt_in():
     )
     assert "youtube" not in default
     assert "nasa" not in default
-    assert default == ("pexels", "pixabay", "openverse")
+    # wikimedia is keyless and asked only a beat's archive query, so unlike
+    # those two it costs a run nothing it was not already spending on Openverse.
+    assert default == ("pexels", "pixabay", "wikimedia", "openverse")
 
 
 def test_provider_readiness_reflects_the_configured_keys(monkeypatch):
@@ -4340,6 +4463,115 @@ def test_only_an_approved_photograph_of_the_subject_is_moved(monkeypatch,
                  _still(9, "Hungerstein in Pirna"))
 
     assert plans[4][0][1].key == stream.key
+
+
+class _Commons(visuals.Provider):
+    """Commons asked directly: archive-only, ahead of the indirect index."""
+    name = "commons"
+    kinds = ("image",)
+    key_env = ()
+    archive = True
+    archive_only = True
+    asked: list = []
+    answers: dict = {}
+
+    def search(self, query, kind, limit):
+        _Commons.asked.append(query)
+        return list(_Commons.answers.get(query, []))
+
+
+@pytest.fixture
+def three_libraries():
+    _Stock.asked, _Archive.asked, _Commons.asked = [], [], []
+    _Commons.answers = {}
+    return [_Stock(None), _Commons(None), _Archive(None)]
+
+
+def test_an_archive_only_library_is_never_asked_the_stock_query(three_libraries):
+    _Commons.answers = {"Hungerstein": [
+        _still(5, "Hungerstein in Decin", provider="commons")]}
+
+    pool = visuals._gather_candidates(three_libraries, _elbe_beat(),
+                                      _settings(assets_per_beat=2), [])
+
+    assert _Commons.asked == ["Hungerstein"]
+    assert [c.provider for c, _, q in pool if q == "Hungerstein"] == ["commons"]
+
+
+def test_the_indirect_archive_is_not_asked_once_commons_has_answered(
+        three_libraries):
+    """Openverse indexes the same files: after Commons it only hands them back
+    under other keys, and on 2026-10-18 it timed out six times in one run."""
+    _Commons.answers = {"Hungerstein": [
+        _still(5, "Hungerstein in Decin", provider="commons")]}
+
+    visuals._gather_candidates(three_libraries, _elbe_beat(),
+                               _settings(assets_per_beat=2), [])
+
+    assert "Hungerstein" not in _Archive.asked
+
+
+def test_the_indirect_archive_is_the_fallback_when_commons_has_nothing(
+        three_libraries):
+    _Commons.answers = {"Hungerstein": [   # found, but too small to crop
+        dataclass_replace(_still(5, "Hungerstein", provider="commons"),
+                          width=640, height=480)]}
+
+    pool = visuals._gather_candidates(three_libraries, _elbe_beat(),
+                                      _settings(assets_per_beat=2), [])
+
+    assert _Archive.asked.count("Hungerstein") == 1
+    assert [c.provider_id for c, _, q in pool
+            if q == "Hungerstein" and c.provider == "archive"] == ["i0", "i1", "i2"]
+
+
+_ANATEXIS_TOPIC = "what is anatexis and partial melting"
+
+
+def _migmatite_opening() -> Beat:
+    return Beat(index=0, start=0.0, end=3.4, query="migmatite rock close up",
+                text="You're looking at a rock that was part solid, part liquid.",
+                archive_query="Migmatite", shots=2)
+
+
+def test_a_clip_the_screen_called_the_subject_must_also_name_it(monkeypatch):
+    """The anatexis reel of 2026-10-18: the screen marked five Pexels rock
+    textures as the migmatite, and they opened the reel. One small still of
+    a rock cannot be told from a migmatite; the clip's words can."""
+    rock = _described(83, "close-up-video-of-a-rock")
+    photo = _still(8, "Migmatite Outcrop in Nashua", provider="wikimedia")
+    rows = [(14.7, rock, "migmatite rock close up"), (5.3, photo, "Migmatite")]
+    both = {rock.key, photo.key}
+
+    led, note = visuals._archive_first(rows, _migmatite_opening(), both, set(),
+                                       both, topic=_ANATEXIS_TOPIC)
+
+    assert [row[1].key for row in led] == [photo.key, rock.key]
+    assert "archive query 'Migmatite'" in note
+
+
+def test_a_clip_that_names_the_subject_still_keeps_its_place():
+    named = _described(84, "migmatite-cliff-on-the-norwegian-coast")
+    photo = _still(8, "Migmatite Outcrop in Nashua", provider="wikimedia")
+    rows = [(14.7, named, "migmatite rock close up"), (5.3, photo, "Migmatite")]
+    both = {named.key, photo.key}
+
+    kept, note = visuals._archive_first(rows, _migmatite_opening(), both,
+                                        set(), both, topic=_ANATEXIS_TOPIC)
+
+    assert kept == rows and note == ""
+
+
+def test_without_a_topic_the_screen_alone_decides_as_before():
+    rock = _described(83, "close-up-video-of-a-rock")
+    photo = _still(8, "Migmatite Outcrop in Nashua", provider="wikimedia")
+    rows = [(14.7, rock, "migmatite rock close up"), (5.3, photo, "Migmatite")]
+    both = {rock.key, photo.key}
+
+    kept, note = visuals._archive_first(rows, _migmatite_opening(), both,
+                                        set(), both)
+
+    assert kept == rows and note == ""
 
 
 

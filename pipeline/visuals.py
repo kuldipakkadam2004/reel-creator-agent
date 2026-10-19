@@ -364,6 +364,10 @@ class Candidate:
     title: str = ""
     duration: float | None = None    # videos only
     preview_url: str = ""
+    #: More of the library's own words, when it keeps any beyond the title -
+    #: Commons' subject categories ("Migmatite", "Outcrops in Ontario"). Read
+    #: by `describe_candidate`, never by the credit line, which quotes `title`.
+    description: str = ""
 
     @property
     def key(self) -> str:
@@ -1109,6 +1113,10 @@ class Provider:
     #: Indexes museum and encyclopedia collections rather than stock, so it is
     #: also asked each beat's `archive_query`. See `_gather_candidates`.
     archive = False
+    #: Asked the archive query and nothing else. A stock-style query ("migmatite
+    #: rock close up") is not how an archive files anything, so asking it costs a
+    #: request per beat for hits the archive query finds better.
+    archive_only = False
 
     def __init__(self, session):
         self.session = session
@@ -1394,6 +1402,131 @@ class OpenverseProvider(Provider):
         return out
 
 
+#: Commons serves thumbnails only at these widths; anything else is a 400. 330
+#: is the screener's still, 3840 the most a 1080x1920 frame can use.
+COMMONS_PREVIEW_WIDTH = 330
+COMMONS_MAX_WIDTH = 3840
+
+#: The licences a reel can carry with a credit line. Commons hosts free files
+#: only, but "free" includes the GFDL, whose terms (ship the licence text with
+#: the work) a caption cannot meet - so anything not on this list is skipped.
+_COMMONS_LICENCE_PREFIXES = ("cc by", "cc-by", "cc0", "public domain", "pd")
+
+#: Categories that say how a file got onto Commons rather than what it shows.
+_COMMONS_CHROME_CATEGORY_RE = re.compile(
+    r"licen[cs]e|gfdl|^cc[- ]|^pd[- ]|self-published|taken with|^files |"
+    r"^pages |^uploaded|^photographs by|^media |^images from|^supported by|"
+    r"^quality images|^featured|^valued|^created with",
+    re.IGNORECASE,
+)
+
+
+def _strip_markup(html: str) -> str:
+    """Commons extmetadata is HTML: tags off, whitespace collapsed."""
+    return " ".join(re.sub(r"<[^>]+>", " ", html or "").split())
+
+
+def _commons_value(meta: dict, name: str) -> str:
+    entry = meta.get(name)
+    return _strip_markup(entry.get("value") if isinstance(entry, dict) else "")
+
+
+class WikimediaProvider(Provider):
+    """Wikimedia Commons, searched directly - photographs of named things.
+
+    Asked the beat's archive query only. Openverse indexes Commons too, but at
+    one remove, and five reels were re-cut by hand with Commons photographs
+    that it never delivered: hunger stones (2026-09-30), gorillas (10-03),
+    hadal amphipods (10-11), turkeys (10-13) and migmatite (10-18). On the
+    last of those it timed out on six archive searches in one run, and it
+    matches every word exactly. Searched by hand that evening, Commons
+    returned 39 crop-safe, freely licensed migmatites from three queries.
+
+    `fileh:` has the search drop files too short for the 9:16 floor before
+    they cost a slot in the page, and the URLs lose the `?utm_` tail Commons
+    appends, which breaks the thumbnail path.
+    """
+
+    name = "wikimedia"
+    kinds = ("image",)
+    key_env = ()
+    attribution_required = True
+    archive = True
+    archive_only = True
+    API_URL = "https://commons.wikimedia.org/w/api.php"
+
+    def search(self, query: str, kind: str, limit: int) -> list[Candidate]:
+        if kind != "image" or not query.strip():
+            return []
+        params = {
+            "action": "query", "format": "json", "formatversion": "2",
+            "generator": "search", "gsrnamespace": "6",
+            "gsrsearch": (f"{query.strip()} filetype:bitmap "
+                          f"fileh:>{max(0, config.VISUAL_MIN_HEIGHT - 1)}"),
+            "gsrlimit": str(max(1, min(limit, 50))),
+            "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
+            "iiurlwidth": str(COMMONS_PREVIEW_WIDTH),
+            "iiextmetadatafilter": "LicenseShortName|Artist|Categories",
+        }
+        payload = _get_json(self.session, self.API_URL, provider=self.name,
+                            params=params, headers=_download_headers(self.API_URL))
+        self.searches += 1
+
+        pages = (payload.get("query") or {}).get("pages") or []
+        if isinstance(pages, dict):          # formatversion 1 shape
+            pages = list(pages.values())
+        out = []
+        for page in sorted(pages, key=lambda p: p.get("index", 0)):
+            candidate = self._candidate(page)
+            if candidate is not None:
+                out.append(candidate)
+        return out
+
+    def _candidate(self, page: dict) -> Candidate | None:
+        info = (page.get("imageinfo") or [{}])[0]
+        if info.get("mime") not in ("image/jpeg", "image/png"):
+            return None                      # TIFF, SVG, GIF: not a frame
+        meta = info.get("extmetadata") or {}
+        licence = _commons_value(meta, "LicenseShortName")
+        if not licence.lower().startswith(_COMMONS_LICENCE_PREFIXES):
+            return None
+        width, height = int(info.get("width") or 0), int(info.get("height") or 0)
+        original = (info.get("url") or "").split("?", 1)[0]
+        preview = (info.get("thumburl") or "").split("?", 1)[0]
+        page_url = (info.get("descriptionurl") or "").split("?", 1)[0]
+        if not original or not width or not height:
+            return None
+        download, width_used, height_used = original, width, height
+        if width > COMMONS_MAX_WIDTH:
+            marker = f"/{COMMONS_PREVIEW_WIDTH}px-"
+            if marker not in preview:
+                return None                  # no thumbnail path to scale from
+            download = preview.replace(marker, f"/{COMMONS_MAX_WIDTH}px-")
+            width_used = COMMONS_MAX_WIDTH
+            height_used = round(height * COMMONS_MAX_WIDTH / width)
+
+        file_name = str(page.get("title") or "").split(":", 1)[-1]
+        categories = [
+            name for name in _commons_value(meta, "Categories").split("|")
+            if name.strip() and not _COMMONS_CHROME_CATEGORY_RE.search(name.strip())
+        ]
+        return Candidate(
+            provider=self.name,
+            provider_id=file_name,
+            kind="image",
+            width=width_used,
+            height=height_used,
+            download_url=download,
+            source_url=page_url,
+            creator=_commons_value(meta, "Artist")[:80],
+            creator_url=page_url,
+            license=licence,
+            title=file_name.rsplit(".", 1)[0],
+            preview_url=preview,
+            description=", ".join(categories[:6]),
+        )
+
+
 class YouTubeCCProvider(Provider):
     """YouTube, restricted to Creative Commons uploads.
 
@@ -1656,6 +1789,7 @@ class NasaProvider(Provider):
 _PROVIDERS: dict[str, type[Provider]] = {
     PexelsProvider.name: PexelsProvider,
     PixabayProvider.name: PixabayProvider,
+    WikimediaProvider.name: WikimediaProvider,
     OpenverseProvider.name: OpenverseProvider,
     YouTubeCCProvider.name: YouTubeCCProvider,
     NasaProvider.name: NasaProvider,
@@ -1832,7 +1966,7 @@ def describe_candidate(candidate: Candidate) -> str:
     Both are used when both exist: they are written by different people and
     neither is reliably present.
     """
-    parts = [candidate.title or ""]
+    parts = [candidate.title or "", candidate.description or ""]
     match = re.search(r"/(?:videos?|photos?|images?)/([A-Za-z0-9\-]+?)/?$",
                       candidate.source_url or "")
     if match:
@@ -2137,8 +2271,11 @@ def _screen_picture(url: str) -> bytes | None:
         import requests
         from PIL import Image
 
+        # Commons previews come straight off thumb.wikimedia.org, which
+        # throttles a User-Agent that names no contact - see _download_headers.
         response = requests.get(url, timeout=SCREEN_PICTURE_TIMEOUT,
-                                headers={"User-Agent": USER_AGENT})
+                                headers=_download_headers(url)
+                                or {"User-Agent": USER_AGENT})
         response.raise_for_status()
         with Image.open(io.BytesIO(response.content)) as image:
             still = image.convert("RGB")
@@ -2948,7 +3085,7 @@ def _gather_candidates(
         # provider per beat, and only on the query most likely to be answered.
         exhaustive = position == 0
         for rank, provider in enumerate(providers):
-            if provider.disabled_reason:
+            if provider.disabled_reason or provider.archive_only:
                 continue
             for kind in settings["kinds"]:
                 if kind not in provider.kinds:
@@ -2989,9 +3126,16 @@ def _gather_candidates(
     # `_shortlist` finds them.
     folded = _without_accents(archive)
     for asked in dict.fromkeys(q for q in (archive, folded) if q):
+        # In preference order, and the first archive that answers with
+        # something usable is the last one asked. Commons searched directly
+        # comes first; Openverse indexes the same files at one remove, so after
+        # Commons has answered it only returns them again under other keys, and
+        # on 2026-10-18 it timed out on six of these searches at 30s apiece.
+        # It stays as the fallback for a name Commons has nothing under.
         for rank, provider in enumerate(providers):
             if not provider.archive or provider.disabled_reason:
                 continue
+            answered = 0
             for kind in settings["kinds"]:
                 if kind not in provider.kinds:
                     continue
@@ -3000,6 +3144,10 @@ def _gather_candidates(
                     if candidate.key not in seen:
                         seen.add(candidate.key)
                         pool.append((candidate, rank, archive))
+                        if not reject_reason(candidate, settings):
+                            answered += 1
+            if answered:
+                break
     return pool
 
 
@@ -3252,9 +3400,27 @@ def _shortlist(ranked: list[Row], beat: Beat | None, size: int,
     return head, [row for row in ranked if row[1].key not in shown]
 
 
+def _names_the_subject(candidate: Candidate, archive: str, topic: str) -> bool:
+    """Whether a clip's own words name what the archive query and topic do.
+
+    Every word of the archive name, or any content word of the topic: "hunger
+    stones exposed in the elbe" names a topic about hunger stones, though its
+    archive name is the German "Hungerstein". A clip with no words at all
+    cannot be read either way, and is taken at the screen's word.
+    """
+    described = _content_terms(_without_accents(describe_candidate(candidate)))
+    if not described:
+        return True
+    named = _content_terms(_without_accents(archive))
+    if named and all(_matches(term, described) for term in named):
+        return True
+    return any(_matches(term, described)
+               for term in _content_terms(_without_accents(topic)))
+
+
 def _archive_first(rows: list[Row], beat: Beat, screened_keys: set[str],
-                   rejected_keys: set[str],
-                   subject_keys: set[str]) -> tuple[list[Row], str]:
+                   rejected_keys: set[str], subject_keys: set[str],
+                   topic: str = "") -> tuple[list[Row], str]:
     """Lead a beat with its archive photograph, when nothing else it kept
     shows the subject. Returns (rows, note) - the note is "" when nothing
     moved.
@@ -3271,13 +3437,25 @@ def _archive_first(rows: list[Row], beat: Beat, screened_keys: set[str],
     photograph, so the beat's next slot still goes to footage that moves.
     "Approved" is `_open_on_the_subject`'s test: screened, and rejected by no
     beat, since pass 2 reads `rejected_keys` run-wide.
+
+    "Shows the subject" needs the stock clip's own words to name it as well as
+    the screen's `subj`, when the topic is known. The screen judges a subject
+    from one small still, and for a subject that is a kind of something it
+    cannot tell apart from the rest of its kind: on the anatexis reel of
+    2026-10-18 it called five Pexels rock textures - "close up video of a rock",
+    "rocky texture" - the migmatite the video was about, and they opened it.
+    A bison is named in its clip's words, and so are hunger stones; a
+    migmatite filmed as "a rock" is not, and loses its place to the photograph
+    filed under its name.
     """
     archive = (beat.archive_query or "").strip()
     if not archive:
         return rows, ""
     approved = [row for row in rows if row[1].key in screened_keys
                 and row[1].key not in rejected_keys]
-    if any(row[1].key in subject_keys for row in approved if row[2] != archive):
+    if any(row[1].key in subject_keys
+           and (not topic or _names_the_subject(row[1], archive, topic))
+           for row in approved if row[2] != archive):
         return rows, ""
     lead = next((row for row in approved
                  if row[2] == archive and row[1].key in subject_keys), None)
@@ -3419,7 +3597,8 @@ def _screen_beats(
             if not verdicts.get(position, (True, ""))[0]
         )
         reordered, lead_note = _archive_first(
-            reordered, beat, screened_keys, rejected_keys, subject_keys)
+            reordered, beat, screened_keys, rejected_keys, subject_keys,
+            topic=topic)
         if lead_note:
             beat_notes.append(lead_note)
         plans[index] = reordered + tail

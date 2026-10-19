@@ -116,7 +116,7 @@ moved or deployed without editing code.
 | 1 | Scaffolding, config | done |
 | 2 | Script generation (Gemini) | done |
 | 3 | TTS (ElevenLabs) | done |
-| 4 | Visual sourcing (Pexels / Pixabay / Openverse) | done |
+| 4 | Visual sourcing (Pexels / Pixabay / Wikimedia Commons / Openverse) | done |
 | 5 | Video assembly + burned-in captions + cover frame | done |
 | 5b | Looking at the rendered frames — the cover, and the reel | done |
 | 6 | Instagram caption + hashtags + cover alt text (Gemini) | done |

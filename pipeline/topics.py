@@ -3426,11 +3426,15 @@ def _dedupe(candidates: list[Candidate]) -> tuple[list[Candidate], int]:
 
 
 def _ready_providers(session, warnings: list[str]) -> list:
-    """Step 4's providers, in step 4's preference order, that have their keys."""
+    """Step 4's providers, in step 4's preference order, that have their keys.
+
+    Not the archive-only ones: step 4 never asks them a topic's keywords, only
+    a beat's archive name, so a hit there says nothing about this question.
+    """
     providers = []
     for name in config.VISUAL_PROVIDERS:
         cls = visuals._PROVIDERS.get(name)
-        if cls is None or not cls.is_configured():
+        if cls is None or not cls.is_configured() or cls.archive_only:
             continue
         providers.append(cls(session))
     if not providers:

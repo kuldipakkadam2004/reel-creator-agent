@@ -852,6 +852,11 @@ VIDEO_FPS = get_env_int("VIDEO_FPS", 30)
 #: killing it.
 #:   pexels    - video + photo, free key, strongest vertical library
 #:   pixabay   - video + photo, free key
+#:   wikimedia - photo only, NO KEY NEEDED. Wikimedia Commons searched directly,
+#:               and only for a beat's archive query: the photograph of the
+#:               named thing no stock library holds. Ahead of openverse, which
+#:               indexes the same files at one remove and is then only asked
+#:               when Commons has nothing under the name.
 #:   openverse - photo only, NO KEY NEEDED (200 req/day anon). Last-resort net.
 #:   youtube   - video, Creative Commons uploads only. Off by default: it needs
 #:               yt-dlp installed, and its searches cost 100 quota units each
@@ -863,13 +868,14 @@ VIDEO_FPS = get_env_int("VIDEO_FPS", 30)
 #: reading whichever .env happens to be on the machine - a test that checks
 #: VISUAL_PROVIDERS for what is off by default is testing the operator, and
 #: fails the moment one of them opts in.
-VISUAL_PROVIDERS_DEFAULT = "pexels,pixabay,openverse"
+VISUAL_PROVIDERS_DEFAULT = "pexels,pixabay,wikimedia,openverse"
 VISUAL_PROVIDERS = get_env_list("VISUAL_PROVIDERS", VISUAL_PROVIDERS_DEFAULT)
 
 #: How Wikimedia can reach whoever runs this - a URL or an email - sent in the
-#: User-Agent on downloads from *.wikimedia.org and nowhere else. Openverse's
-#: Commons photographs live there, and Wikimedia's User-Agent policy asks for
-#: contact details. It means it: measured 2026-10-11, interleaved on five
+#: User-Agent on Commons searches, screener stills and downloads from
+#: *.wikimedia.org and nowhere else. The archive photographs live there, found
+#: by the wikimedia provider or by Openverse, and Wikimedia's User-Agent policy
+#: asks for contact details. It means it: measured 2026-10-11, interleaved on five
 #: Commons files, a User-Agent carrying a contact URL got 10 of 10 through and
 #: the bare "reel-creator-agent/0.1 (visual sourcing)" got 4 of 10, both of
 #: those on files the other had just warmed the cache for. Thumbnail versus
