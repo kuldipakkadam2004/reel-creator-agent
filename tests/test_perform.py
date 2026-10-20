@@ -3235,3 +3235,258 @@ def test_old_read_logs_are_pruned_by_the_read(paths, monkeypatch):
 
     assert not old.exists()
     assert len(_read_logs(paths)) == 1
+
+
+# ---------------------------------------------------------------------------
+# How much a reel was sent on, and what it went on to reach
+# ---------------------------------------------------------------------------
+
+def _sent(run_id: str, reach: int, *, shares: int = 0, saves: int = 0,
+          hours: float = 30.0, posted: str = "") -> dict:
+    return {"run_id": run_id, "status": "posted", "hours_after_post": hours,
+            "posted_at": posted, "features": {"topic": f"topic {run_id}"},
+            "metrics": {"reach": reach, "shares": shares, "saves": saves}}
+
+
+def test_shares_are_read_per_thousand_reached_reel_by_reel(monkeypatch):
+    """The yes/no counted one share off 2,357 the same as 33 off 4,204."""
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 0)
+    rows = [_sent("hunger", 1573, hours=19.4),
+            _sent("canyon", 2357, shares=1, saves=5, hours=23.5),
+            _sent("turkey", 4204, shares=33, saves=16, hours=17.1)]
+
+    shared = perform.share_rates(rows, floor=30, flag=5)
+
+    assert [row["run_id"] for row in shared["rows"]] == ["turkey", "canyon",
+                                                         "hunger"]
+    assert shared["rows"][0]["sent"] == pytest.approx(7.85, abs=0.01)
+    assert [row["run_id"] for row in shared["flagged"]] == ["turkey"]
+    assert shared["sent_on"] == 2
+    assert shared["highest_unflagged"] == pytest.approx(0.42, abs=0.01)
+
+
+def test_two_shares_off_a_small_reach_are_a_rate_and_not_a_flag(monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 0)
+
+    shared = perform.share_rates([_sent("small", 100, shares=2)],
+                                 floor=30, flag=5)
+
+    assert shared["rows"][0]["sent"] == 20.0
+    assert shared["flagged"] == []
+
+
+def test_a_reel_under_the_reach_floor_gets_no_rate_at_all(monkeypatch):
+    """One share off twelve is eighty-three per 1,000, and it is one person."""
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 0)
+
+    shared = perform.share_rates([_sent("tiny", 12, shares=1)],
+                                 floor=30, flag=5)
+
+    assert (shared["rated"], shared["unrated"]) == (0, 1)
+
+
+def test_a_reel_never_read_for_shares_is_not_a_reel_with_none(monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 0)
+    row = {"run_id": "old", "status": "posted", "metrics": {"reach": 900}}
+
+    shared = perform.share_rates([row], floor=30, flag=5)
+
+    assert (shared["rated"], shared["unrated"]) == (0, 0)
+
+
+def test_the_shared_block_lists_the_most_sent_first(capsys, monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 0)
+    turkey = _sent("turkey", 4204, shares=33, saves=16, hours=17.1)
+    turkey["recorded_at"] = "2026-10-14T06:30:19+00:00"
+    turkey["lifetime"] = {"recorded_at": "2026-10-19T13:00:00+00:00",
+                          "hours_after_post": 143.5,
+                          "metrics": {"reach": 32987, "shares": 1196,
+                                      "saves": 263}}
+    shared = perform.share_rates(
+        [_sent("canyon", 2357, shares=1, saves=5), turkey], floor=30, flag=5)
+
+    perform._print_shared(shared)
+    printed = capsys.readouterr().out
+
+    assert printed.index("topic turkey") < printed.index("topic canyon")
+    assert "being sent on" in printed
+    assert "lifetime at 144h: 32987 reached, 1196 shares" in printed
+
+
+def test_saved_or_sent_says_when_it_is_reading_reach(capsys):
+    """Once a reel shown to two thousand people gets a save and one shown to
+    a hundred does not, the yes/no is mostly saying which reels were pushed."""
+    rows = [_sent(f"big{n}", 1500 + n, saves=1) for n in range(4)]
+    rows += [_sent(f"small{n}", 120 + n) for n in range(4)]
+
+    split = perform.kept_by_reach(rows)
+    perform._print_saved_split(split)
+    printed = capsys.readouterr().out
+
+    assert (split["above"], split["below"]) == ([4, 4], [0, 4])
+    assert "mostly says how far" in printed
+
+
+def test_a_young_reel_being_sent_on_is_warned_about(paths):
+    ledger = _corpus(8)
+    for day in range(8):
+        ledger.record(f"r{day}", {"reach": 1200, "shares": 0,
+                                  "watch_ratio": 0.4})
+    ledger.record("r7", {"reach": 4204, "shares": 33, "saves": 16})
+
+    data = perform.report(ledger=ledger, min_samples=3)
+
+    assert [row["run_id"] for row in data["shared"]["flagged"]] == ["r7"]
+    assert any("is being sent on" in warning for warning in data["warnings"])
+
+
+def test_an_old_reel_that_was_sent_on_is_listed_and_not_warned_about(paths):
+    """The warning is for the days there is still something to do about it."""
+    ledger = _corpus(1)
+    ledger.record("r0", {"reach": 9200, "shares": 112})
+    ledger.reels["r0"]["posted_at"] = "2026-10-13T13:26:13+0000"
+
+    data = perform.report(ledger=ledger, min_samples=3)
+
+    assert data["shared"]["flagged"]
+    assert not any("is being sent on" in warning
+                   for warning in data["warnings"])
+
+
+def test_a_lifetime_reading_never_moves_the_compared_one(paths):
+    """The turkey reel's comparable reading was 9,200 at 39h, and six days
+    later it had reached 32,987. Both are true; only the first compares."""
+    ledger = _corpus(1)
+    ledger.record("r0", {"reach": 9200, "shares": 112})
+    ledger.entry("r0")["hours_after_post"] = 39.3
+
+    ledger.note_lifetime("r0", {"reach": 32987, "shares": 1196})
+
+    entry = ledger.entry("r0")
+    assert entry["metrics"] == {"reach": 9200, "shares": 112}
+    assert entry["hours_after_post"] == 39.3
+    assert len(entry["measurements"]) == 1
+    assert entry["lifetime"]["metrics"] == {"reach": 32987, "shares": 1196}
+    assert perform.latest_metrics(entry)["reach"] == 32987
+
+
+def test_a_lifetime_reading_older_than_the_last_one_is_not_used():
+    entry = {"recorded_at": "2026-10-20T06:00:00+00:00",
+             "metrics": {"reach": 500},
+             "lifetime": {"recorded_at": "2026-10-19T06:00:00+00:00",
+                          "metrics": {"reach": 400}}}
+
+    assert perform.latest_metrics(entry)["reach"] == 500
+
+
+def test_the_totals_count_a_lifetime_reading_and_say_how_many(monkeypatch):
+    monkeypatch.setattr(config, "PERFORMANCE_OWN_ACCOUNTS", 0)
+    turkey = {"status": "posted", "recorded_at": "2026-10-15T04:42:05+00:00",
+              "metrics": {"reach": 9200, "likes": 352, "saves": 58,
+                          "shares": 112},
+              "lifetime": {"recorded_at": "2026-10-19T13:00:00+00:00",
+                           "metrics": {"reach": 32987, "likes": 1423,
+                                       "saves": 263, "shares": 1196}}}
+    anatexis = {"status": "posted", "recorded_at": "2026-10-19T12:23:02+00:00",
+                "metrics": {"reach": 1462, "likes": 22, "saves": 3,
+                            "shares": 3}}
+
+    real = perform.real_engagement([turkey, anatexis])
+
+    assert real["reach"] == 32987 + 1462
+    assert real["shares"] == 1199
+    assert real["lifetime"] == 1
+
+
+def test_lifetime_is_due_a_week_after_posting_and_weekly_after_that(paths):
+    now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+    ledger = _corpus(4)
+    for run_id, days_ago in (("r0", 8), ("r1", 3), ("r2", 20), ("r3", 30)):
+        ledger.reels[run_id].update(
+            status="posted", media_id=f"m-{run_id}",
+            posted_at=(now - timedelta(days=days_ago)).isoformat())
+    ledger.reels["r2"]["lifetime"] = {
+        "recorded_at": (now - timedelta(days=2)).isoformat(),
+        "metrics": {"reach": 5}}
+    del ledger.reels["r3"]["media_id"]   # typed in by hand: nothing to read
+
+    assert ledger.lifetime_due(now=now, days=7) == ["r0"]
+    assert ledger.lifetime_due(now=now, days=7, skip=["r0"]) == []
+    assert ledger.lifetime_due(now=now, days=0) == []
+
+
+def test_a_reel_that_loses_its_post_loses_its_lifetime_reading_too(paths):
+    ledger = _corpus(1)
+    ledger.record("r0", {"reach": 15}, source="provider")
+    ledger.reels["r0"]["media_id"] = "1792"
+    ledger.note_lifetime("r0", {"reach": 40})
+
+    assert ledger.disown("r0")
+    assert "lifetime" not in ledger.entry("r0")
+
+
+def test_the_provider_is_asked_even_when_no_reel_is_waiting(paths):
+    """It is also the account's daily read and the weekly lifetime one."""
+    ledger = _ledger(_features("r1"))
+    ledger.record("r1", {"views": 900})
+    ledger.entry("r1")["hours_after_post"] = 96.0
+    asked = []
+
+    def provider(run_ids, features):
+        asked.append(list(run_ids))
+        return {}
+
+    assert perform.fetch(ledger=ledger, provider=provider) == (0, [])
+    assert asked == [[]]
+
+
+def test_a_lifetime_reading_survives_the_providers_own_save(tmp_path,
+                                                            monkeypatch):
+    """Written onto a reel nobody asked about, so the annotation merge, which
+    walks only the reels that answered, would never reach it."""
+    monkeypatch.setattr(config, "PERFORMANCE_FILE", tmp_path / "p.json")
+    outer = perform.PerformanceLedger()
+    outer.register({"run_id": "r1", "created_at": "2026-09-01T00:00:00+00:00"})
+    outer.record("r1", {"reach": 9200})
+    outer.entry("r1")["hours_after_post"] = 39.3
+    outer.save()
+
+    def provider(run_ids, features_by_run):
+        inner = perform.PerformanceLedger()
+        inner.note_lifetime("r1", {"reach": 32987})
+        inner.save()
+        return {}
+
+    perform.fetch(ledger=outer, provider=provider)
+    outer.save()
+
+    entry = perform.PerformanceLedger().entry("r1")
+    assert entry["lifetime"]["metrics"]["reach"] == 32987
+    assert entry["metrics"]["reach"] == 9200
+
+
+def test_follows_by_day_print_beside_the_visits(paths, capsys):
+    audience = {"daily": {
+        "2026-10-17": {"profile_visits": 24, "follows": 20, "unfollows": 0},
+        "2026-10-18": {"profile_visits": 25, "follows": 34, "unfollows": 1,
+                       "followers": 96}}}
+
+    days = perform.profile_days(audience, [])
+    perform._print_profile_days(days)
+    printed = capsys.readouterr().out
+
+    assert (days["follows"], days["unfollows"], days["follow_days"]) == (54, 1, 2)
+    assert "PROFILE VISITS AND FOLLOWS" in printed
+    assert "+34/-1" in printed
+    assert "54 follow(s) and 1 unfollow(s)" in printed
+
+
+def test_the_followed_line_reads_the_accounts_own_follows(capsys):
+    perform._print_audience(
+        {"followers": 148, "daily": {
+            "2026-10-18": {"follows": 34, "unfollows": 1},
+            "2026-10-19": {"profile_visits": 16}}},
+        1462, own=3, real={"reels": 2, "reach": 3000})
+    printed = capsys.readouterr().out
+
+    assert "FOLLOWED: 34 follow(s) and 1 unfollow(s)" in printed

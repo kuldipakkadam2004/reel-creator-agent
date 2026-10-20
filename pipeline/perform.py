@@ -802,6 +802,30 @@ class PerformanceLedger:
         entry["measurements"] = history[-MEASUREMENT_HISTORY:]
         return warnings
 
+    def note_lifetime(self, run_id: str, metrics: dict) -> list[str]:
+        """Record a reel's lifetime numbers beside the reading it is compared on.
+
+        Never into `metrics` or `measurements`. Every table compares a reel on
+        `hours_after_post`, the age of its latest reading, so a reading taken
+        at a week would move it out of the window it is compared in - the
+        defect `unsettled` was changed to avoid. This is a separate fact about
+        the same reel: what it went on to reach, for the totals and the
+        exhibits, which describe the account rather than compare reels in it.
+        """
+        clean, warnings = normalise_metrics(metrics)
+        if not clean:
+            return warnings + ["no usable numbers were given"]
+        entry = self.reels.setdefault(run_id, {"run_id": run_id})
+        reading: dict = {"recorded_at": _now(), "metrics": clean}
+        posted = _parse_stamp(entry.get("posted_at"))
+        measured = _parse_stamp(reading["recorded_at"])
+        if posted and measured:
+            reading["hours_after_post"] = round(
+                (measured - posted).total_seconds() / 3600.0, 1
+            )
+        entry["lifetime"] = reading
+        return warnings
+
     def note_audio(self, run_id: str, mode: str, track: str = "") -> list[str]:
         """Record what was actually playing under the reel when it went out.
 
@@ -858,7 +882,7 @@ class PerformanceLedger:
     #: make that untrue.
     BORROWED = ("media_id", "permalink", "matched_by", "posted_at",
                 "posted_at_assumed", "hours_after_post", "metrics",
-                "measurements", "source", "recorded_at")
+                "measurements", "source", "recorded_at", "lifetime")
 
     def disown(self, run_id: str) -> bool:
         """Give back a post this reel turns out not to be, and its numbers.
@@ -961,6 +985,41 @@ class PerformanceLedger:
                 continue
             if age < hours:
                 out.append(row)
+        return out
+
+    def lifetime_due(self, skip=(), *, days: int | None = None,
+                     now: datetime | None = None) -> list[str]:
+        """The posted reels whose lifetime numbers are due to be read again.
+
+        A reel is due once it is `days` old, and again every `days` after its
+        last lifetime reading. `unsettled` stops asking about a reel the moment
+        its reading is comparable, which is right for the tables and leaves
+        the account's own record frozen at a day or two: the turkey reel's
+        comparable reading was 9,200 reached at 39h, and six days later it had
+        reached 32,987 - while every total in the report still said 9,200.
+
+        Only a row holding a media id, because that is what gets read. `skip`
+        is the reels already being asked about in the same fetch.
+        """
+        days = config.PERFORMANCE_LIFETIME_DAYS if days is None else days
+        if days <= 0:
+            return []
+        now = now or datetime.now(timezone.utc)
+        every = timedelta(days=days)
+        skip = set(skip or ())
+        out = []
+        for row in self.rows():
+            run_id = row.get("run_id") or ""
+            if (row.get("status") != "posted" or not row.get("media_id")
+                    or run_id in skip):
+                continue
+            posted = _parse_stamp(row.get("posted_at"))
+            if not posted or now - posted < every:
+                continue
+            last = _parse_stamp((row.get("lifetime") or {}).get("recorded_at"))
+            if last and now - last < every:
+                continue
+            out.append(run_id)
         return out
 
     def trial_count(self, name: str) -> int:
@@ -1169,6 +1228,165 @@ def was_kept(entry: dict) -> float | None:
         except (TypeError, ValueError):
             continue
     return 1.0 if total > 0 else 0.0
+
+
+def _newer_lifetime(entry: dict) -> dict:
+    """The lifetime numbers on a row if they are at least as new as `metrics`."""
+    lifetime = entry.get("lifetime")
+    if not isinstance(lifetime, dict) or not isinstance(lifetime.get("metrics"), dict):
+        return {}
+    if str(lifetime.get("recorded_at") or "") < str(entry.get("recorded_at") or ""):
+        return {}
+    return lifetime["metrics"]
+
+
+def latest_metrics(entry: dict) -> dict:
+    """The newest numbers held for one reel, its lifetime reading included.
+
+    For totals, and never for anything that compares reels: a lifetime reading
+    is taken a week or more after posting, so set beside a reel read at 30h it
+    is a different measurement, and every table keeps comparing `metrics`. But
+    a total that stops at each reel's comparable reading is not the account's
+    total. On 2026-10-19 the report said 28,199 reached where Instagram's own
+    lifetime figures summed to 52,678, most of the gap one reel that went on
+    being sent after its 39h reading.
+    """
+    metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+    later = _newer_lifetime(entry)
+    return {**metrics, **later} if later else metrics
+
+
+#: How few shares a reel may have and still be flagged as being sent on. A
+#: rate alone flags noise at the small end - two shares off a reach of a
+#: hundred is twenty per 1,000, and it is two people. Five is a declared floor,
+#: not a measured one: the turkey reel had 33 by its first reading at 17h, and
+#: no other reel on the account had more than 3 in its life.
+_SHARE_FLAG_MIN = 5
+
+
+def share_rates(rows: list[dict], *, floor: int | None = None,
+                flag: float | None = None, shown: int = 8) -> dict:
+    """How much each posted reel was sent on and saved, per 1,000 reached.
+
+    SAVED OR SENT asks whether a reel was saved or sent *at all*. That was the
+    right question while the account had neither, and stopped being one once
+    it had an audience: of the twelve reels pushed past 700 reach from
+    2026-09-30, ten have had at least one save or share, so the yes/no counts
+    one share off 2,357 reached the same as 1,196 off 32,987. This is the
+    how-much, reel by reel.
+
+    Not a ratio to the neighbouring reels, which is what `ratios` would make of
+    it: shares are nought on most reels, the neighbours' median is nought, and
+    `local_baseline` refuses it - the trap `was_kept` was written around. A
+    rate per 1,000 reached is defined at nought and needs no baseline.
+
+    Read off each reel's own latest reading (`metrics`) and listed with its
+    age, so a reel read at 17h is never silently set beside one read at 41h;
+    a lifetime reading travels alongside where one has been taken. Under
+    `floor` reach a reel gets no rate at all - one share off thirty is
+    thirty-three per 1,000, and it is one person.
+
+    `flagged` is a reel being sent on: `flag` shares or more per 1,000 reached,
+    and at least `_SHARE_FLAG_MIN` shares.
+    """
+    floor = config.PERFORMANCE_MIN_REACH if floor is None else floor
+    flag = config.PERFORMANCE_SHARE_FLAG if flag is None else flag
+    rated: list[dict] = []
+    unrated = 0
+    for row in rows:
+        if row.get("status") != "posted":
+            continue
+        metrics = row.get("metrics") or {}
+        if metrics.get("shares") is None and metrics.get("saves") is None:
+            continue
+        reach = net_of_own(metrics).get("reach")
+        if not isinstance(reach, (int, float)) or reach < max(1, floor):
+            unrated += 1
+            continue
+        shares = int(metrics.get("shares") or 0)
+        saves = int(metrics.get("saves") or 0)
+        entry = {
+            "run_id": row.get("run_id") or "",
+            "topic": (row.get("features") or {}).get("topic") or "",
+            "posted": row.get("posted_at") or "",
+            "hours": row.get("hours_after_post"),
+            "reach": int(reach),
+            "shares": shares,
+            "saves": saves,
+            "sent": round(1000.0 * shares / reach, 2),
+            "saved": round(1000.0 * saves / reach, 2),
+        }
+        entry["flagged"] = bool(flag > 0 and entry["sent"] >= flag
+                                and shares >= _SHARE_FLAG_MIN)
+        later = _newer_lifetime(row)
+        later_reach = net_of_own(later).get("reach")
+        if isinstance(later_reach, (int, float)) and later_reach > 0:
+            later_shares = int(later.get("shares") or 0)
+            entry["lifetime"] = {
+                "hours": (row.get("lifetime") or {}).get("hours_after_post"),
+                "reach": int(later_reach),
+                "shares": later_shares,
+                "saves": int(later.get("saves") or 0),
+                "sent": round(1000.0 * later_shares / later_reach, 2),
+            }
+        rated.append(entry)
+
+    # Saves break ties by count and not by rate: among reels nobody sent on,
+    # one save off 57 reached is 17.5 per 1,000 and would outrank two off 727.
+    rated.sort(key=lambda entry: (-entry["sent"], -entry["saves"],
+                                  -entry["reach"]))
+    flagged = [entry for entry in rated if entry["flagged"]]
+    listed = rated[:shown]
+    listed += [entry for entry in flagged if entry not in listed]
+    plain = [entry["sent"] for entry in rated if not entry["flagged"]]
+    return {
+        "rows": listed,
+        "rated": len(rated),
+        "unrated": unrated,
+        "sent_on": sum(1 for entry in rated if entry["shares"] > 0),
+        "median": (round(statistics.median(entry["sent"] for entry in rated), 2)
+                   if rated else None),
+        "flagged": flagged,
+        "highest_unflagged": max(plain) if plain else None,
+        "flag": flag,
+        "floor": floor,
+    }
+
+
+#: How far apart the SAVED OR SENT yes/no may run above and below the median
+#: reach before the report says it is mostly reading reach. Arithmetic about
+#: the table and not a finding about reels: at a gap of half, a reel's reach
+#: predicts its answer better than anything the table's own rows ask about.
+_KEPT_TRACKS_REACH = 0.5
+
+
+def kept_by_reach(rows: list[dict]) -> dict:
+    """How the SAVED OR SENT yes/no splits above and below the median reach.
+
+    A save or a share takes a viewer, so a reel shown to two thousand people
+    has had twenty times the chances of one shown to a hundred. Once an
+    account has an audience, "saved or sent at all" mostly says which reels
+    Instagram pushed, and the facet rows in that table inherit whatever
+    separates pushed reels from the rest. Printed under the table, because the
+    table is where it gets misread.
+    """
+    pairs = []
+    for row in rows:
+        kept = was_kept(row)
+        reach = (row.get("metrics") or {}).get("reach")
+        if kept is None or not isinstance(reach, (int, float)):
+            continue
+        pairs.append((float(reach), kept))
+    if len(pairs) < 4:
+        return {}
+    middle = statistics.median(reach for reach, _ in pairs)
+    above = [kept for reach, kept in pairs if reach > middle]
+    below = [kept for reach, kept in pairs if reach <= middle]
+    if not above or not below:
+        return {}
+    return {"median": middle,
+            "above": [int(sum(above)), len(above)],
+            "below": [int(sum(below)), len(below)]}
 
 
 #: The two metrics that are about the account rather than the reel. A profile
@@ -1428,11 +1646,16 @@ def reach_exhibit(rows: list[dict], limit: int = 12) -> dict:
         components = features.get("topic_components")
         if isinstance(components, dict):
             components = component_names(components)
+        # Printed beside the reach and never ranked on: the ranking and the
+        # correlations stay on the reading every reel was taken at, and a
+        # lifetime figure exists only for the reels old enough to have one.
+        later = _newer_lifetime(row).get("reach")
         listed.append({
             "run_id": row.get("run_id") or "",
             "topic": features.get("topic") or "",
             "source": features.get("topic_source") or "",
             "reach": int(reach),
+            "lifetime": int(later) if isinstance(later, (int, float)) else None,
             "score": features.get("topic_score"),
             "components": [str(name) for name in components]
                           if isinstance(components, list) else [],
@@ -2002,18 +2225,24 @@ def real_engagement(rows: list[dict], own: int | None = None) -> dict:
     it carries can have come from an audience. The whole row is discarded
     rather than netted off, which is why a comment on a reel with a reach of
     three does not survive into the total.
+
+    Each reel counts at its newest reading, a lifetime one where it has been
+    taken (`latest_metrics`), because this is the account's total and not a
+    comparison; `lifetime` says how many reels that was.
     """
     own = config.PERFORMANCE_OWN_ACCOUNTS if own is None else own
     out = {"reach": 0, "likes": 0, "comments": 0, "saves": 0,
            "shares": 0, "follows": 0, "profile_visits": 0,
-           "reels": 0, "unseen": 0, "follow_reels": 0}
+           "reels": 0, "unseen": 0, "follow_reels": 0, "lifetime": 0}
     for row in rows:
         if row.get("status") != "posted":
             continue
-        metrics = row.get("metrics") or {}
+        metrics = latest_metrics(row)
         if not metrics:
             continue
         out["reels"] += 1
+        if _newer_lifetime(row):
+            out["lifetime"] += 1
         net = net_of_own(metrics, own)
         reach = int(net.get("reach") or 0)
         if reach <= 0:
@@ -2050,35 +2279,55 @@ def profile_days(audience: dict, rows: list[dict], *, shown: int = 14) -> dict:
 
     Empty when no day carries a visit count: the report then falls back to the
     per-reel table, which is the one a hand-typed ledger fills.
+
+    Follows and unfollows by day sit beside the visits once the account
+    serves them (from 100 followers), and they are the step the visits stood
+    in for: a visit is a viewer who went to look, a follow is one who stayed.
+    The turkey day had 4 visits and 6 follows. Both rates are against each
+    reel's newest reach, lifetime included, since a reel keeps sending people
+    to the profile for as long as it keeps being shown.
     """
     daily = {day: values for day, values in (audience.get("daily") or {}).items()
              if isinstance(values, dict)}
     visited = sorted(day for day, values in daily.items()
                      if isinstance(values.get("profile_visits"), int))
-    if not visited:
+    followed = sorted(day for day, values in daily.items()
+                      if isinstance(values.get("follows"), int))
+    if not visited and not followed:
         return {}
 
     posted_on: dict[str, list[dict]] = {}
     for row in rows:
         if row.get("status") != "posted":
             continue
-        reach = (row.get("metrics") or {}).get("reach")
+        reach = latest_metrics(row).get("reach")
         posted_on.setdefault(str(row.get("posted_at") or "")[:10], []).append({
             "topic": (row.get("features") or {}).get("topic") or "",
             "reach": int(reach) if isinstance(reach, (int, float)) else None,
         })
 
+    def reached(days: list[str]) -> int:
+        return sum(reel["reach"] or 0 for day in days
+                   for reel in posted_on.get(day, []))
+
     followers = [(day, values["followers"]) for day, values in sorted(daily.items())
                  if isinstance(values.get("followers"), int)]
     return {
         "days": len(visited),
-        "since": visited[0],
+        "since": visited[0] if visited else None,
         "visits": sum(daily[day]["profile_visits"] for day in visited),
-        "reach": sum(reel["reach"] or 0 for day in visited
-                     for reel in posted_on.get(day, [])),
+        "reach": reached(visited),
+        "follow_days": len(followed),
+        "follow_since": followed[0] if followed else None,
+        "follows": sum(daily[day]["follows"] for day in followed),
+        "unfollows": sum(int(daily[day].get("unfollows") or 0)
+                         for day in followed),
+        "follow_reach": reached(followed),
         "followers": [followers[0], followers[-1]] if followers else [],
         "listed": [{"day": day,
                     "visits": daily[day].get("profile_visits"),
+                    "follows": daily[day].get("follows"),
+                    "unfollows": daily[day].get("unfollows"),
                     "followers": daily[day].get("followers"),
                     "reels": posted_on.get(day, [])}
                    for day in sorted(daily, reverse=True)[:shown]],
@@ -2223,6 +2472,12 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
         extra=_post_time_facets,
     )
 
+    # How much each reel was sent on, beside the yes/no above. Over every
+    # posted reel rather than `fresh`: each row carries its own reading's age,
+    # and the reel read at 17h is exactly the one worth seeing next morning.
+    shared = share_rates(posted)
+    saved_split = kept_by_reach(fresh)
+
     # The token that fetched all of this, and how long it has left. A
     # provider-agnostic read of whatever the provider chose to say: the key is
     # absent for a hand-typed ledger and for any provider that does not use a
@@ -2300,6 +2555,27 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
             f"column of zeros - that is the account's state, not a finding "
             f"about anything in the table. It starts saying something the "
             f"first time one is"
+        )
+
+    # The one line here about a reel that is still happening. A reel being
+    # sent on goes on reaching people after the reading the tables compare -
+    # the turkey reel was 4,204 at 17h and 32,987 by its sixth day - so it is
+    # said while the reel is young, when there is still time to act on it.
+    recent = timedelta(hours=window if window > 0 else 48)
+    now = datetime.now(timezone.utc)
+    for entry in shared["flagged"]:
+        posted_at = _parse_stamp(entry.get("posted"))
+        if not posted_at or now - posted_at > recent:
+            continue
+        hours = entry.get("hours")
+        warnings.append(
+            f"{(entry.get('topic') or entry['run_id'])[:48]} is being sent "
+            f"on: {entry['shares']} share(s), {entry['sent']:.1f} per 1,000 "
+            f"reached"
+            + (f" at {float(hours):.0f}h" if hours is not None else "")
+            + f" - past PERFORMANCE_SHARE_FLAG ({shared['flag']:g}). A reel "
+            f"being sent on keeps reaching people after the reading the tables "
+            f"compare, so its lifetime reading is the one to watch"
         )
 
     # Three states, not two, and they mean different things. Never read at all
@@ -2386,6 +2662,8 @@ def report(*, ledger: PerformanceLedger | None = None, metric: str = "",
         "reasons": reasons,
         "performance": performance,
         "saved": saved,
+        "saved_split": saved_split,
+        "shared": shared,
         "followed": followed,
         "followed_read": bool(read_follow),
         "profile_days": by_day,
@@ -2639,6 +2917,12 @@ def fetch(*, ledger: PerformanceLedger | None = None, provider=None,
     reel in this ledger sitting on three views. So a posted reel is asked about
     again until its reading is PERFORMANCE_SETTLE_HOURS old, and each answer is
     appended to its history rather than replacing what came before.
+
+    The provider is asked even when no reel is waiting. It is also the daily
+    read of the account - the follower count, follows and visits by day - and
+    the weekly lifetime read of every older reel, and none of that waits on a
+    new reel. Returning early here used to mean a week without a reel was a
+    week the account went unread.
     """
     ledger = ledger or PerformanceLedger()
     provider = provider or load_provider()
@@ -2649,8 +2933,6 @@ def fetch(*, ledger: PerformanceLedger | None = None, provider=None,
         )
 
     waiting = ledger.unsettled(settle_hours)
-    if not waiting:
-        return 0, []
 
     warnings: list[str] = []
     try:
@@ -2680,6 +2962,15 @@ def fetch(*, ledger: PerformanceLedger | None = None, provider=None,
         for field in PROVIDER_ANNOTATIONS:
             if saved.get(field):
                 entry[field] = saved[field]
+
+    # A lifetime reading is written the same way, onto reels nobody asked
+    # about - they are settled, that is why they are due one - so it is merged
+    # from every row on disk, not just the ones that answered.
+    for run_id, saved in stored.items():
+        held = ledger.reels.get(run_id)
+        if (isinstance(saved, dict) and isinstance(held, dict)
+                and isinstance(saved.get("lifetime"), dict)):
+            held["lifetime"] = saved["lifetime"]
 
     # The same merge in the other direction, for the rows a provider *cleared*.
     # A reel whose post turns out to belong to another reel is disowned on
@@ -3150,15 +3441,18 @@ def _print_reach_exhibit(exhibit: dict) -> None:
     # column, the way `_print_reasons` prints its notes: four component names
     # do not fit beside a topic inside the rule this report is drawn to, and
     # truncating them mid-word is how "curiosity" became "curi".
-    print(f"  {'reach':>6} {'share':>5} {'score':>5} {'read':>5}  topic")
+    print(f"  {'reach':>6} {'share':>5} {'score':>5} {'read':>5} "
+          f"{'lifetime':>8}  topic")
     for row in listed:
         share = f"{row['share']:.0%}" if row.get("share") is not None else "-"
         score = (f"{float(row['score']):.2f}"
                  if row.get("score") is not None else "-")
         hours = (f"{float(row['hours']):.0f}h"
                  if row.get("hours") is not None else "-")
-        print(f"  {row['reach']:>6} {share:>5} {score:>5} {hours:>5}  "
-              f"{(row.get('topic') or row['run_id'])[:44]}")
+        later = row.get("lifetime")
+        print(f"  {row['reach']:>6} {share:>5} {score:>5} {hours:>5} "
+              f"{later if later is not None else '-':>8}  "
+              f"{(row.get('topic') or row['run_id'])[:40]}")
         # Indented like the notes under WHY THEY WERE BINNED rather than
         # aligned under the topic column: alignment cost thirteen characters
         # and thirteen characters was the difference between showing which
@@ -3178,6 +3472,12 @@ def _print_reach_exhibit(exhibit: dict) -> None:
                   f"sits above {of - 1} of the {of},")
             print(f"  so there is no ordinary reel here for the tables to "
                   f"describe")
+    if any(row.get("lifetime") is not None for row in listed):
+        print(f"  lifetime is Instagram's own figure, read again every "
+              f"{config.PERFORMANCE_LIFETIME_DAYS} day(s) once a reel is that "
+              f"old;")
+        print("  everything above ranks on the reading each reel was "
+              "compared at")
 
     # The two orderings side by side, and nothing inferred from the pair. If
     # the board's favourites are also the ones that reached people, these two
@@ -3195,6 +3495,74 @@ def _print_reach_exhibit(exhibit: dict) -> None:
     if unread:
         print(f"  {unread} posted reel(s) have no reach reading and are not "
               f"listed - never asked is not nobody saw it")
+
+
+def _print_shared(shared: dict) -> None:
+    """How much each reel was sent on and saved, the most-sent first.
+
+    Under the reach exhibit, because it is the same kind of block - the
+    observations themselves, reel by reel, with no table's floors on them -
+    and because it is the step after reach: a reel has to be shown before it
+    can be sent, and on this account the sending is what has grown it.
+    """
+    print(RULE)
+    print("SHARED  (shares and saves per 1,000 reached, at each reel's own "
+          "reading)")
+    listed = shared.get("rows") or []
+    if not listed:
+        print("  no posted reel has a share or save reading yet.")
+        return
+    print(f"  {'shares/1k':>9} {'saves/1k':>8} {'shares':>6} {'saves':>5} "
+          f"{'reach':>6} {'read':>5}  topic")
+    for row in listed:
+        hours = (f"{float(row['hours']):.0f}h"
+                 if row.get("hours") is not None else "-")
+        print(f"  {row['sent']:>9.1f} {row['saved']:>8.1f} {row['shares']:>6} "
+              f"{row['saves']:>5} {row['reach']:>6} {hours:>5}  "
+              f"{(row.get('topic') or row['run_id'])[:30]}")
+        if row.get("flagged"):
+            print(f"             being sent on - past {shared.get('flag'):g} "
+                  f"per 1,000 and {_SHARE_FLAG_MIN} shares")
+        later = row.get("lifetime")
+        if later:
+            age = (f" at {float(later['hours']):.0f}h"
+                   if later.get("hours") is not None else "")
+            # Singular where the count is one, as ACTED does it.
+            counts = ", ".join(
+                f"{later[name]} {name[:-1] if later[name] == 1 else name}"
+                for name in ("shares", "saves"))
+            print(f"             lifetime{age}: {later['reach']} reached, "
+                  f"{counts} - {later['sent']:.1f} per 1,000")
+
+    rated = shared.get("rated") or 0
+    median = shared.get("median")
+    print(f"  {shared.get('sent_on') or 0} of {rated} reel(s) were sent on at "
+          f"all; the median is {median or 0:.1f} share(s) per 1,000 reached")
+    flagged = shared.get("flagged") or []
+    highest = shared.get("highest_unflagged")
+    line = (f"  {len(flagged)} reel(s) past {shared.get('flag'):g} per 1,000 "
+            f"and {_SHARE_FLAG_MIN} shares (PERFORMANCE_SHARE_FLAG)")
+    if highest is not None:
+        line += f"; the highest of the rest is {highest:.1f}"
+    print(line)
+    if shared.get("unrated"):
+        print(f"  {shared['unrated']} reel(s) reached under "
+              f"{shared.get('floor')} and get no rate - a share there is one "
+              f"person")
+
+
+def _print_saved_split(split: dict) -> None:
+    """Whether SAVED OR SENT is answering its question or reading reach."""
+    if not split:
+        return
+    (kept_above, above), (kept_below, below) = split["above"], split["below"]
+    print(f"  saved or sent: {kept_above}/{above} reels above the median reach "
+          f"({split['median']:g}), {kept_below}/{below} below it")
+    if above and below and (kept_above / above - kept_below / below
+                            >= _KEPT_TRACKS_REACH):
+        print("  a yes/no that follows reach this closely mostly says how far "
+              "each reel")
+        print("  was pushed - SHARED above has how much each one was sent on")
 
 
 def _print_reasons(rows: list[dict]) -> None:
@@ -3270,6 +3638,13 @@ def _print_audience(audience: dict, reach_median, own: int = 0,
     print(f"REACHED : {seen} impression(s) that were not yours, across "
           f"{real['reels']} posted reel(s)"
           + (f"; {unseen} of them reached nobody at all" if unseen else ""))
+    if real.get("lifetime"):
+        # Said because these totals and the tables below now count different
+        # readings of the same reels, and a reader comparing the two should
+        # not have to find that out from the ledger.
+        print(f"          {real['lifetime']} of them counted at a lifetime "
+              f"reading; the tables below still compare each reel at the "
+              f"reading taken a day or two after it went out")
 
     # Singular where the count is one: "1 likes, 0 comments" reads as a
     # rounding artefact, and this number is the point of the line.
@@ -3288,7 +3663,16 @@ def _print_audience(audience: dict, reach_median, own: int = 0,
     # state those metrics do not: never asked for. A zero here and a blank
     # here lead to opposite decisions.
     daily = audience.get("daily") or {}
-    if not real.get("follow_reels") and any(
+    followed = sorted(day for day, values in daily.items()
+                      if isinstance(values, dict)
+                      and isinstance(values.get("follows"), int))
+    if not real.get("follow_reels") and followed:
+        follows = sum(daily[day]["follows"] for day in followed)
+        unfollows = sum(int(daily[day].get("unfollows") or 0) for day in followed)
+        print(f"FOLLOWED: {follows} follow(s) and {unfollows} unfollow(s) on "
+              f"the account since {followed[0]} - Instagram will not say which "
+              f"reel won them; by day under PROFILE VISITS AND FOLLOWS")
+    elif not real.get("follow_reels") and any(
             isinstance(values, dict) and "profile_visits" in values
             for values in daily.values()):
         print("FOLLOWED: Instagram does not report follows or profile visits "
@@ -3322,32 +3706,59 @@ def _print_profile_days(days: dict) -> None:
     listed = days.get("listed") or []
     if not listed:
         return
+    # The follows column only once there are follows to put in it, so a
+    # ledger read before the account served them prints as it always did.
+    show_follows = any(row.get("follows") is not None for row in listed)
     print(RULE)
-    print("PROFILE VISITS  (the whole account per UTC day; not credited to any "
-          "reel)")
-    print(f"  {'day':<10} {'visits':>6} {'followers':>9}  posted that day")
+    if show_follows:
+        print("PROFILE VISITS AND FOLLOWS  (account-wide, per UTC day; not "
+              "credited to reels)")
+        print(f"  {'day':<10} {'visits':>6} {'follows':>8} {'followers':>9}  "
+              f"posted that day")
+    else:
+        print("PROFILE VISITS  (the whole account per UTC day; not credited to "
+              "any reel)")
+        print(f"  {'day':<10} {'visits':>6} {'followers':>9}  posted that day")
+    width = 30 if show_follows else 36
     for row in listed:
         visits = row.get("visits")
         followers = row.get("followers")
-        lead = (f"  {row['day']:<10} {visits if visits is not None else '-':>6} "
-                f"{followers if followers is not None else '-':>9}  ")
+        lead = f"  {row['day']:<10} {visits if visits is not None else '-':>6} "
+        if show_follows:
+            follows = row.get("follows")
+            cell = "-" if follows is None else (
+                f"+{follows}"
+                + (f"/-{row['unfollows']}" if row.get("unfollows") else ""))
+            lead += f"{cell:>8} "
+        lead += f"{followers if followers is not None else '-':>9}  "
         reels = row.get("reels") or []
         if not reels:
             print(lead.rstrip())
         for index, reel in enumerate(reels):
             reach = reel.get("reach")
             print(f"{lead if index == 0 else ' ' * len(lead)}"
-                  f"{(reel.get('topic') or '')[:36]:<36} "
+                  f"{(reel.get('topic') or '')[:width]:<{width}} "
                   f"{reach if reach is not None else '-':>6}")
 
-    visits = days.get("visits") or 0
-    reach = days.get("reach") or 0
-    line = (f"  {days.get('days')} day(s) since {days.get('since')}: "
-            f"{visits} profile visit(s) against {reach} reach on the reels "
-            f"posted in them")
-    if visits and reach:
-        line += f" - 1 per {reach / visits:.0f}"
-    print(line)
+    if days.get("days"):
+        visits = days.get("visits") or 0
+        reach = days.get("reach") or 0
+        line = (f"  {days.get('days')} day(s) since {days.get('since')}: "
+                f"{visits} profile visit(s) against {reach} reach on the reels "
+                f"posted in them")
+        if visits and reach:
+            line += f" - 1 per {reach / visits:.0f}"
+        print(line)
+    if days.get("follow_days"):
+        follows = days.get("follows") or 0
+        reach = days.get("follow_reach") or 0
+        line = (f"  {days['follow_days']} day(s) since "
+                f"{days.get('follow_since')}: {follows} follow(s) and "
+                f"{days.get('unfollows') or 0} unfollow(s) against {reach} "
+                f"reach on the reels posted in them")
+        if follows and reach:
+            line += f" - 1 per {reach / follows:.0f}"
+        print(line)
     followers = days.get("followers") or []
     if len(followers) == 2 and followers[0][0] != followers[1][0]:
         (first_day, first), (last_day, last) = followers
@@ -3386,10 +3797,12 @@ def _print_report(data: dict) -> None:
     # reader to go and read the ledger for it is how the account's actual
     # shape stayed unprinted for eight reels.
     _print_reach_exhibit(data.get("reach_exhibit") or {})
+    _print_shared(data.get("shared") or {})
     _print_table(f"HOW THEY DID  (1.00 = an ordinary reel for this account)",
                  data["performance"], unit="x", min_samples=data["min_samples"])
     _print_table("SAVED OR SENT  (1.00 = every reel got a save or a share)",
                  data["saved"], unit="", min_samples=data["min_samples"])
+    _print_saved_split(data.get("saved_split") or {})
     # Printed last because it is the last thing that happens, and the only
     # outcome here that survives the reel. Everything above it is attention
     # paid once; a follower is attention that comes back.
@@ -3826,8 +4239,16 @@ def _run(args: argparse.Namespace) -> int:
             return 0
 
         if args.fetch:
+            started = _now()
             recorded, warnings = fetch(ledger=ledger)
             print(f"recorded {recorded} reel(s) from PERFORMANCE_PROVIDER.")
+            relived = sum(
+                1 for entry in ledger.reels.values() if isinstance(entry, dict)
+                and str((entry.get("lifetime") or {}).get("recorded_at") or "")
+                >= started)
+            if relived:
+                print(f"read {relived} older reel(s) again for their lifetime "
+                      f"numbers.")
 
             # The whole point of the daily read: it writes down what it
             # found, so the report exists whether or not anybody types

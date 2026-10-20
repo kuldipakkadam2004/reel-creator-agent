@@ -2228,6 +2228,21 @@ PERFORMANCE_MIN_AGE_HOURS = get_env_int("PERFORMANCE_MIN_AGE_HOURS", 24)
 #: would spend calls producing readings the report then refuses to compare.
 PERFORMANCE_SETTLE_HOURS = get_env_int("PERFORMANCE_SETTLE_HOURS", 36)
 
+#: How old a posted reel has to be, in days, before its lifetime numbers are
+#: read, and how often they are read again after that. Kept apart from the
+#: reading every table compares, which stops at a day or two by design - and
+#: which left the turkey reel at 9,200 reached in every total while Instagram
+#: said 32,987. The report's totals and exhibits use the lifetime figure; no
+#: table compares on it. 0 turns it off.
+PERFORMANCE_LIFETIME_DAYS = get_env_int("PERFORMANCE_LIFETIME_DAYS", 7)
+
+#: Shares per 1,000 accounts reached at which the report flags a reel as being
+#: sent on, together with a floor of five shares so two people do not make a
+#: flag. A declared prior, not a measured threshold: the one reel that was sent
+#: on had 7.8 at its first reading (33 shares off 4,204 at 17h), and no other
+#: reel on the account has passed 1.5. 0 turns the flag off.
+PERFORMANCE_SHARE_FLAG = get_env_float("PERFORMANCE_SHARE_FLAG", 5.0)
+
 #: Whether the ledger may put a "measured" component on step 0's board. Off,
 #: because the honest use of this for a long while is a report a person reads.
 #: Turned on, it adds one more named component that argues its own case in the

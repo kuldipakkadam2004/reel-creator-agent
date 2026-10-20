@@ -101,6 +101,13 @@ METRIC_MAP = {
 #: The ones worth a second attempt on their own if the batch was refused.
 CORE_METRICS = ("reach", "likes", "comments", "saved")
 
+#: What a lifetime re-read asks for: METRIC_MAP less the three names this API
+#: version has refused on every read since 2026-10-08 - `plays`, `follows`
+#: and `profile_visits` - so a weekly pass over forty reels costs forty
+#: requests rather than a hundred and twenty. A refusal still prunes itself.
+LIFETIME_METRICS = ("views", "reach", "likes", "comments", "saved", "shares",
+                    "ig_reels_avg_watch_time")
+
 
 class InstagramError(RuntimeError):
     """Raised when the API cannot be used at all."""
@@ -338,6 +345,81 @@ def account_days(session=None, *, have=(), today: date | None = None,
     return out
 
 
+#: Follows and unfollows by day, asked of the account in a request of their
+#: own. Meta serves them from 100 followers - at 7 on 2026-10-14 they came back
+#: empty - and the account passed 100 on 2026-10-19. Folded into the
+#: `profile_views` request with a breakdown, the API answers "An unknown error
+#: has occurred" (code 1), tried 2026-10-20, so they are never added to
+#: ACCOUNT_DAILY_METRICS. Under `breakdown=follow_type`, FOLLOWER counts the
+#: accounts that followed that day and NON_FOLLOWER the ones that left.
+ACCOUNT_FOLLOW_METRIC = "follows_and_unfollows"
+ACCOUNT_FOLLOW_TYPES = {"FOLLOWER": "follows", "NON_FOLLOWER": "unfollows"}
+
+
+def account_follow_days(session=None, *, have=(), today: date | None = None,
+                        days: int | None = None) -> dict:
+    """Follows and unfollows per UTC day, for the finished days not already held.
+
+    The step the profile visits stood in for: a visit is a viewer who went to
+    look, a follow is one who stayed. Read the way `account_days` reads visits,
+    one request per finished day and today never asked, and kept apart from
+    it so a token that cannot have one costs nothing of the other. A refusal
+    ends this loop with a warning rather than the whole read - follows are
+    what is added here, and losing the day's reels to them would be backwards.
+
+    A day that answers with no results is left out rather than stored as
+    nought. Meta fills a day in late: on 2026-10-20 the 19th came back with
+    no results while the 18th said 34 follows and 1 unfollow, and a nought
+    stored once is never asked for again.
+
+    Returns {"YYYY-MM-DD": {"follows": n, "unfollows": n}}.
+    """
+    require_credentials()
+    session = session or _session()
+    today = today or datetime.now(timezone.utc).date()
+    span = ACCOUNT_DAILY_DAYS if days is None else days
+    held = set(have)
+    out: dict[str, dict] = {}
+    for back in range(span, 0, -1):
+        day = today - timedelta(days=back)
+        if day.isoformat() in held:
+            continue
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        try:
+            body = _get(session, f"{config.INSTAGRAM_USER_ID}/insights", {
+                "metric": ACCOUNT_FOLLOW_METRIC,
+                "period": "day",
+                "metric_type": "total_value",
+                "breakdown": "follow_type",
+                "since": int(start.timestamp()),
+                "until": int((start + timedelta(days=1)).timestamp()),
+            })
+        except InstagramError as exc:
+            print(f"warning: follows by day: {exc}", file=sys.stderr)
+            break
+        values: dict[str, int] = {}
+        for entry in body.get("data") or []:
+            if not isinstance(entry, dict) or entry.get("name") != ACCOUNT_FOLLOW_METRIC:
+                continue
+            total = entry.get("total_value")
+            breakdowns = total.get("breakdowns") if isinstance(total, dict) else None
+            for breakdown in breakdowns or []:
+                results = breakdown.get("results") if isinstance(breakdown, dict) else None
+                for result in results or []:
+                    if not isinstance(result, dict):
+                        continue
+                    keys = result.get("dimension_values") or [None]
+                    name = ACCOUNT_FOLLOW_TYPES.get(keys[0])
+                    value = result.get("value")
+                    if (name and isinstance(value, (int, float))
+                            and not isinstance(value, bool)):
+                        values[name] = int(value)
+        if "follows" in values:
+            values.setdefault("unfollows", 0)
+            out[day.isoformat()] = values
+    return out
+
+
 def media(session=None, *, limit: int | None = None) -> list[dict]:
     """Recent posts, newest first, as the API describes them."""
     require_credentials()
@@ -375,7 +457,8 @@ def _refused(message: str, wanted: list[str]) -> list[str]:
     return [name for name in wanted if name in message]
 
 
-def _insights(session, media_id: str) -> tuple[dict, list[str]]:
+def _insights(session, media_id: str,
+              metrics=None) -> tuple[dict, list[str]]:
     """Insights for one post, with refused metrics dropped rather than fatal.
 
     Meta renames these between versions and answers for a different set
@@ -383,9 +466,12 @@ def _insights(session, media_id: str) -> tuple[dict, list[str]]:
     the *whole* call, so a refusal is read for which name offended, that name is
     dropped, and what is left is asked for again. Four metrics out of six is a
     useful answer; an exception because a field was renamed is not.
+
+    `metrics` narrows what is asked for (names from METRIC_MAP); by default it
+    is all of them.
     """
     warnings: list[str] = []
-    wanted = list(METRIC_MAP)
+    wanted = list(metrics or METRIC_MAP)
 
     while wanted:
         try:
@@ -851,6 +937,28 @@ def fetch(run_ids, features_by_run: dict) -> dict:
             record["posted_at"] = found["posted_at"]
         out[run_id] = metrics
 
+    # Every reel a week old again, weekly, into a reading of its own. The
+    # reading the tables compare stops once it is comparable, which is right
+    # for them and left the turkey reel at 9,200 reached in every total while
+    # it went on to 32,987. `note_lifetime` never touches `metrics`, so nothing
+    # read here can move a reel out of the window it is compared in.
+    for run_id in ledger.lifetime_due(skip=run_ids):
+        entry = ledger.entry(run_id)
+        try:
+            metrics, warnings = _insights(session, entry.get("media_id") or "",
+                                          LIFETIME_METRICS)
+        except InstagramAuthError:
+            raise
+        except InstagramError:
+            continue
+        for warning in warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        metrics = derive_watch_through(metrics, entry.get("features") or {})
+        metrics = {name: value for name, value in metrics.items()
+                   if name in perform.METRICS}
+        if metrics:
+            ledger.note_lifetime(run_id, metrics)
+
     # After the reels and not before: they are what the read is for, and the
     # first read here asks for four weeks of days, one request each.
     daily = ledger.audience.get("daily") or {}
@@ -859,6 +967,11 @@ def fetch(run_ids, features_by_run: dict) -> dict:
         if isinstance(values, dict) and "profile_visits" in values])
     if days:
         ledger.set_audience({"daily": days})
+    follows = account_follow_days(session, have=[
+        day for day, values in daily.items()
+        if isinstance(values, dict) and "follows" in values])
+    if follows:
+        ledger.set_audience({"daily": follows})
 
     ledger.save()
     return out
@@ -999,19 +1112,26 @@ def _print_fetch() -> int:
     # reading has settled, because a number taken the same evening is a number
     # taken while the reel was still being shown.
     waiting = ledger.unsettled()
-    if not waiting:
-        print("nothing is waiting for numbers, and nothing read recently "
-              "enough to be worth reading again.")
-        return 0
     again = sum(1 for row in waiting if row.get("status") == "posted")
 
+    # Asked even with nothing waiting: the account's own day and the weekly
+    # lifetime re-reads do not wait on a new reel.
+    started = perform._now()
     recorded, warnings = perform.fetch(ledger=ledger, provider=fetch)
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
-    print(f"recorded {recorded} of {len(waiting)} reel(s)"
-          + (f" - {again} of them re-read, their numbers not yet "
-             f"{config.PERFORMANCE_SETTLE_HOURS}h old." if again else "."))
+    if waiting:
+        print(f"recorded {recorded} of {len(waiting)} reel(s)"
+              + (f" - {again} of them re-read, their numbers not yet "
+                 f"{config.PERFORMANCE_SETTLE_HOURS}h old." if again else "."))
+    else:
+        print("no reel is waiting for numbers; the account was read.")
+    relived = sum(1 for entry in ledger.reels.values() if isinstance(entry, dict)
+                  and str((entry.get("lifetime") or {}).get("recorded_at") or "")
+                  >= started)
+    if relived:
+        print(f"read {relived} older reel(s) again for their lifetime numbers.")
     guessed = [run_id for run_id, entry in ledger.reels.items()
                if entry.get("matched_by") == "timestamp"]
     if guessed:

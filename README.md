@@ -2433,6 +2433,41 @@ at zero and moves the first time one lands. While nothing has ever been saved
 the report says so outright, so a column of zeros is never mistaken for a
 finding.
 
+**Why SHARED sits beside it, and why SAVED OR SENT now says what it is
+reading.** The yes/no was right while the account had no saves or shares at
+all, and it stopped telling reels apart once the account had an audience: of
+the twelve reels pushed past 700 reach from 2026-09-30, ten have had at least
+one save or share, so one share off 2,357 reached and 1,196 off 32,987 both
+count as 1. `SHARED` is the how-much, reel by reel: shares and saves per 1,000
+accounts reached at each reel's own reading, with the reading's age beside it.
+It is a rate per reach and not a ratio to the neighbouring reels, so it is
+defined at nought and needs no baseline; under `PERFORMANCE_MIN_REACH` a reel
+gets no rate, because one share there is one person. A reel past
+`PERFORMANCE_SHARE_FLAG` (5 per 1,000) with at least five shares is flagged as
+being sent on, and while it is under two days old the warnings say so - the one
+reel that ever was had 33 shares by its first reading and went from 4,204
+reached at 17h to 32,987 by its sixth day. Under the SAVED OR SENT table one
+line counts the yes/no above and below the median reach and says outright when
+the table is mostly reading how far each reel was pushed.
+
+**Lifetime readings, beside the compared ones.** The reading every table
+compares stops a day or two after posting by design, and that left the turkey
+reel at 9,200 reached in every total while Instagram's own figure went on to
+32,987. Once a reel is `PERFORMANCE_LIFETIME_DAYS` (7) old, the read fetches
+its numbers again every week into a separate `lifetime` field. `REACHED` and
+`ACTED`, the reach exhibit's lifetime column and `SHARED` use it; no table
+compares on it, and it never moves `metrics` or `hours_after_post`. The read now
+runs even when no reel is waiting, because it is also the account's daily read
+and this weekly one.
+
+**Follows by day.** Instagram will not say which reel won a follow, but from
+100 followers it does say how many follows and unfollows the account had each
+day. The read asks for them one finished UTC day at a time, in a request of
+their own (folded into the profile-visits request the API errors), and
+`PROFILE VISITS AND FOLLOWS` prints them by day beside the visits. A day Meta
+has not filled in yet comes back with no results and is asked again the next
+day rather than stored as nought.
+
 **Why FOLLOWED AFTER exists, and why it was blank until 2026-09-10.** Every
 other table here measures attention paid to one reel and spent there. A
 follower is the only outcome that survives the reel, and on an account at zero

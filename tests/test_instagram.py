@@ -1255,3 +1255,89 @@ def test_an_unreadable_state_file_costs_the_warning_not_the_read(tmp_path):
 
     assert aged["first_seen"] == "2026-09-17"
     assert aged["warn"] is False
+
+
+# ---------------------------------------------------------------------------
+# Follows by day, and the weekly lifetime read
+# ---------------------------------------------------------------------------
+
+def _follows_by_day(counts: dict):
+    """The account answering follows_and_unfollows for one UTC day a request,
+    with no results on a day Meta has not filled in yet."""
+    def answer(params):
+        day = datetime.fromtimestamp(int(params["since"]), timezone.utc).date()
+        breakdown = {"dimension_keys": ["follow_type"]}
+        if day.isoformat() in counts:
+            follows, unfollows = counts[day.isoformat()]
+            breakdown["results"] = [
+                {"dimension_values": ["FOLLOWER"], "value": follows},
+                {"dimension_values": ["NON_FOLLOWER"], "value": unfollows}]
+        return {"data": [{"name": "follows_and_unfollows", "period": "day",
+                          "total_value": {"breakdowns": [breakdown]}}]}
+    return answer
+
+
+def test_follows_are_read_one_finished_day_at_a_time(credentials):
+    session = FakeSession({"/insights": _follows_by_day(
+        {"2026-10-17": (20, 0), "2026-10-18": (34, 1)})})
+
+    days = instagram.account_follow_days(session, today=date(2026, 10, 20),
+                                         days=3)
+
+    assert days == {"2026-10-17": {"follows": 20, "unfollows": 0},
+                    "2026-10-18": {"follows": 34, "unfollows": 1}}
+    assert len(session.asked) == 3
+    assert all(params["breakdown"] == "follow_type"
+               for _, params in session.asked)
+
+
+def test_a_day_meta_has_not_filled_in_is_asked_again_not_stored(credentials):
+    """On 2026-10-20 the 19th came back with no results at all."""
+    session = FakeSession({"/insights": _follows_by_day({"2026-10-18": (34, 1)})})
+
+    days = instagram.account_follow_days(session, today=date(2026, 10, 20),
+                                         days=2)
+
+    assert "2026-10-19" not in days
+    assert days["2026-10-18"] == {"follows": 34, "unfollows": 1}
+
+
+def test_a_token_that_cannot_read_follows_loses_nothing_else(credentials):
+    session = FakeSession({"/insights": {"error": {
+        "message": "(#10) Application does not have permission for this action",
+        "code": 10}}})
+
+    assert instagram.account_follow_days(session,
+                                         today=date(2026, 10, 20)) == {}
+    assert len(session.asked) == 1
+
+
+def test_a_reel_a_week_old_is_read_again_for_its_lifetime(credentials,
+                                                          tmp_path,
+                                                          monkeypatch):
+    """Into a reading of its own: the one every table compares does not move."""
+    made = datetime.now(timezone.utc) - timedelta(days=9)
+    posted = made + timedelta(hours=1)
+    features = _features(tmp_path, made=made, caption="Snailfish live deep.")
+    ledger = perform.PerformanceLedger()
+    ledger.register(features)
+    ledger.record("ocean-1a2b3c", {"reach": 9200, "shares": 112},
+                  posted_at=posted.isoformat(timespec="seconds"),
+                  source="provider")
+    ledger.reels["ocean-1a2b3c"].update(hours_after_post=39.3,
+                                        media_id="1792", matched_by="caption")
+    ledger.save()
+    session = _wired(tmp_path, monkeypatch,
+                     insights={"data": [_insight("reach", 32987),
+                                        _insight("shares", 1196)]},
+                     posts=[_post("1792", "Snailfish live deep.", posted)])
+
+    perform.fetch(ledger=perform.PerformanceLedger(), provider=instagram.fetch)
+
+    entry = perform.PerformanceLedger().entry("ocean-1a2b3c")
+    assert entry["metrics"]["reach"] == 9200
+    assert entry["hours_after_post"] == 39.3
+    assert entry["lifetime"]["metrics"] == {"reach": 32987, "shares": 1196}
+    asked = [params["metric"] for url, params in session.asked
+             if "1792/insights" in url]
+    assert asked == [",".join(instagram.LIFETIME_METRICS)]
