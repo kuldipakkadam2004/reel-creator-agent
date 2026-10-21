@@ -1423,7 +1423,18 @@ def _fit_alt(text: str, limit: int) -> str:
     cut = text[:limit].rstrip()
     trimmed = _ALT_TRIM_RE.sub("", cut) or cut
     trimmed = _undangle(trimmed) or trimmed
-    return trimmed.rstrip(" ,;:") + "."
+    return _full_stop(trimmed)
+
+
+def _full_stop(text: str) -> str:
+    """`text` ending in exactly one sentence end.
+
+    The cut above can land just after a sentence's own full stop, and the
+    chameleon post of 2026-10-20 shipped "Kameleon (Chamaeleonidae)
+    Wisselbuijk.. Text on the image" because one was added on top of it.
+    """
+    text = text.rstrip(" ,;:")
+    return text if text.endswith((".", "!", "?", "…")) else text + "."
 
 
 def build_alt_text(cover: dict, *, limit: int, mode: str = "literal",
@@ -1456,6 +1467,14 @@ def build_alt_text(cover: dict, *, limit: int, mode: str = "literal",
         rephrased = " ".join(str(rewritten).split())
         if rephrased:
             depicts, source = rephrased, "llm"
+    # Ahead of both: the cover look's own words for the frame it graded. The
+    # provider's title is a file name - a Wikimedia catalogue entry in Dutch on
+    # the chameleon post of 2026-10-20 - and the rewrite above can only rephrase
+    # it, while the look is the one pass that saw the picture.
+    look = cover.get("look") if isinstance(cover.get("look"), dict) else {}
+    seen = " ".join(str(look.get("shows") or "").split())
+    if seen:
+        depicts, source = seen, "look"
 
     card = " ".join(str(cover.get("hook_card_text") or "").split())
     report.update({
@@ -1478,7 +1497,7 @@ def build_alt_text(cover: dict, *, limit: int, mode: str = "literal",
     # ("... over A jellyfish drifts in blue water"). Kept apart, each is
     # grammatical whichever it is, and quoting the card in its own sentence is
     # how a screen reader is normally told an image has words on it.
-    picture = f"{_sentence_case(depicts)}." if depicts else ""
+    picture = _full_stop(_sentence_case(depicts)) if depicts else ""
     on_image = ""
     if card:
         # A card too long for the field on its own is trimmed *inside* the

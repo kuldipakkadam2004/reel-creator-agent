@@ -342,3 +342,15 @@ def test_the_problem_list_the_prompt_offers_is_the_one_the_code_accepts(monkeypa
     look.grade_reel(frames("0.5s"))
     for name in look.PROBLEMS:
         assert name in seen["prompt"]
+
+
+def test_the_cover_look_says_what_the_picture_shows(monkeypatch):
+    """Step 6 describes the cover with it - see caption.build_alt_text."""
+    ask, seen = answers([{"frame": "shot 0", "grade": 3, "ok": True,
+                          "why": "striking", "shows": "a  turquoise chameleon\non a branch"}])
+    monkeypatch.setattr(look, "_ask", ask)
+
+    verdicts, _ = look.judge_covers(frames("shot 0"))
+
+    assert verdicts["shot 0"]["shows"] == "a turquoise chameleon on a branch"
+    assert '"shows"' in seen["prompt"]

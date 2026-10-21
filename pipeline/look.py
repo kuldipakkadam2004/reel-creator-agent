@@ -116,8 +116,13 @@ typography problem, and it is the most common way a cover fails.
 reject say what is wrong with it; on a {grade_max} say what would stop the \
 scroll.
 
+"shows" says what the picture itself shows, in plain words and under twelve of \
+them, for someone who cannot see it: the subject and the scene, not the words \
+of any card drawn over it, and not whether it makes a good cover.
+
 Return ONLY a JSON array, one object per frame, using each frame's own label:
-[{{"frame": "A", "grade": 2, "ok": true, "why": "clear shot of a river mouth"}}]"""
+[{{"frame": "A", "grade": 2, "ok": true, "why": "clear shot of a river mouth", \
+"shows": "a river mouth seen from the air"}}]"""
 
 _REEL_SYSTEM_INSTRUCTION = """\
 You review finished short-form vertical video by looking at frames sampled \
@@ -305,6 +310,12 @@ def judge_covers(frames: list[tuple[str, bytes]], *, topic: str = "",
             "ok": bool(entry.get("ok", True)),
             "why": str(entry.get("why") or "").strip()[:120],
         }
+        # What the picture is, in words: step 6 describes the cover with it.
+        # The provider's own title is a file name, and on 2026-10-20 that made
+        # the alt text a Rijksmuseum catalogue entry in Dutch.
+        shows = " ".join(str(entry.get("shows") or "").split())[:120]
+        if shows:
+            verdicts[label]["shows"] = shows
 
     notes: list[str] = []
     unseen = sorted(known - set(verdicts))

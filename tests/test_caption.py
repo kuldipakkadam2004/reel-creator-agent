@@ -1370,3 +1370,42 @@ def test_a_keyword_caption_is_not_checked_again(monkeypatch, tmp_path):
                                     mode="heuristic")
 
     assert post["claims"]["checked"] is False
+
+
+# --- the chameleon post of 2026-10-20 -------------------------------------
+
+def test_a_trim_that_lands_on_a_full_stop_does_not_add_another():
+    """It shipped "Kameleon (Chamaeleonidae) Wisselbuijk.. Text on the image"."""
+    text = alt_for(make_cover(
+        depicts=("Kameleon (Chamaeleonidae) Wisselbuijk. Chamaeleon. Chamelion. "
+                 "(titel op object), RP T BR 2017 1 7"),
+        hook_card_text="This isn't just camouflage"))
+
+    assert ".." not in text
+    assert text.endswith('Text on the image: "This isn\'t just camouflage".')
+
+
+def test_a_description_that_already_ends_a_sentence_gets_no_second_stop():
+    assert alt_for(make_cover(depicts="A chameleon on a branch!",
+                              hook_card_text="")) == "A chameleon on a branch!"
+
+
+def test_the_cover_look_describes_the_picture_ahead_of_the_file_name():
+    cover = make_cover(
+        depicts="Kameleon (Chamaeleonidae) Wisselbuijk. Chamaeleon.",
+        depicts_source="provider_title", hook_card_text="This isn't just camouflage",
+        look={"grade": 3, "ok": True, "why": "striking colours",
+              "shows": "a turquoise and red panther chameleon on a branch"})
+
+    text, report, _ = caption.build_alt_text(cover, limit=100)
+
+    assert text == ('A turquoise and red panther chameleon on a branch. '
+                    'Text on the image: "This isn\'t just camouflage".')
+    assert report["source"] == "look"
+
+
+def test_a_cover_look_with_no_description_leaves_step_fives_words():
+    text, report, _ = caption.build_alt_text(
+        make_cover(look={"grade": 2, "ok": True, "why": "clear"}), limit=100)
+
+    assert "Medusa blue ocean" in text and report["source"] == "source_url"
