@@ -1221,11 +1221,61 @@ def _clean_words(raw: list[dict]) -> list[dict]:
     return words
 
 
+def _alignment_cache_path(audio_path: Path) -> Path:
+    """Where a narration's ElevenLabs alignment is kept: beside the .mp3."""
+    return audio_path.with_name(audio_path.stem + ".alignment.json")
+
+
+def _sha256_of(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def _align_elevenlabs_cached(audio_path: Path, script: str,
+                             notes: list[str]) -> tuple[list[dict], float]:
+    """`_align_elevenlabs`, asked once per narration rather than once per encode.
+
+    The alignment is billed (see `_align_elevenlabs`), and a hand re-cut encodes
+    the same narration again and again: the chameleon reel of 2026-10-20 was
+    encoded four times and spent 208 voice characters on alignments that were
+    all the same. Reused only while both the audio and the script are
+    byte-identical - a re-voice writes new audio, so it is aligned afresh.
+    """
+    key = {"audio_sha256": _sha256_of(audio_path.read_bytes()),
+           "script_sha256": _sha256_of(script.encode("utf-8"))}
+    cache = _alignment_cache_path(audio_path)
+    try:
+        kept = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        kept = None
+    if (isinstance(kept, dict) and kept.get("audio_sha256") == key["audio_sha256"]
+            and kept.get("script_sha256") == key["script_sha256"]
+            and kept.get("words")):
+        notes.append(f"caption alignment reused from {cache.name}: the narration "
+                     f"and script are unchanged, so ElevenLabs was not billed again")
+        return kept["words"], float(kept.get("loss") or 0.0)
+
+    words, loss = _align_elevenlabs(audio_path, script)
+    try:
+        cache.write_text(json.dumps({"backend": "elevenlabs", **key, "loss": loss,
+                                     "words": words}, indent=2, ensure_ascii=False),
+                         encoding="utf-8")
+    except OSError as exc:
+        notes.append(f"the caption alignment could not be kept for reuse: {exc}")
+    return words, loss
+
+
 def _align_elevenlabs(audio_path: Path, script: str) -> tuple[list[dict], float]:
     """ElevenLabs forced alignment: the audio, plus the text it was made from.
 
     Forced alignment, not transcription - the words are the script's own, so
-    there is nothing to mis-hear. One API call, no synthesis credits.
+    there is nothing to mis-hear. One API call, and **not free**: ElevenLabs
+    bills it at its speech-to-text rate, out of the same quota as the voice.
+    This said "no synthesis credits" until 2026-10-21, when the chameleon reel's
+    four encodes were found to have spent ~52 characters each - the "endpoint
+    lag" every run had been logging since October. Call it through
+    `_align_elevenlabs_cached`.
     """
     import requests
 
@@ -1341,7 +1391,7 @@ def align_words(audio_path: Path, manifest: dict, audio_duration: float,
         order.append("estimate")
 
     backends = {
-        "elevenlabs": lambda: _align_elevenlabs(audio_path, script),
+        "elevenlabs": lambda: _align_elevenlabs_cached(audio_path, script, warnings),
         "whisper": lambda: _align_whisper(audio_path),
         "estimate": lambda: _align_estimate(manifest, audio_duration),
     }

@@ -3327,3 +3327,58 @@ def test_the_preflight_reports_a_missing_ffmpeg(monkeypatch):
     monkeypatch.setattr(assemble, "ffmpeg_binary", missing)
 
     assert assemble.preflight().startswith("ffmpeg not found")
+
+
+# ---------------------------------------------------------------------------
+# The ElevenLabs alignment is billed, so it is asked once per narration
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def billed_aligner(monkeypatch):
+    """A stand-in for the API that counts how often it is asked."""
+    calls: list[str] = []
+
+    def fake(audio_path, script):
+        calls.append(script)
+        return [{"word": "Hello", "start": 0.0, "end": 0.4}], 0.12
+
+    monkeypatch.setattr(assemble, "_align_elevenlabs", fake)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    return calls
+
+
+def test_a_re_encode_of_the_same_narration_reuses_its_alignment(tmp_path, billed_aligner):
+    """2026-10-20: four encodes of one narration spent 208 voice characters."""
+    audio = tmp_path / "chameleon.mp3"
+    audio.write_bytes(b"narration audio")
+    manifest = make_manifest(script="Hello there.")
+
+    first = assemble.align_words(audio, manifest, NARRATION, "auto")
+    second = assemble.align_words(audio, manifest, NARRATION, "auto")
+
+    assert billed_aligner == ["Hello there."]
+    assert second[0] == first[0] and second[1] == "elevenlabs" and second[2] == 0.12
+    assert any("reused from chameleon.alignment.json" in w for w in second[3])
+    assert (tmp_path / "chameleon.alignment.json").is_file()
+
+
+def test_a_re_voiced_narration_is_aligned_again(tmp_path, billed_aligner):
+    audio = tmp_path / "chameleon.mp3"
+    audio.write_bytes(b"narration audio")
+    assemble.align_words(audio, make_manifest(script="Hello there."), NARRATION, "auto")
+
+    audio.write_bytes(b"a new take of the narration")
+    assemble.align_words(audio, make_manifest(script="Hello there."), NARRATION, "auto")
+    assemble.align_words(audio, make_manifest(script="Hello again."), NARRATION, "auto")
+
+    assert billed_aligner == ["Hello there.", "Hello there.", "Hello again."]
+
+
+def test_an_unreadable_alignment_cache_is_asked_again(tmp_path, billed_aligner):
+    audio = tmp_path / "chameleon.mp3"
+    audio.write_bytes(b"narration audio")
+    (tmp_path / "chameleon.alignment.json").write_text("{not json", encoding="utf-8")
+
+    assemble.align_words(audio, make_manifest(script="Hello there."), NARRATION, "auto")
+
+    assert billed_aligner == ["Hello there."]
