@@ -787,8 +787,12 @@ def _make_reel(record: dict, candidate: dict, *, duration: int | None,
     # All four of step 2's passes report rather than raise, so their warnings
     # are the only trace of a hook that was kept, a rewrite that was thrown
     # away or a fact-check that could not be reached. They were being dropped.
-    for pass_name in ("hook", "structure", "takeaway", "claims"):
+    for pass_name in ("hook", "structure", "takeaway", "trim", "claims"):
         _collect(record, "script", (script.get(pass_name) or {}).get("warnings"))
+    trim = script.get("trim") or {}
+    if trim.get("revised"):
+        _announce(2, "script", f"cut from {trim['words_before']} to "
+                               f"{trim['words_after']} words to fit the budget")
     # Step 2's own warnings, as opposed to those of the four passes it runs:
     # what the script is after all of them have had their turn.
     _collect(record, "script", script.get("warnings"))

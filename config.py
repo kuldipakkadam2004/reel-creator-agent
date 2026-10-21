@@ -673,6 +673,21 @@ STRUCTURE_MIN_SCORE = get_env_float("STRUCTURE_MIN_SCORE", 2.0)
 #: off - score it and report, act on nothing
 TAKEAWAY_MODE = get_env("TAKEAWAY_MODE", "llm")
 
+# --- Length pass -------------------------------------------------------------
+# The word budget was enforced on every rewrite a pass offered and on nothing
+# else, so the script that was voiced could run long: 7 of the 25 scripts to
+# 2026-10-20 shipped over it, and the last three 40s reels went 130, 136 and
+# 142 words against a ceiling of 124. Every word is ~6 characters of
+# ElevenLabs quota, which is the thing that runs out. The chameleon reel's 142
+# words billed 827 characters and left the account unable to make another.
+#
+#: llm - a script over its ceiling buys one cut back inside it, kept only if
+#:       the first and last sentences survive word for word and nothing new
+#:       was written in; it runs before the fact-check, which then checks the
+#:       cut script
+#: off - report the length, act on nothing (the behaviour before this pass)
+SCRIPT_TRIM_MODE = get_env("SCRIPT_TRIM_MODE", "llm")
+
 #: The score at or above which no rewrite is bought. Set at the weight of the
 #: transfer line alone (2.0), so one sentence putting the viewer in front of
 #: the thing clears it outright, and so does a name plus the viewer in the

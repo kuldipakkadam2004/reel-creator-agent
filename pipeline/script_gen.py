@@ -3145,6 +3145,111 @@ def verify_claims(topic: str, script: str, *, mode: str | None = None) -> dict:
     return report
 
 
+# ---------------------------------------------------------------------------
+# The length pass: the script that is voiced is held to the word budget
+# ---------------------------------------------------------------------------
+
+#: Low on purpose: this is deletion, and the variety a higher temperature buys
+#: is variety in what to write, which this pass is not allowed to do.
+TRIM_TEMPERATURE = 0.3
+
+#: How many content words a cut may bring that the script did not have - the
+#: "and" or "so" a joined sentence sometimes needs is a stopword already, so
+#: this is headroom for a rejoined clause, not for new material.
+TRIM_MAX_NEW_WORDS = 2
+
+_TRIM_SYSTEM_INSTRUCTION = """\
+You cut narration scripts for short vertical videos down to length. You only \
+ever remove words. You never add a fact, a claim, an image or a phrase the \
+script does not already contain, and you never reword a sentence you keep, \
+beyond the joining word a cut sometimes needs.
+
+You always return only the words to be spoken, and nothing else."""
+
+_TRIM_PROMPT_TEMPLATE = """\
+Topic of the video: {topic}
+
+This narration for a {seconds}-second video runs {words} words. It must come \
+back at no more than {high} words and no fewer than {low}; about {target} is \
+best. Cut it to fit.
+
+Rules:
+- Keep the first sentence exactly as it is, word for word.
+- Keep the last sentence exactly as it is, word for word.
+- Cut what a viewer loses least first: a restatement, a second example, an \
+aside, filler, a sentence that only sets up the next one.
+- Keep every fact the script turns on, and keep the line that tells the \
+viewer what to look for or what the thing is called.
+- Do not add anything and do not reword what you keep. Keep the paragraph \
+breaks between what is left.
+- Return only the narration.
+
+Narration:
+{script}"""
+
+
+def _sentence_key(text: str) -> str:
+    return " ".join(w.lower() for w in _HOOK_WORD_RE.findall(text or ""))
+
+
+def trim_to_budget(topic: str, script: str, duration_seconds: int | None = None,
+                   *, mode: str | None = None) -> dict:
+    """Cut a script that runs over its word budget back inside it. Never raises.
+
+    Every other pass checks the budget on the rewrite it offers and none of
+    them checked the script itself, so the generator's own overrun went
+    straight to the voice: 142 words for a 40s reel on 2026-10-20, 47s of
+    narration and 827 characters of quota. This buys one cut, and keeps it only
+    when it is a cut: inside the band, the first sentence (what the hook pass
+    chose and the card is cut from) and the last (what the structure pass built
+    to answer it) intact, and nothing new written in. Anything else and the
+    script ships as it was, with a warning that says why.
+
+    Returns {"mode", "words_before", "words_after", "revised", "script",
+    "warnings"}. "script" is always the one to carry on with.
+    """
+    mode = (mode or config.SCRIPT_TRIM_MODE or "off").strip().lower()
+    wanted = target_duration(duration_seconds)
+    low, high = word_band(wanted)
+    words = count_words(script)
+    report = {"mode": mode, "words_before": words, "words_after": words,
+              "revised": False, "script": script, "warnings": []}
+    if mode != "llm" or words <= high:
+        return report
+
+    def refuse(why: str) -> dict:
+        report["warnings"].append(
+            f"the length pass's cut from {words} words was not used: {why}")
+        return report
+
+    prompt = _TRIM_PROMPT_TEMPLATE.format(
+        topic=topic or "(not given)", seconds=wanted, words=words,
+        low=low, high=high, target=words_for_duration(wanted), script=script)
+    try:
+        raw = call_gemini(prompt, system_instruction=_TRIM_SYSTEM_INSTRUCTION,
+                          temperature=TRIM_TEMPERATURE)
+    except (ScriptGenerationError, config.MissingConfigError) as exc:
+        return refuse(f"the call failed ({exc})")
+
+    cut = clean_script(raw)
+    after = count_words(cut)
+    if not cut:
+        return refuse("it came back empty")
+    if not low <= after <= high:
+        return refuse(f"it came back at {after} words, outside {low}-{high}")
+    before_sentences, after_sentences = split_sentences(script), split_sentences(cut)
+    if _sentence_key(before_sentences[0]) != _sentence_key(after_sentences[0]):
+        return refuse(f"it changed the opening line to {after_sentences[0]!r}")
+    if _sentence_key(before_sentences[-1]) != _sentence_key(after_sentences[-1]):
+        return refuse(f"it changed the closing line to {after_sentences[-1]!r}")
+    new = sorted(_content_words(cut) - _content_words(script))
+    if len(new) > TRIM_MAX_NEW_WORDS:
+        return refuse(f"it wrote in words the script did not have: {', '.join(new)}")
+
+    report.update(words_after=after, revised=True, script=cut)
+    return report
+
+
 def generate_script(topic: str, duration_seconds: int | None = None, *,
                     hooks: str | bool | None = None,
                     structure: str | bool | None = None,
@@ -3232,6 +3337,12 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
     if keep["revised"]:
         script = keep["revised_script"]
 
+    # After every pass that writes and before the one that checks: the cut is
+    # only a deletion, but the fact-check is what proves that, so it reads the
+    # script that will actually be voiced.
+    trim = trim_to_budget(topic.strip(), script, duration_seconds)
+    script = trim["script"]
+
     # Last, because it is the only pass that reads the script for what it says
     # rather than for how it is built, and the three above it rewrite the
     # words. Checking before them would be checking a draft that no longer
@@ -3302,6 +3413,7 @@ def generate_script(topic: str, duration_seconds: int | None = None, *,
         "hook": hook,
         "structure": shape,
         "takeaway": keep,
+        "trim": {k: v for k, v in trim.items() if k != "script"},
         "claims": claims,
         "warnings": warnings,
     }

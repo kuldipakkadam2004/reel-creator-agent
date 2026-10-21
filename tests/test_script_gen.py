@@ -3303,3 +3303,134 @@ def test_a_card_is_left_alone_when_the_check_found_nothing(monkeypatch):
 
     assert result["claims"]["revised"] is False
     assert result["hook_card"] == "Forests talk"
+
+
+# ---------------------------------------------------------------------------
+# The length pass
+# ---------------------------------------------------------------------------
+
+TRIM_OPEN = "You are looking at a mood ring."
+TRIM_CLOSE = "It is showing you how it feels."
+
+
+def _long_script(seconds: int = 40) -> str:
+    """A script with the trim pass's fixed ends and a body over the ceiling."""
+    _, high = script_gen.word_band(seconds)
+    body = []
+    n = 0
+    while len(" ".join([TRIM_OPEN, *body, TRIM_CLOSE]).split()) <= high + 12:
+        body.append(f"Fact number {n} about guanine crystals sits here.")
+        n += 1
+    return " ".join([TRIM_OPEN, *body, TRIM_CLOSE])
+
+
+def _cut_to(seconds: int, *, opening: str = TRIM_OPEN, closing: str = TRIM_CLOSE,
+            extra: str = "") -> str:
+    """A cut that lands mid-band, built from the long script's own sentences."""
+    low, high = script_gen.word_band(seconds)
+    body = []
+    n = 0
+    while len(" ".join([opening, *body, closing]).split()) < (low + high) // 2:
+        body.append(f"Fact number {n} about guanine crystals sits here.")
+        n += 1
+    return " ".join([opening, *body, extra, closing]).replace("  ", " ")
+
+
+def _trim_gemini(monkeypatch, answer: str) -> list[str]:
+    prompts: list[str] = []
+
+    def fake(prompt, **kwargs):
+        prompts.append(prompt)
+        return answer
+
+    monkeypatch.setattr(script_gen, "call_gemini", fake)
+    return prompts
+
+
+def test_a_script_inside_its_budget_costs_no_call(monkeypatch):
+    prompts = _trim_gemini(monkeypatch, "unused")
+    short = f"{TRIM_OPEN} One fact. {TRIM_CLOSE}"
+
+    report = script_gen.trim_to_budget("chameleons", short, 40, mode="llm")
+
+    assert prompts == [] and report["revised"] is False and report["script"] == short
+
+
+def test_a_script_over_its_ceiling_is_cut_back_inside_it(monkeypatch):
+    """2026-10-20: 142 words for a 40s reel went straight to the voice."""
+    long = _long_script(40)
+    cut = _cut_to(40)
+    prompts = _trim_gemini(monkeypatch, cut)
+    low, high = script_gen.word_band(40)
+
+    report = script_gen.trim_to_budget("chameleons", long, 40, mode="llm")
+
+    assert len(prompts) == 1 and f"no more than {high} words" in prompts[0]
+    assert report["revised"] is True and report["script"] == cut
+    assert low <= report["words_after"] <= high < report["words_before"]
+    assert report["warnings"] == []
+
+
+@pytest.mark.parametrize("answer, why", [
+    (_cut_to(40, opening="You are looking at a living mood ring."), "changed the opening line"),
+    (_cut_to(40, closing="It is telling you how it feels."), "changed the closing line"),
+    (_cut_to(40, extra="Scientists in Geneva filmed iridescent nanocrystals."), "wrote in words"),
+    (f"{TRIM_OPEN} Too short now. {TRIM_CLOSE}", "outside"),
+    ("", "came back empty"),
+])
+def test_a_cut_that_is_not_only_a_cut_is_not_used(monkeypatch, answer, why):
+    long = _long_script(40)
+    _trim_gemini(monkeypatch, answer)
+
+    report = script_gen.trim_to_budget("chameleons", long, 40, mode="llm")
+
+    assert report["revised"] is False and report["script"] == long
+    assert why in report["warnings"][0]
+
+
+def test_a_failed_trim_call_keeps_the_script(monkeypatch):
+    def boom(prompt, **kwargs):
+        raise script_gen.ScriptGenerationError("503 from Gemini")
+
+    monkeypatch.setattr(script_gen, "call_gemini", boom)
+    long = _long_script(40)
+
+    report = script_gen.trim_to_budget("chameleons", long, 40, mode="llm")
+
+    assert report["script"] == long and "the call failed" in report["warnings"][0]
+
+
+def test_the_length_pass_can_be_turned_off(monkeypatch):
+    prompts = _trim_gemini(monkeypatch, _cut_to(40))
+
+    report = script_gen.trim_to_budget("chameleons", _long_script(40), 40, mode="off")
+
+    assert prompts == [] and report["revised"] is False
+
+
+def test_the_fact_check_reads_the_cut_script(monkeypatch):
+    """The cut runs before the check, so the check proves it only deleted."""
+    long, cut = _long_script(20), _cut_to(20)
+    checked: list[str] = []
+
+    def dispatch(prompt, **kwargs):
+        if "Write a voiceover narration" in prompt:
+            return long
+        if "Cut it to fit" in prompt:
+            return cut
+        if "Find every place" in prompt:
+            checked.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(script_gen, "call_gemini", dispatch)
+    monkeypatch.setattr(config, "SCRIPT_TRIM_MODE", "llm")
+    result = script_gen.generate_script("chameleons", 20, hooks=False,
+                                        structure=False, takeaway=False)
+
+    assert result["script"] == cut
+    assert result["trim"]["revised"] is True and "script" not in result["trim"]
+    kept = script_gen.split_sentences(cut)
+    dropped = [s for s in script_gen.split_sentences(long) if s not in kept]
+    assert checked and dropped
+    assert all(s in checked[0] for s in kept)
+    assert not any(s in checked[0] for s in dropped)
