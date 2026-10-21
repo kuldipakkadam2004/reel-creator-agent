@@ -4731,3 +4731,231 @@ def test_a_429_with_no_wait_named_still_gets_its_one_retry(tmp_path,
     assert slept == [visuals.RATE_LIMIT_BACKOFF_SECONDS]
     assert len(session.download_calls) == 2
 
+
+# ---------------------------------------------------------------------------
+# The chameleon reel of 2026-10-20: the subject beats a word match
+#
+# The screen passed an angry man under "threatened", a parade float under
+# "display" and a sports car under "reds and oranges", and turned real
+# chameleons down as "calm" and "not red or orange". Keepers filled first, the
+# variety check skipped a second chameleon photograph as "the same shot", and
+# beats sharing an archive query all led with one photograph.
+# ---------------------------------------------------------------------------
+
+_CHAMELEON = "how a chameleon actually changes colour"
+
+
+def _chameleon_run(monkeypatch, served, verdicts_by_key, subject_beats=(0, 1),
+                   neutral_beats=()):
+    """End to end, with beat N searching `served["qN"]` and naming the subject
+    in its query on the beats in `subject_beats`. The beats in `neutral_beats`
+    fall back to `served["neutral"]`."""
+    fillers: dict[str, list] = {}
+
+    class PerBeatProvider(visuals.Provider):
+        name = "stub"
+        kinds = ("video",)
+        key_env = ()
+        attribution_required = False
+
+        def search(self, query, kind, limit):
+            key = query.split()[-1]
+            if key in served:
+                return list(served[key])
+            number = 300 + int(key[1:])
+            return fillers.setdefault(key, [_described(number, f"filler-{number}")])
+
+    def queries(beats, topic, mode):
+        for beat in beats:
+            beat.query = (f"chameleon q{beat.index}" if beat.index in subject_beats
+                          else f"blue yellow ink q{beat.index}")
+            beat.alt_queries = ()
+            beat.neutral_query = "neutral" if beat.index in neutral_beats else ""
+        return []
+
+    monkeypatch.setattr(visuals, "_PROVIDERS", {"stub": PerBeatProvider})
+    monkeypatch.setattr(visuals, "build_queries", queries)
+    monkeypatch.setattr(visuals, "llm_screen", _screen_by_key(verdicts_by_key))
+    manifest = run_visuals(relevance_mode="llm", assets_per_beat=1, topic=_CHAMELEON)
+
+    def placed(beat_index):
+        return {manifest["assets"][i]["source_url"]
+                for i in manifest["beats"][beat_index]["asset_indexes"]}
+    return manifest, placed
+
+
+def test_the_subject_in_the_wrong_mood_beats_an_approved_clip_of_something_else(
+        sandbox, monkeypatch, one_shot_beats):
+    opening = _described(310, "panther-chameleon-on-a-branch")
+    car = _described(311, "vibrant-sports-car-on-urban-street")
+    calm = _described(312, "green-chameleon-amidst-lush-foliage")
+    manifest, placed = _chameleon_run(monkeypatch, {"q0": [opening], "q1": [car, calm]}, {
+        opening.key: (True, True), car.key: (True, False), calm.key: (False, True)})
+
+    assert calm.source_url in placed(1) and car.source_url not in placed(1)
+    assert any("turned down for this line" in n for n in manifest["beats"][1]["notes"])
+    assert any("plays 1 clip(s) of the subject" in w for w in manifest["warnings"])
+
+
+def test_the_variety_check_cannot_trade_the_subject_for_something_else(
+        sandbox, monkeypatch, one_shot_beats):
+    """Same species, so same words - the variety check called it a repeat."""
+    first = _described(320, "panther-chameleon-on-a-mossy-branch")
+    second = _described(321, "panther-chameleon-on-a-mossy-twig")
+    car = _described(322, "vibrant-sports-car-on-urban-street")
+    _, placed = _chameleon_run(monkeypatch, {"q0": [first], "q1": [second, car]}, {
+        first.key: (True, True), second.key: (True, True), car.key: (True, False)})
+
+    assert second.source_url in placed(1) and car.source_url not in placed(1)
+
+
+def test_a_line_that_is_a_picture_of_something_else_keeps_its_picture(
+        sandbox, monkeypatch, one_shot_beats):
+    """A query that does not name the subject did not ask for it, so ink stays."""
+    opening = _described(330, "panther-chameleon-on-a-branch")
+    ink = _described(331, "blue-and-yellow-ink-mixing-in-water")
+    calm = _described(332, "green-chameleon-amidst-lush-foliage")
+    _, placed = _chameleon_run(monkeypatch, {"q0": [opening], "q1": [ink, calm]}, {
+        opening.key: (True, True), ink.key: (True, False), calm.key: (False, True)},
+        subject_beats=(0,))
+
+    assert ink.source_url in placed(1) and calm.source_url not in placed(1)
+
+
+def test_beats_sharing_an_archive_query_lead_with_different_photographs():
+    first = Beat(index=0, start=0.0, end=4.0, query="chameleon q0", text="a",
+                 archive_query="Chamaeleonidae")
+    second = Beat(index=1, start=4.0, end=8.0, query="chameleon q1", text="b",
+                  archive_query="Chamaeleonidae")
+    stock = _described(340, "green-leaf-in-the-rain")
+    one = _described(341, "chamaeleonidae-photograph-one")
+    two = _described(342, "chamaeleonidae-photograph-two")
+    rows = [(9.0, stock, "chameleon q0"), (5.0, one, "Chamaeleonidae"),
+            (5.0, two, "Chamaeleonidae")]
+    screened = {stock.key, one.key, two.key}
+    led: set[str] = set()
+
+    a, note_a = visuals._archive_first(list(rows), first, screened, set(),
+                                       {one.key, two.key}, led=led)
+    b, note_b = visuals._archive_first(list(rows), second, screened, set(),
+                                       {one.key, two.key}, led=led)
+
+    assert a[0][1] is one and b[0][1] is two
+    assert "led with" in note_a and "led with" in note_b
+
+
+def test_the_opening_puts_a_drawing_of_the_subject_behind_its_photographs(monkeypatch):
+    drawing = _described(350, "kameleon", title=(
+        "Kameleon (Chamaeleonidae) Wisselbuijk (titel op object), gouache "
+        "paintings in the rijksmuseum amsterdam"))
+    photo_needed = _described(351, "jumping-spider-on-a-green-leaf")
+    photo_spare = _described(352, "a-spider-on-a-branch-with-a-blue-sky")
+    plans = {
+        0: [(14.7, drawing, "pouring milk into glass")],
+        1: [(8.7, photo_needed, "jumping spider with babies"),
+            (8.7, photo_spare, "jumping spider with babies")],
+    }
+    notes, _ = _screen_opening(monkeypatch, plans, [_milk_beat(shots=1), _spider_beat()], {
+        drawing.key: (True, True), photo_needed.key: (True, True),
+        photo_spare.key: (True, True)})
+
+    opening = [row[1].provider_id for row in plans[0]]
+    assert opening[:2] == ["v352", "v350"], opening
+    assert any("behind its photographs" in n for n in notes[0])
+
+
+@pytest.mark.parametrize("title, description, art", [
+    ("Kameleon (Chamaeleonidae) Wisselbuijk. Chamaeleon. Chamelion. (titel op object), "
+     "RP-T-BR-2017-1-7-12", "gouache paintings in the rijksmuseum amsterdam", True),
+    ("Scyllarides haanii (10.12782-specdiv.29.327) Figure 4", "", True),
+    ("Panther chameleon (Furcifer pardalis) male Montagne d’Ambre 3",
+     "furcifer pardalis, chamaeleonidae of madagascar, photographs taken on 2018-12-01", False),
+    ("Phyllosoma prisca", "", False),
+    ("Chameleon eye", "macro photographs of reptile eyes", False),
+])
+def test_artwork_is_told_from_a_photograph_by_its_own_words(title, description, art):
+    candidate = Candidate(provider="wikimedia", provider_id=title, kind="image",
+                          width=2000, height=3000, download_url="https://x.test/a.jpg",
+                          title=title, description=description)
+
+    assert visuals._looks_like_artwork(candidate) is art
+
+
+def test_a_clip_the_screen_left_out_of_its_answer_is_not_approved(monkeypatch):
+    """Silence used to read as a keep: a missing verdict defaulted to ok in
+    `_demote_rejects`, and every row the screen was shown was marked screened."""
+    beat = Beat(index=0, start=0.0, end=6.0, query="crystal lattice animation",
+                text="shimmering crystals of guanine")
+    answered = _described(360, "glittering-crystals-falling")
+    skipped = _described(361, "adorable-dog-smiling-indoors")
+
+    def screen(shortlists, beats, topic, subject_keys=None, establishing=False):
+        return {0: {0: (True, "")}}, []
+
+    monkeypatch.setattr(visuals, "llm_screen", screen)
+    plans = {0: [(9.0, answered, beat.query), (9.0, skipped, beat.query)]}
+    screened: set[str] = set()
+    rejected: set[str] = set()
+    visuals._screen_beats(plans, [beat], _CHAMELEON,
+                          [_query_aware_provider({})(session=None)],
+                          _retry_settings(), visuals.UsageLedger(), "run",
+                          visuals._RunState(), {}, [], rejected, screened)
+
+    assert answered.key in screened
+    assert skipped.key not in screened and skipped.key not in rejected
+
+
+def test_a_subject_beat_borrows_a_chameleon_another_beat_can_spare(
+        sandbox, monkeypatch, one_shot_beats):
+    """The re-run of 2026-10-21: "chameleon eye close up" ran out of its own
+    chameleons and took a human eye, with chameleons unplaced elsewhere."""
+    opening = _described(370, "panther-chameleon-on-a-branch")
+    spare = _described(371, "veiled-chameleon-on-a-leaf")
+    eye = _described(372, "extreme-close-up-shot-of-a-person-s-eye")
+    manifest, placed = _chameleon_run(
+        monkeypatch, {"q0": [opening, spare], "q1": [eye]}, {
+            opening.key: (True, True), spare.key: (True, True), eye.key: (True, False)})
+
+    assert spare.source_url in placed(1) and eye.source_url not in placed(1)
+    assert any("from other beats' footage" in n for n in manifest["beats"][1]["notes"])
+
+
+def test_a_later_beat_keeps_the_subject_it_will_need(sandbox, monkeypatch, one_shot_beats):
+    opening = _described(380, "panther-chameleon-on-a-branch")
+    eye = _described(381, "extreme-close-up-shot-of-a-person-s-eye")
+    needed = _described(382, "veiled-chameleon-on-a-leaf")
+    _, placed = _chameleon_run(
+        monkeypatch, {"q0": [opening], "q1": [eye], "q2": [needed]}, {
+            opening.key: (True, True), eye.key: (True, False), needed.key: (True, True)},
+        subject_beats=(0, 1, 2))
+
+    assert eye.source_url in placed(1)
+    assert needed.source_url in placed(2)
+
+
+def test_a_subject_beat_takes_the_neutral_shot_before_a_clip_of_something_else(
+        sandbox, monkeypatch, one_shot_beats):
+    """The re-run of 2026-10-21: with its chameleons spent, "red orange
+    chameleon" placed a car on a city street that the screen had passed."""
+    opening = _described(390, "panther-chameleon-on-a-branch")
+    car = _described(391, "sunset-car-cruise-near-a-tower")
+    jungle = _described(392, "lush-tropical-forest-canopy-with-sunlight")
+    manifest, placed = _chameleon_run(
+        monkeypatch, {"q0": [opening], "q1": [car], "neutral": [jungle]}, {
+            opening.key: (True, True), car.key: (True, False), jungle.key: (True, False)},
+        neutral_beats=(1,))
+
+    assert jungle.source_url in placed(1) and car.source_url not in placed(1)
+
+
+def test_the_clip_of_something_else_still_beats_an_empty_slot(
+        sandbox, monkeypatch, one_shot_beats):
+    opening = _described(393, "panther-chameleon-on-a-branch")
+    car = _described(394, "sunset-car-cruise-near-a-tower")
+    manifest, placed = _chameleon_run(
+        monkeypatch, {"q0": [opening], "q1": [car]}, {
+            opening.key: (True, True), car.key: (True, False)})
+
+    assert car.source_url in placed(1)
+    assert any("do not show the subject its query asked for" in w
+               for w in manifest["warnings"])

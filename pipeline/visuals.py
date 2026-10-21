@@ -3208,6 +3208,20 @@ def _verdicts_for(
     return {}
 
 
+def _judged_keys(rows: list[tuple[float, Candidate, str]],
+                 verdicts: dict[int, tuple[bool, str]]) -> set[str]:
+    """The rows a screen actually gave a verdict on.
+
+    Every row it was shown used to count as screened, and `_demote_rejects`
+    reads a missing verdict as a keep - so a clip the model simply left out of
+    its answer became approved footage, placed ahead of the neutral shot with
+    nothing said. The lexical screen answers every position or none, so this
+    only ever changes what an LLM answer that skipped a clip means: unjudged,
+    which pass 2 places last and out loud, rather than approved.
+    """
+    return {row[1].key for position, row in enumerate(rows) if position in verdicts}
+
+
 def _demote_rejects(
     ranked: list[tuple[float, Candidate, str]],
     verdicts: dict[int, tuple[bool, str]],
@@ -3418,9 +3432,57 @@ def _names_the_subject(candidate: Candidate, archive: str, topic: str) -> bool:
                for term in _content_terms(_without_accents(topic)))
 
 
+def _query_names_subject(beat: Beat, topic: str) -> bool:
+    """Whether a beat's own search asked for the video's subject by name.
+
+    The query writer names the subject when the line is about it - "agitated
+    chameleon display", "chameleon turning red orange" - and leaves it out when
+    the line is a picture of something else - "blue yellow light mixing" for a
+    line about colours combining. Only the first kind is asking for the subject
+    to be on screen, so only on those does a clip of it beat a clip of
+    something else that the screen let through.
+    """
+    asked = _content_terms(_without_accents(beat.query or ""))
+    if not asked:
+        return False
+    return any(_matches(term, asked)
+               for term in _content_terms(_without_accents(topic or "")))
+
+
+def _subject_spares(plans: dict[int, list[Row]], beats: list[Beat], current: Beat,
+                    subject_keys: set[str], rejected_keys: set[str],
+                    state: "_RunState", settings: dict) -> list[Row]:
+    """Clips of the video's subject that other beats can spare. Approved first.
+
+    For a beat that asks for the subject and has run out of its own. A beat
+    already filled spares everything it did not place; a beat still to come
+    keeps as many as it will ask for. The chameleon re-run of 2026-10-21 is why:
+    "aggressive chameleon display" fell to jungle leaves and "chameleon eye
+    close up" to a human eye, with chameleons unplaced in other beats' rows.
+    """
+    approved: list[Row] = []
+    turned: list[Row] = []
+    seen: set[str] = set()
+    for other in sorted(beats, key=lambda b: b.index):
+        if other.index == current.index:
+            continue
+        rows = [row for row in plans.get(other.index) or []
+                if row[1].key in subject_keys and row[1].key not in state.taken_keys
+                and row[1].key not in state.failed_keys]
+        if other.index > current.index:
+            rows = rows[_assets_wanted(other, settings):]
+        for row in rows:
+            if row[1].key in seen:
+                continue
+            seen.add(row[1].key)
+            (turned if row[1].key in rejected_keys else approved).append(row)
+    return approved + turned
+
+
 def _archive_first(rows: list[Row], beat: Beat, screened_keys: set[str],
                    rejected_keys: set[str], subject_keys: set[str],
-                   topic: str = "") -> tuple[list[Row], str]:
+                   topic: str = "", led: set[str] | None = None,
+                   ) -> tuple[list[Row], str]:
     """Lead a beat with its archive photograph, when nothing else it kept
     shows the subject. Returns (rows, note) - the note is "" when nothing
     moved.
@@ -3447,10 +3509,17 @@ def _archive_first(rows: list[Row], beat: Beat, screened_keys: set[str],
     A bison is named in its clip's words, and so are hunger stones; a
     migmatite filmed as "a rock" is not, and loses its place to the photograph
     filed under its name.
+
+    `led` is the photographs earlier beats already lead with, and this beat's
+    is added to it. Beats share an archive query - five asked for
+    "Chamaeleonidae" on the chameleon reel of 2026-10-20 - and each picked the
+    same top photograph: the first beat to download it kept it, and beat 6 lost
+    its lead to an angry man. Of the last 11 leads, 8 never reached their beat.
     """
     archive = (beat.archive_query or "").strip()
     if not archive:
         return rows, ""
+    led = led if led is not None else set()
     approved = [row for row in rows if row[1].key in screened_keys
                 and row[1].key not in rejected_keys]
     if any(row[1].key in subject_keys
@@ -3458,8 +3527,12 @@ def _archive_first(rows: list[Row], beat: Beat, screened_keys: set[str],
            for row in approved if row[2] != archive):
         return rows, ""
     lead = next((row for row in approved
-                 if row[2] == archive and row[1].key in subject_keys), None)
-    if lead is None or lead is rows[0]:
+                 if row[2] == archive and row[1].key in subject_keys
+                 and row[1].key not in led), None)
+    if lead is None:
+        return rows, ""
+    led.add(lead[1].key)
+    if lead is rows[0]:
         return rows, ""
     return [lead] + [row for row in rows if row is not lead], (
         f"led with {lead[1].key} "
@@ -3557,6 +3630,8 @@ def _screen_beats(
         warnings.extend(screen_warnings)
 
     retry: list[Beat] = []
+    #: Archive photographs a beat already leads with - see `_archive_first`.
+    led: set[str] = set()
     #: The beats that arrived here with nothing found at all, as opposed to
     #: something found and rejected. Only the wording downstream differs, but
     #: "nothing matches the narration" is not true of a beat no provider
@@ -3591,14 +3666,14 @@ def _screen_beats(
         if not verdicts:
             continue
         reordered, beat_notes = _demote_rejects(head, verdicts)
-        screened_keys.update(row[1].key for row in head)
+        screened_keys.update(_judged_keys(head, verdicts))
         rejected_keys.update(
             row[1].key for position, row in enumerate(head)
             if not verdicts.get(position, (True, ""))[0]
         )
         reordered, lead_note = _archive_first(
             reordered, beat, screened_keys, rejected_keys, subject_keys,
-            topic=topic)
+            topic=topic, led=led)
         if lead_note:
             beat_notes.append(lead_note)
         plans[index] = reordered + tail
@@ -3650,7 +3725,7 @@ def _screen_beats(
             if not verdicts:
                 continue
             reordered, beat_notes = _demote_rejects(rows, verdicts)
-            screened_keys.update(row[1].key for row in rows)
+            screened_keys.update(_judged_keys(rows, verdicts))
             rejected_keys.update(
                 row[1].key for position, row in enumerate(rows)
                 if not verdicts.get(position, (True, ""))[0]
@@ -3725,7 +3800,7 @@ def _screen_beats(
             if verdicts:
                 reordered, beat_notes = _demote_rejects(head, verdicts)
                 kept = len([1 for ok, _ in verdicts.values() if ok])
-                screened_keys.update(row[1].key for row in head)
+                screened_keys.update(_judged_keys(head, verdicts))
                 rejected_keys.update(
                     row[1].key for position, row in enumerate(head)
                     if not verdicts.get(position, (True, ""))[0]
@@ -3864,6 +3939,30 @@ def _screen_beats(
     return notes
 
 
+#: Words an archive file's own title and categories use for a picture that is
+#: not a photograph of the thing: a museum drawing, a journal figure. Two reels
+#: opened on one - a Rijksmuseum gouache filed under "gouache paintings in the
+#: rijksmuseum amsterdam" (chameleon, 2026-10-20) and "scyllarides haanii
+#: (10.12782-specdiv.29.327) figure 4" (lobster larva, 2026-10-12) - and every
+#: reel whose opening frames showed the subject reached 700+ while 0 of 4 that
+#: did not did. The screen marks a drawing of the subject `subj`, as it should;
+#: only the opening, which is also the cover, cares that it is a drawing.
+_ARTWORK_RE = re.compile(
+    r"\b(?:paintings?|drawings?|illustrations?|engravings?|lithographs?|etchings?"
+    r"|woodcuts?|watercolou?rs?|gouache|sketch(?:es|book)?|diagrams?|infographics?"
+    r"|figure \d+|fig\. ?\d+|plate \d+|rijksmuseum|titel op object"
+    r"|biodiversity heritage library|scientific illustrations?)\b"
+    r"|\(10\.\d{4,}[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_artwork(candidate: Candidate) -> bool:
+    """Whether a candidate's own words say it is art or a figure, not a photo."""
+    return bool(_ARTWORK_RE.search(
+        f"{candidate.title or ''} {describe_candidate(candidate) or ''}"))
+
+
 def _open_on_the_subject(
     plans: dict[int, list[tuple[float, Candidate, str]]], beats: list[Beat],
     settings: dict, state: "_RunState", screened_keys: set[str],
@@ -3913,7 +4012,12 @@ def _open_on_the_subject(
                 and key not in state.taken_keys)
 
     want = _assets_wanted(opening, settings)
-    own = [row for row in rows if approved(row) and row[1].key in subject_keys]
+    subject = [row for row in rows if approved(row) and row[1].key in subject_keys]
+    # A drawing of the subject is the subject, and the screen says so. But this
+    # beat is also the cover, so photographs of it go first - borrowed from a
+    # later beat if need be - and art only behind them. See `_ARTWORK_RE`.
+    own = [row for row in subject if not _looks_like_artwork(row[1])]
+    art = [row for row in subject if _looks_like_artwork(row[1])]
 
     spare: list[tuple[float, Candidate, str]] = []
     needed: list[tuple[float, Candidate, str]] = []
@@ -3927,6 +4031,8 @@ def _open_on_the_subject(
                 key = row[1].key
                 if key not in subject_keys or key in seen:
                     continue
+                if _looks_like_artwork(row[1]):
+                    continue
                 seen.add(key)
                 if position >= _assets_wanted(beat, settings):
                     spare.append(row)
@@ -3936,7 +4042,7 @@ def _open_on_the_subject(
     if not own and not borrowed:
         borrowed = needed[:1]
 
-    lead = own + borrowed
+    lead = own + borrowed + art
     if not lead:
         warnings.append(
             f"beat {opening.index} ({opening.query!r}): the opening shot does "
@@ -3951,10 +4057,15 @@ def _open_on_the_subject(
         return
     plans[opening.index] = reordered
 
+    if art and (own or borrowed):
+        notes.setdefault(opening.index, []).append(
+            f"put {len(art)} drawing(s) or figure(s) of the subject behind its "
+            f"photographs: this beat is the first frame and the cover"
+        )
     if not borrowed:
         notes.setdefault(opening.index, []).append(
-            f"moved {len(own)} clip(s) of the video's subject to the front: "
-            f"this beat is the first frame and the cover"
+            f"moved {len(own) + len(art)} clip(s) of the video's subject to the "
+            f"front: this beat is the first frame and the cover"
         )
         return
     notes.setdefault(opening.index, []).append(
@@ -4627,14 +4738,80 @@ def source_visuals(
             }
 
             deferred = False
-            acquired = take(keepers, want, beat)
-            if len(acquired) < want:
-                # Variety is a preference, not a filter. A beat left short by
-                # it is worse off than one holding a near-repeat: too few
-                # clips means one shot stretched across the whole beat, which
-                # is the very thing the preference exists to prevent.
-                acquired += take(keepers, want - len(acquired), beat,
-                                 avoid_similar=False)
+            # On a beat whose own query asks for the subject, the subject goes
+            # in first: what the screen approved that shows it, then what it
+            # turned down only for doing something else, and only after both
+            # the approved clips of something else. The chameleon reel of
+            # 2026-10-20 is why. Its screen passed an angry man under
+            # "threatened", a parade float under "display" and a sports car
+            # under "reds and oranges", and turned down three real chameleons
+            # as "calm" and "not red or orange" - and keepers fill first, so
+            # the wrong subject in the right mood beat the right subject in the
+            # wrong one. The salvage step makes the same call for a beat that
+            # kept nothing; this makes it for a beat that kept the wrong thing.
+            tiers = [keepers]
+            mood: list[tuple[float, Candidate, str]] = []
+            borrowed: list[tuple[float, Candidate, str]] = []
+            others: list[tuple[float, Candidate, str]] = []
+            #: Approved clips that do not show the subject, on a beat whose
+            #: query asks for it. They wait until after the neutral shot - see
+            #: where they are placed, below it.
+            later: list[tuple[float, Candidate, str]] = []
+            if subject_keys and _query_names_subject(beat, topic):
+                shows = [r for r in keepers if r[1].key in subject_keys]
+                mood = [r for r in rejects if r[1].key in subject_keys]
+                others = [r for r in keepers if r[1].key not in subject_keys]
+                # Short of the subject in its own rows, a beat that asks for it
+                # takes what other beats can spare before a clip of something
+                # else - or the neutral shot, which shows the subject's world
+                # and not the subject.
+                if len(shows) + len(mood) < want:
+                    own = {r[1].key for r in shows + mood}
+                    borrowed = [r for r in _subject_spares(
+                        plans, beats, beat, subject_keys, rejected_keys, state,
+                        settings) if r[1].key not in own]
+                tiers = [shows + mood + borrowed]
+                later = others
+            acquired = []
+            for tier in tiers:
+                acquired += take(tier, want - len(acquired), beat)
+                if len(acquired) < want:
+                    # Variety is a preference, not a filter. A beat left short
+                    # by it is worse off than one holding a near-repeat: too
+                    # few clips means one shot stretched across the whole beat,
+                    # which is the very thing the preference exists to prevent.
+                    # Per tier, so it can never trade the subject away either:
+                    # on the chameleon reel it skipped an orange panther
+                    # chameleon as "the same shot" as an earlier chameleon -
+                    # their Commons categories share the taxonomy - and the
+                    # sports car, similar to nothing, took the slot.
+                    acquired += take(tier, want - len(acquired), beat,
+                                     avoid_similar=False)
+            if mood or borrowed:
+                mood_keys = {r[1].key for r in mood}
+                lent_keys = {r[1].key for r in borrowed}
+                turned = sum(1 for a in acquired if a.get("provider_key") in mood_keys)
+                lent = sum(1 for a in acquired if a.get("provider_key") in lent_keys)
+                if lent:
+                    record["notes"].append(
+                        f"placed {lent} clip(s) of the video's subject from other "
+                        f"beats' footage: {beat.query!r} asks for the subject and "
+                        f"its own rows ran out of it"
+                    )
+                instead = (f"{len(others)} approved clip(s) that do not show the "
+                           f"subject" if others else "the neutral shot")
+                if turned:
+                    record["notes"].append(
+                        f"placed {turned} clip(s) of the video's subject that the "
+                        f"screen turned down for this line, ahead of {instead}: "
+                        f"{beat.query!r} asks for the subject"
+                    )
+                if turned or lent:
+                    warnings.append(
+                        f"beat {beat.index} ({beat.query!r}): plays {turned + lent} "
+                        f"clip(s) of the subject doing something other than the "
+                        f"line, rather than {instead}"
+                    )
 
             # The screen kept something here, but not enough of it reached the
             # beat, and the next rows are clips it rejected. Reaching past them
@@ -4642,7 +4819,7 @@ def source_visuals(
             # makes: an under-specified shot of the subject's own world beats
             # one that contradicts the narration. Only beats that need it pay
             # for the search.
-            if len(acquired) < want and (rejects or unscreened):
+            if len(acquired) < want and (rejects or unscreened or later):
                 # The neutral is one shot for the whole video - the query
                 # prompt says the same answer for every beat is fine - so the
                 # second beat to reach for it puts the same footage on screen
@@ -4659,7 +4836,7 @@ def source_visuals(
                 deferred = (
                     cap >= 0
                     and state.neutral_beats >= cap
-                    and bool(unscreened)
+                    and bool(unscreened or later)
                 )
                 seen = {row[1].key for row in ranked}
                 safe = [] if deferred else _neutral_plan(
@@ -4696,6 +4873,30 @@ def source_visuals(
                         f"world, not the subject"
                     )
                 ranked = ranked + safe
+
+            # Approved for the line's words but not of the subject its query
+            # asked for, so after the neutral shot: that shows the subject's
+            # world and cannot say anything false about it, and a sports car
+            # under "reds and oranges" or a woman shouting under "threatened"
+            # can. Both of those reached a chameleon reel's re-run on
+            # 2026-10-21 once its chameleons had all been placed.
+            if len(acquired) < want and later:
+                placed = take(later, want - len(acquired), beat)
+                if len(acquired) + len(placed) < want:
+                    placed += take(later, want - len(acquired) - len(placed), beat,
+                                   avoid_similar=False)
+                if placed:
+                    acquired += placed
+                    record["notes"].append(
+                        f"placed {len(placed)} approved clip(s) that do not show "
+                        f"the video's subject: {beat.query!r} asks for it, and "
+                        f"neither the run's footage of it nor the neutral shot "
+                        f"covered the beat"
+                    )
+                    warnings.append(
+                        f"beat {beat.index} ({beat.query!r}): plays {len(placed)} "
+                        f"clip(s) that do not show the subject its query asked for"
+                    )
 
             # Below the neutral shot, above the rejects: these are the rows
             # the screen never reached. One of them may be perfect and one may
