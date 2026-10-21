@@ -169,7 +169,7 @@ FFMPEG_ERROR_TAIL = 1800
 #: is a runaway guard, not a target.
 FFMPEG_TIMEOUT = 1800
 
-#: A filter graph longer than this goes into a file (-filter_complex_script)
+#: A filter graph longer than this goes into a file (see `filter_file_flag`)
 #: rather than onto the command line, which Windows caps at 32k characters.
 FILTER_GRAPH_INLINE_LIMIT = 8000
 
@@ -295,6 +295,84 @@ def ffmpeg_binary() -> str:
 def ffprobe_binary() -> str | None:
     """Path to ffprobe if this machine has one. Optional - see `probe_media`."""
     return _find_binary("ffprobe", config.FFPROBE_BINARY)
+
+
+_FFMPEG_VERSION_RE = re.compile(r"ffmpeg version n?(\d+)\.\d+")
+_VERSION_CACHE: dict[str, int | None] = {}
+
+
+def ffmpeg_major_version(exe: str) -> int | None:
+    """The major version of the ffmpeg at `exe`, or None if it cannot be told.
+
+    None covers a git build ("ffmpeg version N-117000-g..."), which is newer
+    than any release, and a binary that would not answer at all - the encode
+    reports that failure itself, with ffmpeg's own words.
+    """
+    if exe in _VERSION_CACHE:
+        return _VERSION_CACHE[exe]
+    major = None
+    try:
+        done = subprocess.run([exe, "-hide_banner", "-version"], capture_output=True,
+                              text=True, errors="replace", timeout=30)
+        found = _FFMPEG_VERSION_RE.search(done.stdout or "")
+        major = int(found.group(1)) if found else None
+    except (OSError, subprocess.SubprocessError):
+        major = None
+    _VERSION_CACHE[exe] = major
+    return major
+
+
+def filter_file_flag(exe: str) -> str:
+    """The option that reads a filter graph from a file, for this ffmpeg.
+
+    ffmpeg 7.0 added the generic `-/option <file>` form and deprecated
+    `-filter_complex_script`; 9.0 removed the old name. The chameleon reel of
+    2026-10-20 lost its encode to exactly that, after its narration had been
+    billed: a WinGet ffmpeg 9.0.2 on PATH was found ahead of imageio's 7.1,
+    and its 8,029-character graph was the first long enough to reach the file.
+    Builds older than 7 only know the old name, so they keep it.
+    """
+    major = ffmpeg_major_version(exe)
+    if major is not None and major < 7:
+        return "-filter_complex_script"
+    return "-/filter_complex"
+
+
+#: The smallest encode with the shape of step 5's own: a filter graph read from
+#: a file, a still pushed through zoompan, and the configured video codec.
+_PREFLIGHT_GRAPH = "[0:v]zoompan=z=1.05:d=6:s=64x64:fps=30,setsar=1,format=yuv420p[v]"
+
+
+def preflight() -> str:
+    """Check that this machine's ffmpeg can run step 5. "" when it can.
+
+    Step 5 runs after step 3 has billed the narration, so an encoder that
+    cannot do the job costs a whole voice-over before anything says so - which
+    is what a removed ffmpeg option did on 2026-10-20. This runs the same
+    command shape on a 0.2s black frame in under a second, before anything is
+    spent, and returns why it failed: run.py stops the run on it.
+    """
+    try:
+        exe = ffmpeg_binary()
+    except FFmpegNotFoundError as exc:
+        return str(exc)
+    with tempfile.TemporaryDirectory(prefix="reel-preflight-") as tmp:
+        graph = Path(tmp) / "filtergraph.txt"
+        graph.write_text(_PREFLIGHT_GRAPH, encoding="utf-8")
+        args = [exe, "-hide_banner", "-nostdin", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.2:r=30",
+                filter_file_flag(exe), str(graph), "-map", "[v]",
+                "-c:v", config.VIDEO_CODEC, "-pix_fmt", config.VIDEO_PIXEL_FORMAT,
+                "-f", "mp4", str(Path(tmp) / "preflight.mp4")]
+        try:
+            done = subprocess.run(args, capture_output=True, text=True,
+                                  errors="replace", timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"could not run ffmpeg at {exe}: {exc}"
+    if done.returncode != 0:
+        tail = " ".join((done.stderr or "").split())[-300:]
+        return f"ffmpeg at {exe} failed a test encode (exit {done.returncode}): {tail}"
+    return ""
 
 
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
@@ -2026,12 +2104,13 @@ def render(shots: list[Shot], audio_path: Path, output_path: Path, *,
         sfx_cues=sfx_cues, sfx_index=sfx_index,
     )
 
-    args = [ffmpeg_binary(), "-hide_banner", "-nostdin",
+    exe = ffmpeg_binary()
+    args = [exe, "-hide_banner", "-nostdin",
             "-y" if overwrite else "-n", *inputs]
     if len(graph) > FILTER_GRAPH_INLINE_LIMIT:
         script = work_dir / "filtergraph.txt"
         script.write_text(graph, encoding="utf-8")
-        args += ["-filter_complex_script", str(script)]
+        args += [filter_file_flag(exe), str(script)]
     else:
         args += ["-filter_complex", graph]
 

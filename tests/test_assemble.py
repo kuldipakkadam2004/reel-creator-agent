@@ -3241,3 +3241,89 @@ def test_no_override_leaves_the_setting_in_charge(moving):
     assemble._plan_motion(shots)
 
     assert [s.motion for s in shots] == ["push", "pull", "push"]
+
+
+# ---------------------------------------------------------------------------
+# The filter-file flag, and the encoder check run.py makes before step 0
+# ---------------------------------------------------------------------------
+
+def _ffmpeg_answering(monkeypatch, version_line: str, *, returncode: int = 0,
+                      stderr: str = "", seen: list | None = None):
+    """An ffmpeg whose -version says `version_line` and whose encodes exit
+    `returncode`. Every other call's argv is kept in `seen`."""
+    monkeypatch.setattr(assemble, "_VERSION_CACHE", {})
+    monkeypatch.setattr(assemble, "ffmpeg_binary", lambda: "ffmpeg")
+
+    def fake_run(args, **kwargs):
+        if "-version" in args:
+            return assemble.subprocess.CompletedProcess(args, 0, version_line, "")
+        if seen is not None:
+            seen.append(list(args))
+        return assemble.subprocess.CompletedProcess(args, returncode, "", stderr)
+
+    monkeypatch.setattr(assemble.subprocess, "run", fake_run)
+
+
+@pytest.mark.parametrize("version_line, flag", [
+    ("ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c)", "-/filter_complex"),
+    ("ffmpeg version 7.1-essentials_build-www.gyan.dev Copyright", "-/filter_complex"),
+    ("ffmpeg version n7.0.2 Copyright (c) 2000-2024", "-/filter_complex"),
+    ("ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023", "-filter_complex_script"),
+    ("ffmpeg version N-117000-g1a2b3c4d5e Copyright (c)", "-/filter_complex"),
+    ("", "-/filter_complex"),
+])
+def test_the_filter_file_flag_follows_the_ffmpeg_version(monkeypatch, version_line, flag):
+    """9.0 removed -filter_complex_script; 7.0 added the -/ form that replaces it.
+
+    The chameleon reel of 2026-10-20 failed step 5 on the 9.0.2 that WinGet put
+    on PATH, after its narration had been billed. A git build and a binary that
+    will not say its version get the modern form: they are the newest.
+    """
+    _ffmpeg_answering(monkeypatch, version_line)
+
+    assert assemble.filter_file_flag("ffmpeg") == flag
+
+
+def test_a_long_graph_reaches_ffmpeg_through_the_flag_its_version_reads(tmp_path, monkeypatch):
+    seen: list = []
+    _ffmpeg_answering(monkeypatch, "ffmpeg version 9.0.2-full_build", seen=seen)
+    long_graph = "[0:v]null[vout]" + ";" * assemble.FILTER_GRAPH_INLINE_LIMIT
+    monkeypatch.setattr(assemble, "build_filter_graph", lambda *a, **k: (long_graph, "vout"))
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00")
+
+    assemble.render([shot(index=0, path=clip, duration=3.0)], tmp_path / "voice.mp3",
+                    tmp_path / "reel.mp4", total=3.0, narration=3.0, ass_path=None,
+                    fonts_dir=None, work_dir=tmp_path)
+
+    args = seen[-1]
+    assert "-filter_complex_script" not in args
+    at = args.index("-/filter_complex")
+    assert Path(args[at + 1]).read_text(encoding="utf-8") == long_graph
+
+
+def test_the_preflight_passes_an_encoder_that_works(monkeypatch):
+    seen: list = []
+    _ffmpeg_answering(monkeypatch, "ffmpeg version 7.1", seen=seen)
+
+    assert assemble.preflight() == ""
+    assert "-/filter_complex" in seen[-1] and "zoompan" not in " ".join(seen[-1])
+
+
+def test_the_preflight_says_why_an_encoder_fails(monkeypatch):
+    _ffmpeg_answering(monkeypatch, "ffmpeg version 9.0.2", returncode=1,
+                      stderr="Unrecognized option 'nope'.\nError splitting the argument list")
+
+    problem = assemble.preflight()
+
+    assert "failed a test encode (exit 1)" in problem
+    assert "Unrecognized option 'nope'." in problem
+
+
+def test_the_preflight_reports_a_missing_ffmpeg(monkeypatch):
+    def missing():
+        raise assemble.FFmpegNotFoundError("ffmpeg not found. Install it")
+
+    monkeypatch.setattr(assemble, "ffmpeg_binary", missing)
+
+    assert assemble.preflight().startswith("ffmpeg not found")

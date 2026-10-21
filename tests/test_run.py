@@ -77,6 +77,14 @@ class Steps:
             "tier": "free", "used": 1000, "limit": 10000, "remaining": 9000,
             "resets": date(2026, 10, 14), "extendable": False}
         self.balance_reads = 0
+        #: What the ffmpeg test encode reports: "" when the encoder works.
+        self.encoder_problem = ""
+        self.preflights = 0
+
+    # --- the encoder guard, before step 0 ------------------------------
+    def preflight(self):
+        self.preflights += 1
+        return self.encoder_problem
 
     # --- the balance guard, before step 0 ------------------------------
     def read_balance(self):
@@ -195,6 +203,7 @@ def steps(tmp_path, monkeypatch):
     monkeypatch.setattr(tts, "read_balance", stub.read_balance)
     monkeypatch.setattr(visuals, "source_visuals", stub.source_visuals)
     monkeypatch.setattr(assemble, "assemble_video", stub.assemble_video)
+    monkeypatch.setattr(assemble, "preflight", stub.preflight)
     monkeypatch.setattr(caption, "generate_caption", stub.generate_caption)
 
     monkeypatch.setattr(config, "LOGS_DIR", tmp_path / "logs")
@@ -533,6 +542,30 @@ def test_a_dry_run_does_not_ask_for_the_balance(steps):
     run.run_pipeline(dry_run=True)
 
     assert steps.balance_reads == 0
+
+
+def test_a_broken_encoder_stops_the_run_before_anything_is_spent(steps):
+    """2026-10-20: ffmpeg 9 refused step 5's command after the voice was billed."""
+    steps.encoder_problem = ("ffmpeg at ffmpeg.exe failed a test encode (exit 1): "
+                             "Unrecognized option 'filter_complex_script'.")
+
+    record = run.run_pipeline()
+
+    assert record["status"] == "failed"
+    assert record["reason"].startswith("assemble: ffmpeg")
+    assert "filter_complex_script" in record["reason"]
+    assert steps.calls == []
+
+
+def test_a_working_encoder_is_checked_once_and_the_run_goes_on(steps):
+    assert run.run_pipeline()["status"] == "ok"
+    assert steps.preflights == 1
+
+
+def test_a_dry_run_does_not_test_the_encoder(steps):
+    run.run_pipeline(dry_run=True)
+
+    assert steps.preflights == 0
 
 
 def test_the_summary_says_what_is_left_after_the_run(steps, capsys):

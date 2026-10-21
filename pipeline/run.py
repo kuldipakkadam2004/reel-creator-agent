@@ -373,6 +373,22 @@ def _check_balance(record: dict) -> str:
             f"a reel needs about {floor:,} (RUN_MIN_TTS_CHARACTERS){resets}")
 
 
+def _check_encoder() -> str:
+    """Stop before step 0 when this machine's ffmpeg cannot run step 5.
+
+    Step 5 comes after step 3 has billed the narration, so an encoder fault
+    found there costs a voice-over - see `assemble.preflight`, which this asks
+    in under a second. Returns the reason to stop, or "" to carry on.
+    """
+    problem = assemble.preflight()
+    if problem:
+        return f"assemble: {problem}"
+    stamp = datetime.now().strftime("%H:%M:%S")
+    print(f"{stamp}  [-/{len(STEPS)}] encoder   ffmpeg passed a test encode",
+          flush=True)
+    return ""
+
+
 def _one_line(text) -> str:
     """An error boiled down to something a ledger column can hold.
 
@@ -560,6 +576,11 @@ def run_pipeline(topic: str | None = None, *, duration: int | None = None,
         if short:
             print(f"error: {short}", file=sys.stderr)
             return finish("failed", short)
+
+        broken = _check_encoder()
+        if broken:
+            print(f"error: {broken}", file=sys.stderr)
+            return finish("failed", broken)
 
     # --- the one thing this reel does differently -------------------------
     # Chosen here rather than inside `_make_reel`, where it used to be, because
