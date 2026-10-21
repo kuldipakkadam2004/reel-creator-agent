@@ -4905,6 +4905,69 @@ def test_a_clip_the_screen_left_out_of_its_answer_is_not_approved(monkeypatch):
     assert skipped.key not in screened and skipped.key not in rejected
 
 
+# ---------------------------------------------------------------------------
+# A provider that keeps timing out is benched, not waited on
+# ---------------------------------------------------------------------------
+
+def test_a_search_timeout_is_its_own_kind_of_failure():
+    import requests
+
+    def slow(url):
+        raise requests.exceptions.Timeout("read timed out")
+
+    with pytest.raises(visuals.ProviderTimeoutError) as caught:
+        visuals._get_json(FakeSession(default=slow), "https://x/", provider="openverse")
+    assert "timed out after" in str(caught.value) and not caught.value.fatal
+
+
+def _provider_answering(outcomes):
+    """A provider whose searches play `outcomes` in order: a list is an
+    answer, an exception is raised."""
+    class Scripted(visuals.Provider):
+        name = "openverse"
+        kinds = ("image",)
+        key_env = ()
+        calls = 0
+
+        def search(self, query, kind, limit):
+            outcome = outcomes[Scripted.calls]
+            Scripted.calls += 1
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    return Scripted(session=None)
+
+
+def _timeout():
+    return visuals.ProviderTimeoutError("openverse search timed out after 30s",
+                                        provider="openverse")
+
+
+def test_a_provider_that_times_out_twice_running_is_benched_for_the_run():
+    """2026-10-20: eleven Openverse searches, 30 seconds each, all timed out."""
+    provider = _provider_answering([_timeout(), _timeout()])
+    warnings: list[str] = []
+
+    for query in ("chameleon changing color", "two chameleons interacting"):
+        assert visuals._search_provider(provider, query, "image", warnings) == []
+
+    assert "2 searches in a row timed out" in provider.disabled_reason
+    assert any(w.startswith("openverse benched for this run") for w in warnings)
+    assert type(provider).calls == 2, "a timeout is not retried like a rate limit"
+
+
+def test_an_answer_between_two_timeouts_keeps_the_provider():
+    provider = _provider_answering([_timeout(), [], _timeout()])
+    warnings: list[str] = []
+
+    for query in ("a", "b", "c"):
+        visuals._search_provider(provider, query, "image", warnings)
+
+    assert provider.disabled_reason == ""
+    assert not any("benched" in w for w in warnings)
+
+
 def test_a_subject_beat_borrows_a_chameleon_another_beat_can_spare(
         sandbox, monkeypatch, one_shot_beats):
     """The re-run of 2026-10-21: "chameleon eye close up" ran out of its own

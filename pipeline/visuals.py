@@ -114,6 +114,13 @@ ARCHIVE_SHORTLIST = 2
 
 #: (connect, read) seconds. Searches are small; downloads stream real media.
 SEARCH_TIMEOUT = (10, 30)
+#: Consecutive search timeouts that bench a provider for the rest of the run.
+#: Only a rate limit or a bad key used to, so a provider that was simply down
+#: was asked again on every beat and every fallback query, 30 seconds a time:
+#: Openverse timed out 11 times on 2026-10-20 and 6 on 10-18, eight and a half
+#: minutes of two runs, while supplying 19 clips across the 20 runs around them -
+#: worth keeping, not worth waiting on once it has stopped answering.
+SEARCH_TIMEOUTS_TO_BENCH = 2
 DOWNLOAD_TIMEOUT = (10, 180)
 DOWNLOAD_CHUNK_SIZE = 1 << 16
 
@@ -278,6 +285,15 @@ class ProviderRateLimitError(ProviderError):
                  retry_after: float | None = None):
         super().__init__(message, provider=provider, fatal=True)
         self.retry_after = retry_after
+
+
+class ProviderTimeoutError(ProviderError):
+    """A search that got no answer inside SEARCH_TIMEOUT.
+
+    Not fatal on its own - one slow answer says little - but a provider that
+    times out twice running is down, and every further search waits the full
+    timeout to learn it again. See SEARCH_TIMEOUTS_TO_BENCH.
+    """
 
 
 class ProviderTransientError(ProviderError):
@@ -956,7 +972,7 @@ def _get_json(session, url: str, *, provider: str, params=None, headers=None) ->
             url, params=params, headers=headers, timeout=SEARCH_TIMEOUT
         )
     except requests.exceptions.Timeout as exc:
-        raise ProviderError(
+        raise ProviderTimeoutError(
             f"{provider} search timed out after {SEARCH_TIMEOUT[1]}s", provider=provider
         ) from exc
     except requests.exceptions.RequestException as exc:
@@ -1120,9 +1136,12 @@ class Provider:
 
     def __init__(self, session):
         self.session = session
-        #: Set when the provider is benched mid-run (bad key, rate limited).
+        #: Set when the provider is benched mid-run (bad key, rate limited,
+        #: timing out).
         self.disabled_reason = ""
         self.searches = 0
+        #: Searches in a row that timed out - see SEARCH_TIMEOUTS_TO_BENCH.
+        self.timeouts = 0
 
     @classmethod
     def api_key(cls) -> str | None:
@@ -3029,13 +3048,24 @@ def _search_provider(
     """One search, with a single backoff on a rate limit. Never raises."""
     for attempt in (0, 1):
         try:
-            return provider.search(query, kind, SEARCH_PAGE_SIZE)
+            found = provider.search(query, kind, SEARCH_PAGE_SIZE)
+            provider.timeouts = 0
+            return found
         except ProviderRateLimitError as exc:
             if attempt == 0:
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
                 continue
             provider.disabled_reason = str(exc)
             warnings.append(f"{provider.name} benched for this run: {exc}")
+        except ProviderTimeoutError as exc:
+            provider.timeouts = getattr(provider, "timeouts", 0) + 1
+            if provider.timeouts >= SEARCH_TIMEOUTS_TO_BENCH:
+                provider.disabled_reason = (
+                    f"{provider.timeouts} searches in a row timed out ({exc})")
+                warnings.append(
+                    f"{provider.name} benched for this run: {provider.disabled_reason}")
+            else:
+                warnings.append(f"{provider.name} search {query!r} failed: {exc}")
         except ProviderError as exc:
             if exc.fatal:
                 provider.disabled_reason = str(exc)
