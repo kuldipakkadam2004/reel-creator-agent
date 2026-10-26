@@ -1439,6 +1439,20 @@ _COMMONS_CHROME_CATEGORY_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: The texture maps a 3D scan is uploaded with, one per channel, named for the
+#: mesh's polygon count: "Morse-telegraph-key-150k-4096-normals", "Pergolesi
+#: side chair diffuse-100k". In a frame they are a flat lavender square or an
+#: abstract tangle. Their categories name only the object, so the title is the
+#: only tell - and the screen passed two of them on the passenger pigeon reel
+#: of 2026-10-25, because that title names the telegraph key exactly. A map word
+#: alone is not enough: "diffuse" is also a nebula, so it needs the count too.
+_COMMONS_TEXTURE_MAP_RE = re.compile(
+    r"\b\d+k\b.*\b(?:normals|normal[- _]?map|occlusion|diffuse|albedo|roughness|specular)\b"
+    r"|\b(?:normals|normal[- _]?map|occlusion|diffuse|albedo|roughness|specular)\b.*\b\d+k\b"
+    r"|master[- _]?texture|textured[- _]?image|\btexture[- _]?(?:mask|map|atlas)",
+    re.IGNORECASE,
+)
+
 
 def _strip_markup(html: str) -> str:
     """Commons extmetadata is HTML: tags off, whitespace collapsed."""
@@ -1505,6 +1519,9 @@ class WikimediaProvider(Provider):
         info = (page.get("imageinfo") or [{}])[0]
         if info.get("mime") not in ("image/jpeg", "image/png"):
             return None                      # TIFF, SVG, GIF: not a frame
+        file_name = str(page.get("title") or "").split(":", 1)[-1]
+        if _COMMONS_TEXTURE_MAP_RE.search(file_name):
+            return None                      # a 3D scan's texture, not a picture
         meta = info.get("extmetadata") or {}
         licence = _commons_value(meta, "LicenseShortName")
         if not licence.lower().startswith(_COMMONS_LICENCE_PREFIXES):
@@ -1524,7 +1541,6 @@ class WikimediaProvider(Provider):
             width_used = COMMONS_MAX_WIDTH
             height_used = round(height * COMMONS_MAX_WIDTH / width)
 
-        file_name = str(page.get("title") or "").split(":", 1)[-1]
         categories = [
             name for name in _commons_value(meta, "Categories").split("|")
             if name.strip() and not _COMMONS_CHROME_CATEGORY_RE.search(name.strip())

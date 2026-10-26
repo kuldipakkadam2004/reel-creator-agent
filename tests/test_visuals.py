@@ -2418,6 +2418,32 @@ def test_commons_skips_what_a_caption_cannot_credit_or_a_frame_cannot_show():
     assert [c.title for c in found] == ["A plate", "A drawing"]
 
 
+def test_commons_skips_the_texture_maps_a_3d_scan_is_uploaded_with():
+    """The passenger pigeon reel of 2026-10-25 played two of these for 5.2s:
+    the screen kept them because the title names the telegraph key."""
+    maps = [
+        "Morse-telegraph-key-150k-4096-normals (Smithsonian Institution).png",
+        "Morse-telegraph-key-150k-4096-occlusion (Smithsonian Institution).png",
+        "Usnm 1171477-100k-2048-diffuse (Acropora cervicornis by Smithsonian Institution).jpg",
+        "Pergolesi side chair diffuse-100k (Smithsonian Institution).jpg",
+        "Cosmic-buddha-laser-scan-150k-diffuse-4096 (Smithsonian Institution).jpg",
+        "Morse-telegraph-key-master-texture (Smithsonian Institution).png",
+        "F1930 54-part 02-smartscan-fixed-texturedImage1 (Smithsonian Institution).png",
+        "Texture Mask (Hatch, Crew, Apollo 11 by NASA and Smithsonian Institution).png",
+    ]
+    photos = [
+        "Telegraph Key & Relay - Victorian Telegraph Service, 1860s.jpg",
+        "Diffuse nebula NGC 6302.jpg",            # a map word, but no polygon count
+        "Woolly mammoth skeleton, 100k years old.jpg",  # a count, but no map word
+    ]
+    found = visuals.WikimediaProvider(_commons_session(*(
+        _commons_page(index, title, 4096, 4096, licence="CC0")
+        for index, title in enumerate(maps + photos)
+    ))).search("x", "image", 15)
+
+    assert [c.provider_id for c in found] == photos
+
+
 def test_commons_is_keyless_and_only_ever_asked_the_archive_query():
     assert visuals.WikimediaProvider.is_configured()
     assert visuals.WikimediaProvider.archive and visuals.WikimediaProvider.archive_only
